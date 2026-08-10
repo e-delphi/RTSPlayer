@@ -1,0 +1,13 @@
+gravador.json
+*.local
+*.identcache
+*.deployproj
+__history/
+__recovery/
+/dcu/
+/bin/*
+!/bin/Win64/
+/bin/Win64/*
+!/bin/Win64/Release/
+/bin/Win64/Release/*
+!/bin/Win64/Release/*.dll

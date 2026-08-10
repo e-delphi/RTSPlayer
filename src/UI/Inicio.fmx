@@ -1,0 +1,13 @@
+object Form1: TForm1
+  Left = 0
+  Top = 0
+  Caption = 'Player RTSP'
+  ClientHeight = 640
+  ClientWidth = 360
+  FormFactor.Width = 360
+  FormFactor.Height = 640
+  FormFactor.Devices = [Desktop]
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  DesignerMasterStyle = 0
+end
