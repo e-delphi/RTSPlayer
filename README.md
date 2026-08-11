@@ -10,6 +10,14 @@ libVLC, sem wrapper, sem componente de terceiro. Só a decodificação de vídeo
 [![Framework](https://img.shields.io/badge/framework-FireMonkey-blue)](https://docwiki.embarcadero.com/RADStudio/en/FireMonkey)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green)](LICENSE)
 
+## Telas
+
+| Início | Configurar |
+|:--:|:--:|
+| ![Tela inicial com a lista vazia e o botão de adicionar câmera](docs/app-inicio.png) | ![Cadastro da câmera: protocolo, host, porta, credenciais, transporte e o resultado do teste de conexão](docs/app-configurar.png) |
+| **Listagem** | **Vídeo ao vivo** |
+| ![Lista de câmeras cadastradas, mostrando URL e transporte de cada uma](docs/app-listagem.png) | ![Player exibindo o stream ao vivo de uma câmera](docs/app-video.png) |
+
 ## Recursos
 
 - **RTSP** com autenticação Basic e Digest, `DESCRIBE`/`SETUP`/`PLAY`, keep-alive
