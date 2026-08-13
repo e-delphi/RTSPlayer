@@ -50,6 +50,31 @@ type
     Cameras: TArray<TCameraConfigEntry>;
   end;
 
+  // Leitor da configuração. A parte comum (câmeras, storage, block, log) é lida
+  // AQUI e só aqui — quem precisa de campos a mais herda e sobrescreve
+  // LoadExtra, que recebe a raiz do mesmo JSON já carregado. Assim não existe
+  // um segundo parser (nem um segundo formato) por app.
+  TAppConfigLoader = class
+  strict private
+    FConfig: TAppConfig;
+  protected
+    // campos que só a config derivada tem
+    procedure LoadExtra(Root: TJSONObject); virtual;
+    // validação extra da derivada; a comum já rodou
+    procedure ValidateExtra; virtual;
+  public
+    procedure LoadFromFile(const FilePath: string);
+    property Config: TAppConfig read FConfig;
+  end;
+
+// Helpers de JSON — expostos para que as configs derivadas leiam os campos
+// delas do mesmo jeito que a base lê os dela.
+function GetJsonStr(Obj: TJSONObject; const Name, Default: string): string;
+function GetJsonBool(Obj: TJSONObject; const Name: string; Default: Boolean): Boolean;
+function GetJsonInt(Obj: TJSONObject; const Name: string; Default: Integer): Integer;
+function GetJsonDouble(Obj: TJSONObject; const Name: string; Default: Double): Double;
+
+// Atalho para quem não precisa de campos extras (é o TAppConfigLoader puro).
 function LoadAppConfig(const FilePath: string): TAppConfig;
 
 implementation
@@ -121,43 +146,38 @@ begin
     Result := TJSONArray(V);
 end;
 
-function ParseTransportArray(Arr: TJSONArray): TArray<TTransportKind>;
+function DefaultTransports: TArray<TTransportKind>;
+begin
+  SetLength(Result, 2);
+  Result[0] := txTcp;
+  Result[1] := txUdp;
+end;
+
+// "transport" é uma string separada por vírgula: "tcp", "udp", "tcp,udp".
+// É o formato único do repo — o mesmo que o app RTSPlayer grava no
+// cameras.json. Ausente ou irreconhecível cai no default (tcp,udp).
+function ParseTransportValue(V: TJSONValue): TArray<TTransportKind>;
 var
   I, Count: Integer;
-  V: TJSONValue;
-  S: string;
+  Parts: TArray<string>;
   T: TTransportKind;
 begin
   Result := nil;
-  if (Arr = nil) or (Arr.Count = 0) then
-  begin
-    SetLength(Result, 2);
-    Result[0] := txTcp;
-    Result[1] := txUdp;
-    Exit;
-  end;
   Count := 0;
-  SetLength(Result, Arr.Count);
-  for I := 0 to Arr.Count - 1 do
+  if V is TJSONString then
   begin
-    V := Arr.Items[I];
-    if V is TJSONString then
-    begin
-      S := TJSONString(V).Value;
-      if ParseTransportKind(S, T) then
+    Parts := TJSONString(V).Value.Split([',']);
+    SetLength(Result, Length(Parts));
+    for I := 0 to High(Parts) do
+      if ParseTransportKind(Trim(Parts[I]), T) then
       begin
         Result[Count] := T;
         Inc(Count);
       end;
-    end;
   end;
   SetLength(Result, Count);
   if Count = 0 then
-  begin
-    SetLength(Result, 2);
-    Result[0] := txTcp;
-    Result[1] := txUdp;
-  end;
+    Result := DefaultTransports;
 end;
 
 function ParseReconnect(Obj: TJSONObject): TReconnectConfig;
@@ -170,7 +190,6 @@ end;
 
 function ParseCamera(Obj: TJSONObject): TCameraConfigEntry;
 var
-  TransportArr: TJSONArray;
   ReconnectObj: TJSONValue;
 begin
   Result.Name := GetJsonStr(Obj, 'name', '');
@@ -178,8 +197,7 @@ begin
   Result.Url := GetJsonStr(Obj, 'url', '');
   Result.User := GetJsonStr(Obj, 'user', '');
   Result.Password := GetJsonStr(Obj, 'password', '');
-  TransportArr := GetJsonArray(Obj, 'transport');
-  Result.Transports := ParseTransportArray(TransportArr);
+  Result.Transports := ParseTransportValue(Obj.GetValue('transport'));
   Result.RecordAudio := GetJsonBool(Obj, 'recordAudio', True);
   Result.FilenamePattern := GetJsonStr(Obj, 'filenamePattern', '{name}_{yyyy-MM-dd_HH-mm-ss}.vms');
   ReconnectObj := Obj.GetValue('reconnect');
@@ -227,7 +245,19 @@ begin
   end;
 end;
 
-function LoadAppConfig(const FilePath: string): TAppConfig;
+{ TAppConfigLoader }
+
+procedure TAppConfigLoader.LoadExtra(Root: TJSONObject);
+begin
+  // sem campos extras na config base
+end;
+
+procedure TAppConfigLoader.ValidateExtra;
+begin
+  // nada a validar além do comum
+end;
+
+procedure TAppConfigLoader.LoadFromFile(const FilePath: string);
 var
   Json: string;
   Root: TJSONValue;
@@ -250,55 +280,73 @@ begin
       raise EVmsConfigError.Create('Config root must be a JSON object');
     Obj := TJSONObject(Root);
 
-    FillChar(Result, SizeOf(Result), 0);
-    Result.StorageDir := GetJsonStr(Obj, 'storageDir', '');
-    Result.LogDir := GetJsonStr(Obj, 'logDir', '');
+    FillChar(FConfig, SizeOf(FConfig), 0);
+    FConfig.StorageDir := GetJsonStr(Obj, 'storageDir', '');
+    FConfig.LogDir := GetJsonStr(Obj, 'logDir', '');
 
     LevelStr := GetJsonStr(Obj, 'logLevel', 'info');
     if ParseLogLevel(LevelStr, Level) then
-      Result.LogLevel := Level
+      FConfig.LogLevel := Level
     else
-      Result.LogLevel := llInfo;
+      FConfig.LogLevel := llInfo;
 
-    Result.TransportFallbackTimeoutMs := Cardinal(GetJsonInt(Obj, 'transportFallbackTimeoutMs', 5000));
+    FConfig.TransportFallbackTimeoutMs := Cardinal(GetJsonInt(Obj, 'transportFallbackTimeoutMs', 5000));
 
     KaStr := LowerCase(GetJsonStr(Obj, 'keepAliveMethod', 'get_parameter'));
     if (KaStr = 'options') then
-      Result.KeepAliveMethod := kamOptions
+      FConfig.KeepAliveMethod := kamOptions
     else
-      Result.KeepAliveMethod := kamGetParameter;
+      FConfig.KeepAliveMethod := kamGetParameter;
 
     V := Obj.GetValue('block');
     if V is TJSONObject then
     begin
       BlockObj := TJSONObject(V);
-      Result.MaxBlockSamples := GetJsonInt(BlockObj, 'maxSamples', 256);
-      Result.MaxBlockDurationMs := GetJsonInt(BlockObj, 'maxDurationMs', 2000);
-      Result.MaxBlockSizeBytes := GetJsonInt(BlockObj, 'maxSizeBytes', 1048576);
+      FConfig.MaxBlockSamples := GetJsonInt(BlockObj, 'maxSamples', 256);
+      FConfig.MaxBlockDurationMs := GetJsonInt(BlockObj, 'maxDurationMs', 2000);
+      FConfig.MaxBlockSizeBytes := GetJsonInt(BlockObj, 'maxSizeBytes', 1048576);
     end
     else
     begin
-      Result.MaxBlockSamples := 256;
-      Result.MaxBlockDurationMs := 2000;
-      Result.MaxBlockSizeBytes := 1048576;
+      FConfig.MaxBlockSamples := 256;
+      FConfig.MaxBlockDurationMs := 2000;
+      FConfig.MaxBlockSizeBytes := 1048576;
     end;
 
     Arr := GetJsonArray(Obj, 'cameras');
     if Arr <> nil then
     begin
-      SetLength(Result.Cameras, Arr.Count);
+      SetLength(FConfig.Cameras, Arr.Count);
       for I := 0 to Arr.Count - 1 do
       begin
         V := Arr.Items[I];
         if V is TJSONObject then
-          Result.Cameras[I] := ParseCamera(TJSONObject(V))
+          FConfig.Cameras[I] := ParseCamera(TJSONObject(V))
         else
           raise EVmsConfigError.CreateFmt('cameras[%d] must be an object', [I]);
       end;
     end;
-    ValidateConfig(Result);
+
+    // a derivada lê os campos dela do mesmo JSON, sem reabrir o arquivo
+    LoadExtra(Obj);
   finally
     Root.Free;
+  end;
+
+  ValidateConfig(FConfig);
+  ValidateExtra;
+end;
+
+function LoadAppConfig(const FilePath: string): TAppConfig;
+var
+  Loader: TAppConfigLoader;
+begin
+  Loader := TAppConfigLoader.Create;
+  try
+    Loader.LoadFromFile(FilePath);
+    Result := Loader.Config;
+  finally
+    Loader.Free;
   end;
 end;
 

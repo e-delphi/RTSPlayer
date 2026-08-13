@@ -315,6 +315,7 @@
         <DCCReference Include="src\App\VMS.App.Composition.pas"/>
         <DCCReference Include="src\App\VMS.App.Config.pas"/>
         <DCCReference Include="src\App\VMS.App.Logger.pas"/>
+        <DCCReference Include="src\App\VMS.App.ScreenAwake.pas"/>
         <DCCReference Include="src\Depacketizer\VMS.Depk.AAC.pas"/>
         <DCCReference Include="src\Depacketizer\VMS.Depk.Base.pas"/>
         <DCCReference Include="src\Depacketizer\VMS.Depk.Factory.pas"/>

@@ -17,6 +17,7 @@ uses
   VMS.Rtsp.Client,
   VMS.App.Config,
   VMS.App.Composition,
+  VMS.App.ScreenAwake,
   VMS.Media.Renderer,
   VMS.Android.MemoLogger,
   UI.Common,
@@ -331,6 +332,9 @@ begin
       FFramePlayer.SetStatus(COLOR_DANGER, 'Erro');
     end;
   end;
+  // enquanto a câmera está no ar a tela não pode apagar (o toque some com os
+  // controles, então o usuário fica minutos sem tocar em nada)
+  SetKeepScreenOn(FPlaying);
   FFramePlayer.SetPlaying(FPlaying);
   FFramePlayer.ShowControls;
 end;
@@ -340,6 +344,7 @@ begin
   if FPlaying then
     FLogger.Info('ui', 'Stop');
   FPlaying := False;
+  SetKeepScreenOn(False); // volta ao timeout normal de tela do aparelho
   if FSupervisor <> nil then
   begin
     FSupervisor.Stop;

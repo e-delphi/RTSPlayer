@@ -272,6 +272,9 @@ begin
   end;
   FNeedPrepend := True;
 
+  if Length(FExtradata) = 0 then
+    Log('SDP sem parameter sets (SPS/PPS só in-band)');
+
   ReleaseCodec;
   if Id = 0 then
   begin
@@ -309,6 +312,7 @@ var
   ExtraLen: Integer;
 begin
   if Length(S.Data) = 0 then Exit;
+
   // Prefixa os parameter sets (Annex-B) no 1o AU e nos keyframes, caso a
   // câmera só os mande no SDP. Se já vierem in-band, o FFmpeg ignora o dup.
   if (Length(FExtradata) > 0) and (FNeedPrepend or (sfKeyframe in S.Flags)) then
@@ -319,7 +323,10 @@ begin
     Move(S.Data[0], Buf[ExtraLen], Length(S.Data));
     FPkt.data := PByte(@Buf[0]);
     FPkt.size := Length(Buf);
-    FNeedPrepend := False;
+    // FNeedPrepend só é desligado quando um quadro sai de fato (ver
+    // DrainFrames). Desligar aqui, no 1o sample, deixava o decoder órfão
+    // quando o stream não traz IDR marcado: os parameter sets iam junto de um
+    // P-frame, não davam início a nada, e nunca mais eram reenviados.
   end
   else
   begin
@@ -358,6 +365,8 @@ begin
       end;
       Break;
     end;
+    // decodificou: a partir daqui os parameter sets só vão nos keyframes
+    FNeedPrepend := False;
     ConvertAndStore;
     av_frame_unref(FFrame);
   end;

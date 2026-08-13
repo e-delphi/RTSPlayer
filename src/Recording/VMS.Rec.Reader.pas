@@ -47,6 +47,12 @@ type
     function BuildIndex: Integer;
     function SeekToTime(WallClockMs: Int64): Boolean;
     function SeekToStart: Boolean;
+    // Posiciona no último bloco que contém um keyframe de vídeo. É o que o
+    // modo ao vivo precisa: entrar no ponto de entrada mais recente, e não no
+    // começo do arquivo (que pode ter horas) nem no meio de um GOP, onde o
+    // decodificador fica sem por onde começar. Não depende do índice, então
+    // funciona com o arquivo ainda sendo gravado.
+    function SeekToLastKeyframe: Boolean;
     function CurrentBlockOffset: Int64;
     property Header: TVmsHeader read FHeader;
     property Index: TArray<TVmsBlockIndexEntry> read FIndex;
@@ -399,6 +405,73 @@ begin
   if FFirstBlockOffset <= 0 then Exit;
   FStream.Position := FFirstBlockOffset;
   Result := True;
+end;
+
+function TVmsReader.SeekToLastKeyframe: Boolean;
+const
+  ENTRY_SIZE = 18; // TrackId(1) + Flags(1) + Pts(8) + Offset(4) + Size(4)
+  BLOCK_HDR  = 28; // magic(4)+size(4)+seq(4)+startMs(8)+count(4)+indexSize(4)
+var
+  Pos, Best: Int64;
+  Hdr, Idx: TBytes;
+  BlockSize, SampleCount, IndexSize: Cardinal;
+  I, Base: Integer;
+  HasKey: Boolean;
+
+  function LE32(const B: TBytes; O: Integer): Cardinal;
+  begin
+    Result := Cardinal(B[O]) or (Cardinal(B[O + 1]) shl 8) or
+              (Cardinal(B[O + 2]) shl 16) or (Cardinal(B[O + 3]) shl 24);
+  end;
+
+begin
+  Result := False;
+  if FFirstBlockOffset <= 0 then Exit;
+  Best := -1;
+  Pos := FFirstBlockOffset;
+  SetLength(Hdr, BLOCK_HDR);
+
+  // Varre só cabeçalho + índice de cada bloco, pulando o payload — é o que
+  // torna a varredura barata mesmo num arquivo grande.
+  while Pos + BLOCK_HDR <= FStream.Size do
+  begin
+    FStream.Position := Pos;
+    if FStream.Read(Hdr[0], BLOCK_HDR) <> BLOCK_HDR then Break;
+    if (Hdr[0] <> VMS_MAGIC_BLOCK[0]) or (Hdr[1] <> VMS_MAGIC_BLOCK[1]) or
+       (Hdr[2] <> VMS_MAGIC_BLOCK[2]) or (Hdr[3] <> VMS_MAGIC_BLOCK[3]) then Break;
+    BlockSize := LE32(Hdr, 4);
+    SampleCount := LE32(Hdr, 20);
+    IndexSize := LE32(Hdr, 24);
+    // bloco ainda incompleto (gravação em curso): para aqui
+    if (BlockSize < BLOCK_HDR) or (Pos + Int64(BlockSize) > FStream.Size) then Break;
+
+    if (IndexSize > 0) and (SampleCount > 0) then
+    begin
+      SetLength(Idx, IndexSize);
+      if FStream.Read(Idx[0], IndexSize) <> Integer(IndexSize) then Break;
+      HasKey := False;
+      for I := 0 to Integer(SampleCount) - 1 do
+      begin
+        Base := I * ENTRY_SIZE;
+        if Base + 1 >= Integer(IndexSize) then Break;
+        // TrackId 0 = vídeo; bit 0 do flags = keyframe
+        if (Idx[Base] = 0) and ((Idx[Base + 1] and $01) <> 0) then
+        begin
+          HasKey := True;
+          Break;
+        end;
+      end;
+      if HasKey then Best := Pos;
+    end;
+
+    Inc(Pos, Int64(BlockSize));
+  end;
+
+  if Best >= 0 then
+  begin
+    FStream.Position := Best;
+    Result := True;
+  end;
 end;
 
 function FindMostRecentVmsForCamera(const RecordingsDir, CameraName: string): string;

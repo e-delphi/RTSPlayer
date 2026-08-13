@@ -25,16 +25,23 @@ uses
 
 const
   DVRIP_HEAD = $FF;
-  // MsgIDs. Login confirmado pela captura (0x03E8). Os de OPMonitor/keepalive
-  // são os padrões do protocolo — confirmar no hex do OPMonitor se necessário.
-  DVRIP_LOGIN            = 1000; // 0x03E8  (confirmado na captura)
-  DVRIP_KEEPALIVE        = 1006;
-  DVRIP_SYSINFO          = 1020;
-  DVRIP_CONFIG_GET       = 1042; // get de config por nome (ex.: "Simplify.Encode")
+  // MsgIDs. Login confirmado pela captura (0x03E8). A convenção do protocolo é
+  // request = N e resposta = N+1; os fluxos de dados têm ID próprio.
+  DVRIP_LOGIN               = 1000; // 0x03E8  (confirmado na captura)
+  DVRIP_LOGIN_RSP           = 1001;
+  DVRIP_KEEPALIVE           = 1006;
+  DVRIP_KEEPALIVE_RSP       = 1007;
+  DVRIP_SYSINFO             = 1020;
+  DVRIP_SYSINFO_RSP         = 1021;
+  DVRIP_CONFIG_GET          = 1042; // get de config por nome (ex.: "Simplify.Encode")
+  DVRIP_CONFIG_GET_RSP      = 1043;
   // OPMonitor usa 2 MsgIDs distintos: Claim reserva no 1413, Start abre o fluxo
   // no 1410 (= 1413-3). Mandar o Claim no 1410 faz a câmera recusar com Ret=103.
-  DVRIP_OPMONITOR_CLAIM  = 1413; // 0x0585  Action="Claim"
-  DVRIP_OPMONITOR        = 1410; // 0x0582  Action="Start" + canal de dados de mídia
+  DVRIP_OPMONITOR_CLAIM     = 1413; // 0x0585  Action="Claim"
+  DVRIP_OPMONITOR_CLAIM_RSP = 1414; // 0x0586
+  DVRIP_OPMONITOR           = 1410; // 0x0582  Action="Start"
+  DVRIP_OPMONITOR_RSP       = 1411; // 0x0583  resposta do Start (JSON com Ret)
+  DVRIP_OPMONITOR_DATA      = 1412; // 0x0584  canal de dados de mídia
 
 type
   TDvripHeader = record
@@ -43,6 +50,11 @@ type
     MsgID: Word;
     DataLen: Cardinal;
   end;
+
+  // Para que serve o payload de uma mensagem recebida. O discriminador certo é
+  // o MsgID do header: olhar o 1º byte do payload é heurística e erra em frame
+  // de mídia que começa com 0x7B ('{').
+  TDvripMsgKind = (mkUnknown, mkControl, mkMedia);
 
 // Hash "Sofia" da senha: MD5(senha) -> 8 chars. Ex.: gera "nebTfKGj".
 function SofiaHash(const Password: string): string;
@@ -54,7 +66,32 @@ procedure DvripSendCmd(const Stream: ITcpStream; SessionID, Sequence: Cardinal;
 // Lê uma mensagem completa (header + payload cru). O chamador decide se o
 // payload é JSON (resposta de comando) ou binário (frames de mídia).
 function DvripRecv(const Stream: ITcpStream; out Hdr: TDvripHeader;
-                   out Payload: TBytes; TimeoutMs: Cardinal): Boolean;
+                   out Payload: TBytes; TimeoutMs: Cardinal): Boolean; overload;
+// Mesma coisa, devolvendo em FailReason o motivo exato (com o hex do que
+// chegou). Timeout e conexão fechada NÃO passam por aqui — o RecvExact levanta
+// exceção nesses casos. Um False daqui é sempre desenquadramento.
+function DvripRecv(const Stream: ITcpStream; out Hdr: TDvripHeader;
+                   out Payload: TBytes; TimeoutMs: Cardinal;
+                   out FailReason: string): Boolean; overload;
+
+// Igual, mas se o fluxo estiver fora de sincronia procura o próximo início de
+// mensagem plausível em vez de derrubar a conexão — mesma ideia do resync que
+// o parser de mídia já faz uma camada abaixo.
+// SkippedBytes = quantos bytes foram descartados até reencontrar o início
+// (0 = leitura limpa). Se vier sempre o mesmo número, é tamanho mal calculado
+// em algum tipo de mensagem, e aí o conserto é no comprimento, não aqui.
+function DvripRecvResync(const Stream: ITcpStream; out Hdr: TDvripHeader;
+                         out Payload: TBytes; TimeoutMs: Cardinal;
+                         out SkippedBytes: Integer;
+                         out FailReason: string): Boolean;
+
+// Classifica a mensagem pelo MsgID do header. mkUnknown = ID fora da tabela;
+// cabe ao chamador decidir (e avisar) — nada aqui adivinha pelo conteúdo.
+function DvripClassifyMsg(MsgID: Word): TDvripMsgKind;
+
+// True se o payload começa (ignorando espaços/quebras) com '{', ou seja, se
+// parece um JSON de controle. Só para conferir a classificação por MsgID.
+function DvripLooksLikeJson(const Payload: TBytes): Boolean;
 
 // Extrai um valor string de um JSON simples ("chave":"valor" ou "chave":123).
 function JsonGetStr(const Json, Key: string): string;
@@ -130,24 +167,159 @@ end;
 function DvripRecv(const Stream: ITcpStream; out Hdr: TDvripHeader;
   out Payload: TBytes; TimeoutMs: Cardinal): Boolean;
 var
+  Ignored: string;
+begin
+  Result := DvripRecv(Stream, Hdr, Payload, TimeoutMs, Ignored);
+end;
+
+function DvripRecv(const Stream: ITcpStream; out Hdr: TDvripHeader;
+  out Payload: TBytes; TimeoutMs: Cardinal; out FailReason: string): Boolean;
+var
   HBuf: TBytes;
 begin
   Result := False;
+  FailReason := '';
   SetLength(Payload, 0);
   SetLength(HBuf, 20);
-  if not Stream.RecvExact(HBuf, 20, TimeoutMs) then Exit;
-  if HBuf[0] <> DVRIP_HEAD then Exit;
+  if not Stream.RecvExact(HBuf, 20, TimeoutMs) then
+  begin
+    FailReason := 'header incompleto';
+    Exit;
+  end;
+  if HBuf[0] <> DVRIP_HEAD then
+  begin
+    // O fluxo saiu de sincronia: o que deveria ser começo de mensagem não é.
+    // O hex mostra onde paramos dentro do que veio antes.
+    FailReason := Format('fora de sincronia: esperava 0x%.2x, veio 0x%.2x [%s]',
+      [DVRIP_HEAD, HBuf[0], BytesToHex(HBuf, 20)]);
+    Exit;
+  end;
   Hdr.SessionID := GetLE32(HBuf, 4);
   Hdr.Sequence := GetLE32(HBuf, 8);
   Hdr.MsgID := Word(HBuf[14]) or (Word(HBuf[15]) shl 8);
   Hdr.DataLen := GetLE32(HBuf, 16);
-  if Hdr.DataLen > MAX_PAYLOAD then Exit;
+  if Hdr.DataLen > MAX_PAYLOAD then
+  begin
+    FailReason := Format('DataLen invalido (%u) MsgID=%d [%s]',
+      [Hdr.DataLen, Hdr.MsgID, BytesToHex(HBuf, 20)]);
+    Exit;
+  end;
   if Hdr.DataLen > 0 then
   begin
     SetLength(Payload, Hdr.DataLen);
-    if not Stream.RecvExact(Payload, Integer(Hdr.DataLen), TimeoutMs) then Exit;
+    if not Stream.RecvExact(Payload, Integer(Hdr.DataLen), TimeoutMs) then
+    begin
+      FailReason := Format('payload incompleto (%u bytes) MsgID=%d',
+        [Hdr.DataLen, Hdr.MsgID]);
+      Exit;
+    end;
   end;
   Result := True;
+end;
+
+// Um header só é aceito se o marcador bate E o tamanho é sanidade. Só o 0xFF
+// não serve: dentro de vídeo comprimido ele aparece toda hora — foi assim que
+// um "header" com DataLen de 1,4 GB passou pela checagem antiga.
+function HeaderPlausible(const HBuf: TBytes; out MsgID: Word; out DataLen: Cardinal): Boolean;
+begin
+  Result := False;
+  if Length(HBuf) < 20 then Exit;
+  if HBuf[0] <> DVRIP_HEAD then Exit;
+  MsgID := Word(HBuf[14]) or (Word(HBuf[15]) shl 8);
+  DataLen := GetLE32(HBuf, 16);
+  Result := DataLen <= MAX_PAYLOAD;
+end;
+
+function DvripRecvResync(const Stream: ITcpStream; out Hdr: TDvripHeader;
+  out Payload: TBytes; TimeoutMs: Cardinal; out SkippedBytes: Integer;
+  out FailReason: string): Boolean;
+const
+  MAX_RESYNC_SCAN = 4 * 1024 * 1024; // desiste em vez de varrer para sempre
+var
+  HBuf, OneByte: TBytes;
+  MsgID: Word;
+  DataLen: Cardinal;
+begin
+  Result := False;
+  SkippedBytes := 0;
+  FailReason := '';
+  SetLength(Payload, 0);
+  SetLength(HBuf, 20);
+  SetLength(OneByte, 1);
+
+  if not Stream.RecvExact(HBuf, 20, TimeoutMs) then
+  begin
+    FailReason := 'header incompleto';
+    Exit;
+  end;
+
+  // desliza a janela de 20 bytes até ela parecer um header de verdade
+  while not HeaderPlausible(HBuf, MsgID, DataLen) do
+  begin
+    if SkippedBytes >= MAX_RESYNC_SCAN then
+    begin
+      FailReason := Format('sem sincronia apos %d bytes [%s]',
+        [SkippedBytes, BytesToHex(HBuf, 20)]);
+      Exit;
+    end;
+    Move(HBuf[1], HBuf[0], 19);
+    if not Stream.RecvExact(OneByte, 1, TimeoutMs) then
+    begin
+      FailReason := Format('fluxo acabou apos pular %d bytes', [SkippedBytes]);
+      Exit;
+    end;
+    HBuf[19] := OneByte[0];
+    Inc(SkippedBytes);
+  end;
+
+  Hdr.SessionID := GetLE32(HBuf, 4);
+  Hdr.Sequence := GetLE32(HBuf, 8);
+  Hdr.MsgID := MsgID;
+  Hdr.DataLen := DataLen;
+  if DataLen > 0 then
+  begin
+    SetLength(Payload, DataLen);
+    if not Stream.RecvExact(Payload, Integer(DataLen), TimeoutMs) then
+    begin
+      FailReason := Format('payload incompleto (%u bytes) MsgID=%d', [DataLen, MsgID]);
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+function DvripClassifyMsg(MsgID: Word): TDvripMsgKind;
+begin
+  case MsgID of
+    // Único ID de mídia que conhecemos: o canal de dados do OPMonitor.
+    DVRIP_OPMONITOR_DATA:
+      Result := mkMedia;
+    // Comandos e suas respostas: payload é sempre JSON. Inclui os IDs de
+    // request porque algumas câmeras respondem no mesmo ID em que perguntamos.
+    DVRIP_LOGIN, DVRIP_LOGIN_RSP,
+    DVRIP_KEEPALIVE, DVRIP_KEEPALIVE_RSP,
+    DVRIP_SYSINFO, DVRIP_SYSINFO_RSP,
+    DVRIP_CONFIG_GET, DVRIP_CONFIG_GET_RSP,
+    DVRIP_OPMONITOR_CLAIM, DVRIP_OPMONITOR_CLAIM_RSP,
+    DVRIP_OPMONITOR_RSP:
+      Result := mkControl;
+    // DVRIP_OPMONITOR (1410) fica de fora de propósito: é o ID em que mandamos
+    // o Start, e não sabemos se esta câmera responde nele ou se manda mídia por
+    // ele. Cai em mkUnknown para o chamador logar o que realmente chegou.
+  else
+    Result := mkUnknown;
+  end;
+end;
+
+function DvripLooksLikeJson(const Payload: TBytes): Boolean;
+var
+  I: Integer;
+begin
+  I := 0;
+  while (I < Length(Payload)) and
+        ((Payload[I] = 32) or (Payload[I] = 9) or (Payload[I] = 10) or (Payload[I] = 13)) do
+    Inc(I);
+  Result := (I < Length(Payload)) and (Payload[I] = Ord('{'));
 end;
 
 function JsonGetStr(const Json, Key: string): string;

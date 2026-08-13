@@ -26,6 +26,8 @@ type
     pathBack: TPath;
     btnDebug: TRectangle;
     pathLog: TPath;
+    btnMute: TRectangle;
+    pathMute: TPath;
     pillStatus: TRectangle;
     dotStatus: TCircle;
     lblStatus: TLabel;
@@ -40,18 +42,22 @@ type
     FRenderer: TMediaRenderer;
     FLogger: ILogger;
     FPlaying: Boolean;
+    FMuted: Boolean;
     FLoggedShown: Boolean;
     FTmrHide: TTimer;
     FOnBack: TNotifyEvent;
     procedure btnBackClick(Sender: TObject);
     procedure btnDebugClick(Sender: TObject);
+    procedure btnMuteClick(Sender: TObject);
     procedure imgVideoClick(Sender: TObject);
     procedure tmrHideTimer(Sender: TObject);
+    procedure UpdateMuteIcon;
   public
     constructor Create(AOwner: TComponent); override;
     procedure Bind(const Renderer: TMediaRenderer; const Logger: ILogger);
     procedure PresentFrame;
     procedure SetPlaying(Value: Boolean);
+    procedure SetMuted(Value: Boolean);
     procedure SetCamName(const S: string);
     procedure SetStatus(C: TAlphaColor; const S: string);
     procedure SetSpinner(AOn: Boolean);
@@ -61,6 +67,7 @@ type
     procedure ResetForNewPlay;
     procedure AppendLog(const Lines: TArray<string>);
     procedure ClearLog;
+    property Muted: Boolean read FMuted write SetMuted;
     property OnBack: TNotifyEvent read FOnBack write FOnBack;
   end;
 
@@ -82,7 +89,9 @@ begin
 
   btnBack.OnClick := btnBackClick;
   btnDebug.OnClick := btnDebugClick;
+  btnMute.OnClick := btnMuteClick;
   imgVideo.OnClick := imgVideoClick;
+  UpdateMuteIcon;
 
   // layTop é overlay sobre o vídeo (não ocupa espaço): precisa ficar por cima do
   // placeholder e do vídeo na ordem-z. O spinner logo abaixo dele.
@@ -94,6 +103,7 @@ procedure TFramePlayer.Bind(const Renderer: TMediaRenderer; const Logger: ILogge
 begin
   FRenderer := Renderer;
   FLogger := Logger;
+  SetMuted(FMuted); // deixa o renderer no mesmo estado que o botão mostra
 end;
 
 procedure TFramePlayer.SetPlaying(Value: Boolean);
@@ -102,6 +112,31 @@ begin
   rectPlaceholder.Visible := not Value;
   if not Value then
     SetSpinner(False);
+end;
+
+procedure TFramePlayer.UpdateMuteIcon;
+begin
+  if pathMute = nil then Exit;
+  if FMuted then
+  begin
+    pathMute.Data.Data := ICON_MUTE;
+    pathMute.Fill.Color := COLOR_DANGER;
+  end
+  else
+  begin
+    pathMute.Data.Data := ICON_SOUND;
+    pathMute.Fill.Color := COLOR_DIM;
+  end;
+end;
+
+procedure TFramePlayer.SetMuted(Value: Boolean);
+begin
+  FMuted := Value;
+  // o mute vive no renderer (instância única), então sobrevive a reconexão e a
+  // troca de câmera sem a UI precisar reaplicar
+  if FRenderer <> nil then
+    FRenderer.AudioEnabled := not FMuted;
+  UpdateMuteIcon;
 end;
 
 procedure TFramePlayer.SetCamName(const S: string);
@@ -188,6 +223,17 @@ end;
 procedure TFramePlayer.btnDebugClick(Sender: TObject);
 begin
   panelDebug.Visible := not panelDebug.Visible;
+end;
+
+procedure TFramePlayer.btnMuteClick(Sender: TObject);
+begin
+  SetMuted(not FMuted);
+  ShowControls; // reinicia o timer de auto-ocultar (o toque foi na barra)
+  if FLogger <> nil then
+    if FMuted then
+      FLogger.Info('ui', 'audio mudo')
+    else
+      FLogger.Info('ui', 'audio ligado');
 end;
 
 procedure TFramePlayer.imgVideoClick(Sender: TObject);

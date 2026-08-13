@@ -25,6 +25,7 @@ uses
   VMS.App.Composition in 'src\App\VMS.App.Composition.pas',
   VMS.App.Config in 'src\App\VMS.App.Config.pas',
   VMS.App.Logger in 'src\App\VMS.App.Logger.pas',
+  VMS.App.ScreenAwake in 'src\App\VMS.App.ScreenAwake.pas',
   VMS.Depk.AAC in 'src\Depacketizer\VMS.Depk.AAC.pas',
   VMS.Depk.Base in 'src\Depacketizer\VMS.Depk.Base.pas',
   VMS.Depk.Factory in 'src\Depacketizer\VMS.Depk.Factory.pas',

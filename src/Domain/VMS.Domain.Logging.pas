@@ -5,6 +5,8 @@ interface
 type
   TLogLevel = (llDebug, llInfo, llWarn, llError);
 
+  // Só escrita. Filtrar por nível é decisão de cada implementação (e nem toda
+  // tem: o log do servidor grava tudo), então não faz parte do contrato.
   ILogger = interface
     ['{B8B0F8C0-7C0A-4F1E-9F1A-3A6C7F5C2E10}']
     procedure Log(Level: TLogLevel; const Tag, Msg: string);
@@ -12,8 +14,6 @@ type
     procedure Info(const Tag, Msg: string);
     procedure Warn(const Tag, Msg: string);
     procedure Error(const Tag, Msg: string);
-    function MinLevel: TLogLevel;
-    procedure SetMinLevel(Level: TLogLevel);
   end;
 
 function LogLevelToStr(Level: TLogLevel): string;

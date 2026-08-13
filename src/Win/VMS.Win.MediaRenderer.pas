@@ -17,6 +17,7 @@ interface
 uses
   System.SysUtils,
   System.Classes,
+  System.SyncObjs,
   VMS.Domain.Types,
   VMS.Domain.Logging,
   VMS.Domain.MediaSink,
@@ -30,8 +31,17 @@ type
     FAudio: TAudioDecoder;
     FAudioEnabled: Boolean;
     FLogger: ILogger;
+    // último formato de áudio anunciado pela sessão, guardado para reconfigurar
+    // o decoder quando o usuário tira o mudo no meio do stream
+    FFmtLock: TCriticalSection;
+    FHasAudioFmt: Boolean;
+    FFmtCodec: TAudioCodec;
+    FFmtRate: Cardinal;
+    FFmtChannels: Byte;
+    FFmtExtra: TBytes;
     function GetOnVideoFrame: TThreadProcedure;
     procedure SetOnVideoFrame(const V: TThreadProcedure);
+    procedure SetAudioEnabled(Value: Boolean);
   protected
     function QueryInterface(const IID: TGUID; out Obj): HResult; stdcall;
     function _AddRef: Integer; stdcall;
@@ -50,7 +60,9 @@ type
     procedure UnlockFrame;
     // Atraso (ms) de áudio (jitter buffer) e vídeo (exibição) p/ A/V sync.
     procedure SetDelays(AudioMs, VideoMs: Integer);
-    property AudioEnabled: Boolean read FAudioEnabled write FAudioEnabled;
+    // False = mudo. Pode ser trocado a qualquer momento (inclusive no meio do
+    // stream); a UI escreve daqui da thread principal.
+    property AudioEnabled: Boolean read FAudioEnabled write SetAudioEnabled;
     property OnVideoFrame: TThreadProcedure read GetOnVideoFrame write SetOnVideoFrame;
   end;
 
@@ -64,6 +76,7 @@ constructor TWindowsMediaRenderer.Create(const ALogger: ILogger);
 begin
   inherited Create;
   FLogger := ALogger;
+  FFmtLock := TCriticalSection.Create;
   FVideo := TVideoDecoder.Create(ALogger);
   FAudio := TAudioDecoder.Create(ALogger);
   FAudioEnabled := True;
@@ -73,6 +86,7 @@ destructor TWindowsMediaRenderer.Destroy;
 begin
   FVideo.Free;
   FAudio.Free;
+  FFmtLock.Free;
   inherited;
 end;
 
@@ -113,8 +127,46 @@ end;
 procedure TWindowsMediaRenderer.OnAudioFormat(Codec: TAudioCodec; SampleRate: Cardinal;
   Channels: Byte; const Extradata: TBytes);
 begin
+  FFmtLock.Enter;
+  try
+    FFmtCodec := Codec;
+    FFmtRate := SampleRate;
+    FFmtChannels := Channels;
+    FFmtExtra := Copy(Extradata);
+    FHasAudioFmt := True;
+  finally
+    FFmtLock.Leave;
+  end;
+  // no mudo nem configura: não abre o dispositivo de áudio à toa
   if FAudioEnabled then
     FAudio.Configure(Codec, SampleRate, Channels, Extradata);
+end;
+
+procedure TWindowsMediaRenderer.SetAudioEnabled(Value: Boolean);
+var
+  Codec: TAudioCodec;
+  Rate: Cardinal;
+  Ch: Byte;
+  Extra: TBytes;
+  HasFmt: Boolean;
+begin
+  if FAudioEnabled = Value then Exit;
+  FAudioEnabled := Value;
+  FAudio.FlushReset; // descarta o que ficou na fila: ao religar começa limpo
+  if not Value then Exit;
+  FFmtLock.Enter;
+  try
+    HasFmt := FHasAudioFmt;
+    Codec := FFmtCodec;
+    Rate := FFmtRate;
+    Ch := FFmtChannels;
+    Extra := Copy(FFmtExtra);
+  finally
+    FFmtLock.Leave;
+  end;
+  // saindo do mudo com o stream já rodando: o formato já passou, reconfigura
+  if HasFmt then
+    FAudio.Configure(Codec, Rate, Ch, Extra);
 end;
 
 procedure TWindowsMediaRenderer.OnSample(const Sample: TSample);
@@ -129,6 +181,12 @@ procedure TWindowsMediaRenderer.OnStreamStopped;
 begin
   FVideo.FlushReset;
   FAudio.FlushReset;
+  FFmtLock.Enter;
+  try
+    FHasAudioFmt := False; // o próximo stream anuncia o formato de novo
+  finally
+    FFmtLock.Leave;
+  end;
 end;
 
 function TWindowsMediaRenderer.LockLatestFrame(out RGBA: TBytes; out W, H: Integer): Boolean;

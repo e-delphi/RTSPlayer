@@ -31,6 +31,14 @@ const
   ICON_BACK   = 'M13 5 L6 12 L13 19 L14.4 17.6 L9.8 13 L20 13 L20 11 L9.8 11 L14.4 6.4 Z';
   ICON_LOG    = 'M3 5 L21 5 L21 7 L3 7 Z M3 11 L21 11 L21 13 L3 13 Z M3 17 L15 17 L15 19 L3 19 Z';
   ICON_CAMERA = 'M3 7 L3 17 L15 17 L15 13 L21 16 L21 8 L15 11 L15 7 Z';
+  // alto-falante + barras de volume / alto-falante + "X" (mudo). Os dois têm a
+  // MESMA bounding box (3..19 x 4..20) pro WrapMode=Fit não mudar o tamanho do
+  // ícone ao alternar.
+  ICON_SOUND  = 'M3 9 L7 9 L12 4 L12 20 L7 15 L3 15 Z M14 8 L15.6 8 L15.6 16 L14 16 Z ' +
+                'M17.4 5.5 L19 5.5 L19 18.5 L17.4 18.5 Z';
+  ICON_MUTE   = 'M3 9 L7 9 L12 4 L12 20 L7 15 L3 15 Z M14 10.5 L15.4 9.1 L16.5 10.2 ' +
+                'L17.6 9.1 L19 10.5 L17.9 11.6 L19 12.7 L17.6 14.1 L16.5 13 L15.4 14.1 ' +
+                'L14 12.7 L15.1 11.6 Z';
   ICON_TRASH  = 'M10 3 L14 3 L14 5 L10 5 Z M5 5 L19 5 L19 7 L5 7 Z M7 7 L17 7 L16 21 L8 21 Z';
 
 type
@@ -218,8 +226,11 @@ begin
     Result.Transports := ParseTransports('auto');
   Result.RecordAudio := True;
   Result.FilenamePattern := '';
-  Result.Reconnect.InitialDelayMs := 2000;
-  Result.Reconnect.MaxDelayMs := 30000;
+  // Uso móvel: numa troca de célula/perda de sinal no 4G o backoff de 30 s do
+  // gravador deixaria a tela parada tempo demais. Teto curto: quem está olhando
+  // a câmera quer a imagem de volta, e uma tentativa a mais custa pouco.
+  Result.Reconnect.InitialDelayMs := 1000;
+  Result.Reconnect.MaxDelayMs := 6000;
   Result.Reconnect.BackoffMultiplier := 2.0;
   Result.Reconnect.NoRtpTimeoutMs := 10000;
   if MaxRetries < 0 then MaxRetries := 0;

@@ -87,6 +87,25 @@ object FramePlayer: TFramePlayer
         WrapMode = Fit
       end
     end
+    object btnMute: TRectangle
+      Align = Right
+      Fill.Kind = None
+      Position.X = 132.000000000000000000
+      Size.Width = 48.000000000000000000
+      Size.Height = 52.000000000000000000
+      Size.PlatformDefault = False
+      Stroke.Kind = None
+      object pathMute: TPath
+        Align = Center
+        Fill.Color = xFFB0B0B0
+        HitTest = False
+        Size.Width = 20.000000000000000000
+        Size.Height = 20.000000000000000000
+        Size.PlatformDefault = False
+        Stroke.Kind = None
+        WrapMode = Fit
+      end
+    end
     object pillStatus: TRectangle
       Align = Right
       Fill.Color = xFF1E1E1E

@@ -1,0 +1,48 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{00E3095B-1CF0-4144-B48F-E416340AA328}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="rtsplayer.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="vms\vmsserver.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="rtsplayer">
+        <MSBuild Projects="rtsplayer.dproj"/>
+    </Target>
+    <Target Name="rtsplayer:Clean">
+        <MSBuild Projects="rtsplayer.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="rtsplayer:Make">
+        <MSBuild Projects="rtsplayer.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="vmsserver">
+        <MSBuild Projects="vms\vmsserver.dproj"/>
+    </Target>
+    <Target Name="vmsserver:Clean">
+        <MSBuild Projects="vms\vmsserver.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="vmsserver:Make">
+        <MSBuild Projects="vms\vmsserver.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="rtsplayer;vmsserver"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="rtsplayer:Clean;vmsserver:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="rtsplayer:Make;vmsserver:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>

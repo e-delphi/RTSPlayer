@@ -13,6 +13,7 @@ const
   H264_NAL_TYPE_MASK = $1F;
   H264_NAL_TYPE_STAPA = 24;
   H264_NAL_TYPE_FUA   = 28;
+  H264_NAL_TYPE_NON_IDR = 1;
   H264_NAL_TYPE_IDR   = 5;
   H264_NAL_TYPE_SPS   = 7;
   H264_NAL_TYPE_PPS   = 8;
@@ -63,16 +64,51 @@ begin
   FCurrentPts := 0;
 end;
 
+// True se a unidade é ponto de entrada para o decodificador.
+//
+// O teste óbvio é NAL tipo 5 (IDR), e é o que basta na maioria das câmeras.
+// Mas existem câmeras que mandam o access unit INTEIRO — SPS + PPS + quadro I
+// — como uma única unidade, declarando no cabeçalho o tipo da PRIMEIRA NAL
+// (7 = SPS). Aí o quadro-chave está lá, completo, e o teste de tipo 5 nunca
+// casa: a gravação inteira fica sem um único ponto de entrada marcado. Por
+// isso, quando a unidade começa com parâmetros, olhamos o que vem dentro dela.
+function UnitIsKeyframe(const Nal: TBytes): Boolean;
+var
+  I, T: Integer;
+begin
+  if Length(Nal) = 0 then Exit(False);
+  T := Nal[0] and H264_NAL_TYPE_MASK;
+  if T = H264_NAL_TYPE_IDR then Exit(True);
+  // só vale a varredura se a unidade abre com SPS/PPS
+  if (T <> H264_NAL_TYPE_SPS) and (T <> H264_NAL_TYPE_PPS) then Exit(False);
+  I := 0;
+  while I <= Length(Nal) - 5 do
+  begin
+    if (Nal[I] = 0) and (Nal[I + 1] = 0) then
+    begin
+      if (Nal[I + 2] = 1) then
+        T := Nal[I + 3] and H264_NAL_TYPE_MASK
+      else if (Nal[I + 2] = 0) and (Nal[I + 3] = 1) then
+        T := Nal[I + 4] and H264_NAL_TYPE_MASK
+      else
+        T := -1;
+      // parâmetros seguidos de slice = quadro-chave completo
+      if (T = H264_NAL_TYPE_IDR) or (T = H264_NAL_TYPE_NON_IDR) then
+        Exit(True);
+    end;
+    Inc(I);
+  end;
+  Result := False;
+end;
+
 procedure TH264Depacketizer.EmitNal(const Nal: TBytes; Pts: Int64);
 var
-  NalType: Byte;
   Flags: TSampleFlags;
   Data: TBytes;
 begin
   if Length(Nal) = 0 then Exit;
-  NalType := Nal[0] and H264_NAL_TYPE_MASK;
   Flags := [];
-  if NalType = H264_NAL_TYPE_IDR then
+  if UnitIsKeyframe(Nal) then
     Include(Flags, sfKeyframe);
   Data := AnnexBWrap(Nal);
   Emit(tkVideo, Pts, Flags, Data);

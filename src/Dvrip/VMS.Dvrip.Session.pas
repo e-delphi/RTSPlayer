@@ -45,6 +45,12 @@ type
     FWinI, FWinP, FWinAud: Integer;
     FWinVidBytes, FWinAudBytes: Int64;
     FStatsTickMs: Int64;
+    // roteamento das mensagens recebidas (ver DispatchMessage)
+    FMediaMsgID: Word;         // MsgID que esta câmera usa para mídia
+    FMediaMsgIDKnown: Boolean;
+    FFramingResyncs: Integer;  // quantas vezes o enquadramento saiu de sincronia
+    FWarnedMsgIDs: array[0..7] of Word; // rate-limit: 1 aviso por MsgID duvidoso
+    FWarnedCount: Integer;
     function ParseHostPort(out Host: string; out Port: Word): Boolean;
     function NextSeq: Cardinal;
     function MonitorJson(const Action, StreamType: string): string;
@@ -52,6 +58,9 @@ type
     function QueryEncodeConfig: Boolean;
     procedure StartMonitor;
     procedure ReceiveLoop;
+    procedure DispatchMessage(MsgID: Word; const Payload: TBytes);
+    procedure FeedMedia(MsgID: Word; const Payload: TBytes);
+    function WarnOnceFor(MsgID: Word): Boolean;
     procedure CheckKeepAlive;
     procedure LogStatsIfDue;
     function StopRequested: Boolean;
@@ -299,21 +308,116 @@ procedure TDvripSession.ReceiveLoop;
 var
   Hdr: TDvripHeader;
   Payload: TBytes;
+  FailReason: string;
+  Skipped: Integer;
 begin
   FLastKeepAliveMs := FClock.MonotonicMs;
   while not StopRequested do
   begin
-    if not DvripRecv(FTcp, Hdr, Payload, 4000) then
-      raise EVmsIoError.Create('DVRIP recv timeout/erro');
-    if Length(Payload) >= 4 then
+    if not DvripRecvResync(FTcp, Hdr, Payload, 4000, Skipped, FailReason) then
+      raise EVmsIoError.Create('DVRIP recv: ' + FailReason);
+    if Skipped > 0 then
     begin
-      if Payload[0] = Ord('{') then
-        FLogger.Debug(FTag, 'ctrl: ' + TEncoding.UTF8.GetString(Payload))
-      else
-        FParser.Feed(Payload, Length(Payload)); // mídia
+      // Perder o enquadramento não derruba mais a conexão, mas continua sendo
+      // defeito: o número de bytes pulados é a pista de onde o tamanho errou.
+      Inc(FFramingResyncs);
+      if (FLogger <> nil) and (FFramingResyncs <= 20) then
+        FLogger.Warn(FTag, Format('enquadramento: pulou %d bytes ate o proximo header (MsgID=%d, %d ocorrencia(s))',
+          [Skipped, Hdr.MsgID, FFramingResyncs]));
     end;
+    DispatchMessage(Hdr.MsgID, Payload);
     LogStatsIfDue;
     CheckKeepAlive;
+  end;
+end;
+
+// True só na 1ª vez que esse MsgID cai num caminho duvidoso — o aviso é para
+// aparecer no log, não para inundá-lo a cada frame.
+function TDvripSession.WarnOnceFor(MsgID: Word): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to FWarnedCount - 1 do
+    if FWarnedMsgIDs[I] = MsgID then Exit(False);
+  if FWarnedCount >= Length(FWarnedMsgIDs) then Exit(False);
+  FWarnedMsgIDs[FWarnedCount] := MsgID;
+  Inc(FWarnedCount);
+  Result := True;
+end;
+
+// Entrega o payload ao parser e fixa o MsgID como o canal de mídia desta
+// sessão: a partir daí ele vai direto para o parser, sem passar de novo pela
+// heurística (é isso que garante que um frame começando com '{' não se perca,
+// mesmo que a câmera use um MsgID fora da tabela).
+procedure TDvripSession.FeedMedia(MsgID: Word; const Payload: TBytes);
+begin
+  if not FMediaMsgIDKnown then
+  begin
+    FMediaMsgID := MsgID;
+    FMediaMsgIDKnown := True;
+    FLogger.Info(FTag, Format('mídia no MsgID %d (0x%.4x)', [MsgID, MsgID]));
+  end;
+  FParser.Feed(Payload, Length(Payload));
+end;
+
+// Decide o destino de cada mensagem pelo MsgID do header. A heurística do 1º
+// byte só sobrevive como fallback para MsgID desconhecido — e avisando, para
+// não trocar um chute silencioso por outro.
+procedure TDvripSession.DispatchMessage(MsgID: Word; const Payload: TBytes);
+var
+  Kind: TDvripMsgKind;
+
+  procedure LogCtrl;
+  begin
+    FLogger.Debug(FTag, 'ctrl: ' + TEncoding.UTF8.GetString(Payload));
+  end;
+
+  procedure WarnMsg(const Reason: string);
+  begin
+    if WarnOnceFor(MsgID) then
+      FLogger.Warn(FTag, Format('%s: MsgID=%d (0x%.4x) len=%d [%s]',
+        [Reason, MsgID, MsgID, Length(Payload), BytesToHex(Copy(Payload, 0, 12), 12)]));
+  end;
+
+begin
+  if Length(Payload) = 0 then Exit;
+
+  Kind := DvripClassifyMsg(MsgID);
+  // Um MsgID fora da tabela que já veio com mídia continua sendo mídia até o
+  // fim da sessão — assim o fallback é usado uma vez só, e não a cada frame.
+  // Não sobrepõe mkControl: lá o JSON de resposta ainda tem que ser lido.
+  if (Kind = mkUnknown) and FMediaMsgIDKnown and (MsgID = FMediaMsgID) then
+    Kind := mkMedia;
+
+  if Kind = mkMedia then
+  begin
+    FeedMedia(MsgID, Payload); // sem olhar o 1º byte: mídia é mídia
+    Exit;
+  end;
+
+  if Length(Payload) < 4 then Exit; // ruído; mesmo filtro de antes
+
+  case Kind of
+    mkControl:
+      begin
+        if DvripLooksLikeJson(Payload) then
+          LogCtrl
+        else
+        begin
+          // MsgID de comando com payload binário: a tabela está errada para
+          // esta câmera. Entrega ao parser (perder frame é pior) e avisa 1x.
+          WarnMsg('MsgID de controle com payload binário');
+          FeedMedia(MsgID, Payload);
+        end;
+      end;
+  else // mkUnknown: fallback = comportamento antigo, agora explícito no log
+    begin
+      WarnMsg('MsgID desconhecido');
+      if DvripLooksLikeJson(Payload) then
+        LogCtrl
+      else
+        FeedMedia(MsgID, Payload);
+    end;
   end;
 end;
 
@@ -478,6 +582,9 @@ begin
   FWinI := 0; FWinP := 0; FWinAud := 0;
   FWinVidBytes := 0; FWinAudBytes := 0;
   FStatsTickMs := 0;
+  FMediaMsgID := 0;
+  FMediaMsgIDKnown := False;
+  FWarnedCount := 0;
   FParser.Reset;
   if not ParseHostPort(Host, Port) then
     raise EVmsConfigError.Create('URL DVRIP inválida: ' + FConfig.Url);
