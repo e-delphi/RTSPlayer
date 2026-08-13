@@ -57,6 +57,8 @@ type
     // parameter sets Annex-B pra prefixar (câmeras que só mandam no SDP)
     FExtradata: TBytes;
     FNeedPrepend: Boolean;
+    FCurCodec: TVideoCodec;
+    FSawInbandPs: Boolean; // já chegaram SPS/PPS (VPS) dentro do próprio stream
     // ffmpeg
     FCodec: PAVCodec;
     FCtx: PAVCodecContext;
@@ -83,6 +85,7 @@ type
     FOnFrame: TThreadProcedure;
     procedure Log(const Msg: string);
     function CodecId: Integer;
+    function SampleHasParameterSets(const Data: TBytes): Boolean;
     procedure DoConfigure;
     procedure ReleaseCodec;
     function PopSample(out S: TSample): Boolean;
@@ -168,6 +171,47 @@ begin
     vcMJPEG: Result := AV_CODEC_ID_MJPEG;
   else
     Result := 0;
+  end;
+end;
+
+// True se o sample já traz parameter sets (SPS/PPS, ou VPS/SPS/PPS no H265)
+// dentro dele. Varre os start codes Annex-B e olha só o cabeçalho de cada NAL.
+function TVideoDecoder.SampleHasParameterSets(const Data: TBytes): Boolean;
+var
+  I, Skip, T: Integer;
+  Hdr: Byte;
+begin
+  Result := False;
+  if (FCurCodec <> vcH264) and (FCurCodec <> vcH265) then Exit;
+  I := 0;
+  while I + 3 < Length(Data) do
+  begin
+    if (Data[I] = 0) and (Data[I + 1] = 0) then
+    begin
+      if Data[I + 2] = 1 then
+        Skip := 3
+      else if (Data[I + 2] = 0) and (Data[I + 3] = 1) then
+        Skip := 4
+      else
+        Skip := 0;
+      if (Skip > 0) and (I + Skip < Length(Data)) then
+      begin
+        Hdr := Data[I + Skip];
+        if FCurCodec = vcH264 then
+        begin
+          T := Hdr and $1F;
+          if (T = 7) or (T = 8) then Exit(True);
+        end
+        else
+        begin
+          T := (Hdr shr 1) and $3F;
+          if (T = 32) or (T = 33) or (T = 34) then Exit(True);
+        end;
+        Inc(I, Skip);
+        Continue;
+      end;
+    end;
+    Inc(I);
   end;
 end;
 
@@ -266,11 +310,13 @@ begin
   try
     FNeedConfig := False;
     Id := CodecId;
+    FCurCodec := FPendingCodec;
     FExtradata := FPendingExtra;
   finally
     FConfigLock.Leave;
   end;
   FNeedPrepend := True;
+  FSawInbandPs := False;
 
   if Length(FExtradata) = 0 then
     Log('SDP sem parameter sets (SPS/PPS só in-band)');
@@ -313,9 +359,25 @@ var
 begin
   if Length(S.Data) = 0 then Exit;
 
+  // Uma vez que o stream traz os próprios parameter sets, os do SDP não entram
+  // mais. Motivo: há câmera cujo SDP anuncia um SPS/PPS VELHO e incompatível
+  // com o que ela transmite (ex.: SDP diz Baseline/CAVLC e o stream é
+  // Main/CABAC), com o MESMO sps_id/pps_id. Quando o AU chega quebrado em NALs
+  // separadas — é o que o servidor RTSP faz ao repacotizar — o slice IDR vem
+  // num sample só, e prefixar o SDP nele SOBRESCREVE o SPS/PPS bom que acabou
+  // de chegar: o slice é decodificado com os parâmetros errados e o quadro sai
+  // cinza. Conectando direto na câmera o problema não aparece, porque lá o AU
+  // inteiro (SPS+PPS+IDR) vem num sample só e os in-band ficam por último.
+  if (not FSawInbandPs) and SampleHasParameterSets(S.Data) then
+  begin
+    FSawInbandPs := True;
+    Log('parameter sets in-band; ignorando os do SDP');
+  end;
+
   // Prefixa os parameter sets (Annex-B) no 1o AU e nos keyframes, caso a
-  // câmera só os mande no SDP. Se já vierem in-band, o FFmpeg ignora o dup.
-  if (Length(FExtradata) > 0) and (FNeedPrepend or (sfKeyframe in S.Flags)) then
+  // câmera só os mande no SDP.
+  if (Length(FExtradata) > 0) and (not FSawInbandPs) and
+     (FNeedPrepend or (sfKeyframe in S.Flags)) then
   begin
     ExtraLen := Length(FExtradata);
     SetLength(Buf, ExtraLen + Length(S.Data));
