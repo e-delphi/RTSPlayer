@@ -37,6 +37,9 @@ type
     UdpSock: TIdUDPClient;
     FirstPtsKnown: Boolean;
     FirstPts: Int64;
+    // instante de parede correspondente a FirstPts; por trilha, para poder
+    // re-ancorar uma sem bagunçar a outra
+    AnchorWallMs: Int64;
   end;
 
   TTxSession = class;
@@ -110,6 +113,12 @@ implementation
 uses
   IdSocketHandle,
   IdException;
+
+const
+  // Espera máxima por sample antes de considerar que o PTS deu um salto.
+  PACE_MAX_WAIT_MS = 1000;
+  // Atraso máximo tolerado antes de re-ancorar em vez de tentar recuperar.
+  PACE_MAX_LAG_MS = 2000;
 
 { TTxPacerThread }
 
@@ -820,26 +829,35 @@ begin
     begin
       Track.FirstPts := Pts;
       Track.FirstPtsKnown := True;
+      Track.AnchorWallMs := FAnchorWallMs;
     end;
-    if FLiveMode then
-    begin
-      WaitMs := 0;
-    end
+    // Ritmo pelo PTS TAMBÉM ao vivo. Antes o modo live saía sem espera nenhuma,
+    // e como o arquivo só cresce quando o gravador FECHA um bloco (2 s), o
+    // cliente recebia 2 s de mídia numa rajada e ficava mais 2 s sem nada: a
+    // imagem andava aos saltos. O arquivo estar sempre alguns segundos atrás do
+    // vivo não muda com isto — o que muda é a mídia sair na mesma cadência em
+    // que foi gravada.
+    if Track.Timescale > 0 then
+      RelativeMs := ((Pts - Track.FirstPts) * 1000) div Int64(Track.Timescale)
     else
+      RelativeMs := 0;
+    NowMs := FClock.MonotonicMs;
+    Deadline := Track.AnchorWallMs + RelativeMs;
+    WaitMs := Deadline - NowMs;
+    // Fora destes limites não é atraso normal e sim descontinuidade de PTS
+    // (wrap do timestamp RTP, troca de arquivo) ou uma fila que cresceu demais.
+    // Re-ancora: segue no ritmo certo a partir daqui, sem despejar tudo de uma
+    // vez nem dormir um tempo absurdo.
+    if (WaitMs > PACE_MAX_WAIT_MS) or (WaitMs < -PACE_MAX_LAG_MS) then
     begin
-      if Track.Timescale > 0 then
-        RelativeMs := ((Pts - Track.FirstPts) * 1000) div Int64(Track.Timescale)
-      else
-        RelativeMs := 0;
-      Deadline := FAnchorWallMs + RelativeMs;
-      NowMs := FClock.MonotonicMs;
-      WaitMs := Deadline - NowMs;
+      Track.FirstPts := Pts;
+      Track.AnchorWallMs := NowMs;
+      WaitMs := 0;
     end;
+    // Atrasado (WaitMs < 0) sai na hora: é assim que recupera o atraso de uma
+    // rajada curta sem precisar re-ancorar.
     if WaitMs > 0 then
-    begin
-      if WaitMs > 1000 then WaitMs := 1000;
       Sleep(Cardinal(WaitMs));
-    end;
 
     SetLength(SampleData, Sample.PayloadSize);
     if Sample.PayloadSize > 0 then

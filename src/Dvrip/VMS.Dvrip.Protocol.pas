@@ -105,6 +105,44 @@ implementation
 
 const
   MAX_PAYLOAD = 16 * 1024 * 1024; // teto de sanidade (16 MB)
+  // Prazo TOTAL para juntar o payload de UMA mensagem. Uma mensagem DVRIP é um
+  // quadro; em qualquer bitrate real ela chega em muito menos que isto.
+  MAX_PAYLOAD_MS = 5000;
+
+// Lê Size bytes com prazo TOTAL, e não por chamada.
+//
+// Por que não usar RecvExact: o ReadTimeout do Indy só dispara quando o fluxo
+// PARA de chegar. Com um DataLen falso e enorme — já aconteceu de um header de
+// lixo pedir 11 MB — o socket continua entregando vídeo, então nada estoura e a
+// thread fica presa lendo por MINUTOS (medido: 104 s a ~1 Mbps). Nesse tempo a
+// gravação não avança, e quem está assistindo pelo servidor congela e cai por
+// timeout. Com prazo total, um tamanho impossível falha em segundos e o
+// chamador reancora no próximo header.
+function RecvExactWithin(const Stream: ITcpStream; var Buf: TBytes; Size: Integer;
+  TimeoutMs, TotalMs: Cardinal): Boolean;
+var
+  Chunk: TBytes;
+  Got, Want, N: Integer;
+  Deadline: UInt64;
+begin
+  if Size <= 0 then Exit(True);
+  Result := False;
+  if Length(Buf) < Size then SetLength(Buf, Size);
+  SetLength(Chunk, 64 * 1024);
+  Deadline := UInt64(TThread.GetTickCount64) + TotalMs;
+  Got := 0;
+  while Got < Size do
+  begin
+    if UInt64(TThread.GetTickCount64) > Deadline then Exit(False);
+    Want := Size - Got;
+    if Want > Length(Chunk) then Want := Length(Chunk);
+    N := Stream.Recv(Chunk, Want, TimeoutMs);
+    if N <= 0 then Exit(False);
+    Move(Chunk[0], Buf[Got], N);
+    Inc(Got, N);
+  end;
+  Result := True;
+end;
 
 function SofiaHash(const Password: string): string;
 const
@@ -207,7 +245,7 @@ begin
   if Hdr.DataLen > 0 then
   begin
     SetLength(Payload, Hdr.DataLen);
-    if not Stream.RecvExact(Payload, Integer(Hdr.DataLen), TimeoutMs) then
+    if not RecvExactWithin(Stream, Payload, Integer(Hdr.DataLen), TimeoutMs, MAX_PAYLOAD_MS) then
     begin
       FailReason := Format('payload incompleto (%u bytes) MsgID=%d',
         [Hdr.DataLen, Hdr.MsgID]);
@@ -279,7 +317,7 @@ begin
   if DataLen > 0 then
   begin
     SetLength(Payload, DataLen);
-    if not Stream.RecvExact(Payload, Integer(DataLen), TimeoutMs) then
+    if not RecvExactWithin(Stream, Payload, Integer(DataLen), TimeoutMs, MAX_PAYLOAD_MS) then
     begin
       FailReason := Format('payload incompleto (%u bytes) MsgID=%d', [DataLen, MsgID]);
       Exit;
