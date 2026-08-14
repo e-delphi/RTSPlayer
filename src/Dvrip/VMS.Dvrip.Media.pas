@@ -39,6 +39,13 @@ type
     FTag: string;
     FLoggedType: array[Byte] of Boolean; // rate-limit: 1 log por tipo desconhecido
     FResyncs: Integer;
+    // Contabilidade por marcador, INCLUSIVE dos que são descartados. É a única
+    // forma de responder "a câmera não manda áudio" x "o áudio vem num frame
+    // que estamos jogando fora" sem uma captura de rede.
+    FTypeFrames: array[Byte] of Integer;
+    FTypeBytes: array[Byte] of Int64;
+    FFedBytes: Int64; // bytes entregues ao parser na janela (fecha a conta)
+    procedure CountFrame(FrameType: Byte; PayloadLen: Integer);
     procedure Grow(Extra: Integer);
     procedure ParseFrames;
     function FindMarker(FromPos: Integer): Integer;
@@ -52,6 +59,9 @@ type
     procedure SetLogger(const ALogger: ILogger; const ATag: string);
     procedure Feed(const Data: TBytes; Count: Integer);
     procedure Reset;
+    // "in=612000B fc=2(184320B) fd=48(390000B) fa=12(3840B)" — tudo que passou
+    // pelo parser desde a última chamada, que também zera os contadores.
+    function TakeFrameStats: string;
   end;
 
 implementation
@@ -105,6 +115,33 @@ begin
   FCodecKnown := False;
   FResyncs := 0;
   FillChar(FLoggedType, SizeOf(FLoggedType), 0);
+  FillChar(FTypeFrames, SizeOf(FTypeFrames), 0);
+  FillChar(FTypeBytes, SizeOf(FTypeBytes), 0);
+  FFedBytes := 0;
+end;
+
+procedure TDvripMediaParser.CountFrame(FrameType: Byte; PayloadLen: Integer);
+begin
+  Inc(FTypeFrames[FrameType]);
+  Inc(FTypeBytes[FrameType], PayloadLen);
+end;
+
+function TDvripMediaParser.TakeFrameStats: string;
+var
+  I: Integer;
+begin
+  // "in" é tudo que a sessão entregou; a soma dos frames tem que bater com ele
+  // (menos os headers). Se não bater, há byte sumindo antes dos contadores.
+  Result := Format('in=%dB', [FFedBytes]);
+  FFedBytes := 0;
+  for I := 0 to 255 do
+    if FTypeFrames[I] > 0 then
+    begin
+      if Result <> '' then Result := Result + ' ';
+      Result := Result + Format('%.2x=%d(%dB)', [I, FTypeFrames[I], FTypeBytes[I]]);
+      FTypeFrames[I] := 0;
+      FTypeBytes[I] := 0;
+    end;
 end;
 
 procedure TDvripMediaParser.Grow(Extra: Integer);
@@ -116,6 +153,7 @@ end;
 procedure TDvripMediaParser.Feed(const Data: TBytes; Count: Integer);
 begin
   if Count <= 0 then Exit;
+  Inc(FFedBytes, Count);
   Grow(Count);
   Move(Data[0], FBuf[FLen], Count);
   Inc(FLen, Count);
@@ -174,6 +212,7 @@ begin
             P := Q; Continue;
           end;
           if FLen - P < 16 + Len then Break; // frame incompleto: espera mais
+          CountFrame(FrameType, Len);
           EmitVideo(P + 16, Len, True);
           Inc(P, 16 + Len);
         end;
@@ -190,6 +229,7 @@ begin
             P := Q; Continue;
           end;
           if FLen - P < 8 + Len then Break; // frame incompleto: espera mais
+          CountFrame(FrameType, Len);
           EmitVideo(P + 8, Len, False);
           Inc(P, 8 + Len);
         end;
@@ -197,6 +237,7 @@ begin
         begin
           Len := LE16(FBuf, P + 6);
           if FLen - P < 8 + Len then Break;
+          CountFrame(FrameType, Len);
           EmitAudio(P + 8, Len, FBuf[P + 4]);
           Inc(P, 8 + Len);
         end;
@@ -204,11 +245,23 @@ begin
         begin
           Len := LE16(FBuf, P + 6);
           if FLen - P < 8 + Len then Break;
+          CountFrame(FrameType, Len);
+          // Descartado sem barulho até agora. Loga o 1º de cada tipo com o
+          // início do payload: é o que diz se aqui dentro vem áudio (a isis
+          // entrega só 6% do áudio esperado e o resto não aparece em lugar
+          // nenhum) ou se é mesmo metadado.
+          if (FLogger <> nil) and (not FLoggedType[FrameType]) then
+          begin
+            FLoggedType[FrameType] := True;
+            FLogger.Info(FTag, Format('frame 00 00 01 %.2x descartado (len=%d) [%s]',
+              [FrameType, Len, BytesToHex(Copy(FBuf, P, 24), 24)]));
+          end;
           Inc(P, 8 + Len);
         end;
     else
       // Tipo de frame não mapeado — loga 1x por tipo (revela formato novo
       // numa câmera/rede diferente) e tenta ressincronizar no próximo marcador.
+      CountFrame(FrameType, 0);
       if (FLogger <> nil) and (not FLoggedType[FrameType]) then
       begin
         FLoggedType[FrameType] := True;

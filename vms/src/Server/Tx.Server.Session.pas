@@ -72,6 +72,9 @@ type
     FAnchorWallMs: Int64;
     FLiveMode: Boolean;
     FCameraName: string;
+    FLastBlockMs: Int64; // último bloco lido; detecta arquivo que parou de crescer
+    FRejectedLivePath: string; // arquivo novo recusado (codec diferente): não repete
+    function SwitchToNewerLiveFile: Boolean;
     procedure Log(Level: TLogLevel; const Msg: string);
     function GenerateSessionId: string;
     procedure SendResponse(Resp: TRtspResponse);
@@ -119,6 +122,9 @@ const
   PACE_MAX_WAIT_MS = 1000;
   // Atraso máximo tolerado antes de re-ancorar em vez de tentar recuperar.
   PACE_MAX_LAG_MS = 2000;
+  // Quanto o leitor ao vivo espera por um bloco novo antes de devolver o
+  // controle ao pacer (não é erro: ele só tenta de novo).
+  LIVE_READ_WAIT_MS = 2000;
 
 { TTxPacerThread }
 
@@ -369,7 +375,12 @@ begin
   FVmsFile := VmsPath;
   if FLiveMode then
   begin
-    FReader.EnableLiveMode(60000);
+    // Espera curta de propósito: quando o arquivo para de crescer, o pacer
+    // precisa voltar para decidir o que fazer (ver SwitchToNewerLiveFile). Com
+    // os 60 s de antes ele ficava um minuto preso aqui dentro — muito além dos
+    // 10 s em que o cliente desiste. Voltar sem bloco pronto não custa nada: o
+    // leitor não perde a posição e o pacer só tenta de novo.
+    FReader.EnableLiveMode(LIVE_READ_WAIT_MS);
     // Sem isto o cliente entra no PRIMEIRO bloco do arquivo — que pode ter
     // horas de gravação — e ainda no meio de um GOP, ficando com a tela preta
     // até o próximo keyframe. Começar no keyframe mais recente resolve as duas
@@ -641,6 +652,7 @@ begin
   end;
 
   FAnchorWallMs := FClock.MonotonicMs;
+  FLastBlockMs := FAnchorWallMs;
   RtpInfo := '';
   if FVideo.Active then
     RtpInfo := Format('url=%strackID=0;seq=0;rtptime=0', [Req.Uri]);
@@ -763,6 +775,70 @@ begin
   DispatchRtp(FAudio, RtpBytes);
 end;
 
+// O gravador começa um arquivo NOVO toda vez que a sessão com a câmera cai e
+// reconecta. Quem estava assistindo ficava preso no arquivo velho, que nunca
+// mais cresce: imagem congelada até o cliente desistir por timeout e reconectar
+// — foi o que apareceu no log da isis. Se o arquivo parou de crescer e já há um
+// mais recente para esta câmera, segue nele, do keyframe mais recente.
+//
+// Só troca se os codecs baterem: o cliente já recebeu o SDP do arquivo antigo, e
+// mandar outro codec no meio seria pior que congelar. Se mudou, deixa o cliente
+// cair e reconectar, que aí ele pega um SDP novo.
+function TTxSession.SwitchToNewerLiveFile: Boolean;
+const
+  LIVE_STALL_MS = 5000; // > período de um bloco, para não trocar por jitter
+var
+  Path: string;
+  Probe: TVmsReader;
+begin
+  Result := False;
+  if (not FLiveMode) or (FCameraName = '') then Exit;
+  if (FClock.MonotonicMs - FLastBlockMs) < LIVE_STALL_MS then Exit;
+  Path := FindMostRecentVmsForCamera(FRecordingsDir, FCameraName);
+  if (Path = '') or SameText(Path, FVmsFile) then Exit;
+  // Já recusado antes: não reabre nem repete o aviso a cada tentativa.
+  if SameText(Path, FRejectedLivePath) then Exit;
+
+  try
+    Probe := TVmsReader.Create(Path);
+  except
+    Exit; // ainda sendo criado; tenta de novo na próxima
+  end;
+  try
+    if not Probe.ReadHeader then Exit;
+    if FVideo.Active and (Integer(Probe.Header.Video.Codec) <> FVideo.Codec) then
+    begin
+      FRejectedLivePath := Path;
+      Log(llWarn, 'arquivo novo tem outro codec de video; nao vou trocar no meio da sessao');
+      Exit;
+    end;
+    if FAudio.Active and (Integer(Probe.Header.Audio.Codec) <> FAudio.Codec) then
+    begin
+      FRejectedLivePath := Path;
+      Log(llWarn, 'arquivo novo tem outro codec de audio; nao vou trocar no meio da sessao');
+      Exit;
+    end;
+  finally
+    Probe.Free;
+  end;
+
+  try
+    OpenReader(Path); // reabre em modo live e já posiciona no keyframe
+  except
+    on E: Exception do
+    begin
+      Log(llWarn, 'falha ao trocar de arquivo ao vivo: ' + E.Message);
+      Exit;
+    end;
+  end;
+  FVideo.FirstPtsKnown := False;
+  FAudio.FirstPtsKnown := False;
+  FAnchorWallMs := FClock.MonotonicMs;
+  FLastBlockMs := FClock.MonotonicMs;
+  Log(llInfo, 'gravacao trocou de arquivo; seguindo em ' + ExtractFileName(Path));
+  Result := True;
+end;
+
 procedure TTxSession.RunPacerOnce;
 var
   Block: TVmsBlock;
@@ -786,7 +862,8 @@ begin
   begin
     if FLiveMode then
     begin
-      Sleep(50);
+      if not SwitchToNewerLiveFile then
+        Sleep(50);
       Exit;
     end;
     if FLoop then
@@ -805,6 +882,7 @@ begin
       Exit;
     end;
   end;
+  FLastBlockMs := FClock.MonotonicMs;
   for I := 0 to High(Block.Samples) do
   begin
     if FStopFlag then Exit;
@@ -837,27 +915,37 @@ begin
     // imagem andava aos saltos. O arquivo estar sempre alguns segundos atrás do
     // vivo não muda com isto — o que muda é a mídia sair na mesma cadência em
     // que foi gravada.
-    if Track.Timescale > 0 then
-      RelativeMs := ((Pts - Track.FirstPts) * 1000) div Int64(Track.Timescale)
-    else
-      RelativeMs := 0;
-    NowMs := FClock.MonotonicMs;
-    Deadline := Track.AnchorWallMs + RelativeMs;
-    WaitMs := Deadline - NowMs;
-    // Fora destes limites não é atraso normal e sim descontinuidade de PTS
-    // (wrap do timestamp RTP, troca de arquivo) ou uma fila que cresceu demais.
-    // Re-ancora: segue no ritmo certo a partir daqui, sem despejar tudo de uma
-    // vez nem dormir um tempo absurdo.
-    if (WaitMs > PACE_MAX_WAIT_MS) or (WaitMs < -PACE_MAX_LAG_MS) then
+    //
+    // Quem dita o ritmo é o VÍDEO. O áudio sai na posição em que foi gravado —
+    // ele está intercalado no bloco, entre os quadros — sem espera própria. Uma
+    // trilha de áudio irregular (a câmera dvrip manda em rajadas, e em vários
+    // trechos nada) tem a linha de tempo bem mais longa que o bloco, e se
+    // dormisse no relógio dela seguraria o vídeo que vem depois: engasgo no
+    // vídeo por causa do áudio. Sem trilha de vídeo, quem dita é o áudio.
+    if (Sample.TrackId = 0) or (not FVideo.Active) then
     begin
-      Track.FirstPts := Pts;
-      Track.AnchorWallMs := NowMs;
-      WaitMs := 0;
+      if Track.Timescale > 0 then
+        RelativeMs := ((Pts - Track.FirstPts) * 1000) div Int64(Track.Timescale)
+      else
+        RelativeMs := 0;
+      NowMs := FClock.MonotonicMs;
+      Deadline := Track.AnchorWallMs + RelativeMs;
+      WaitMs := Deadline - NowMs;
+      // Fora destes limites não é atraso normal e sim descontinuidade de PTS
+      // (wrap do timestamp RTP, troca de arquivo) ou uma fila que cresceu
+      // demais. Re-ancora: segue no ritmo certo a partir daqui, sem despejar
+      // tudo de uma vez nem dormir um tempo absurdo.
+      if (WaitMs > PACE_MAX_WAIT_MS) or (WaitMs < -PACE_MAX_LAG_MS) then
+      begin
+        Track.FirstPts := Pts;
+        Track.AnchorWallMs := NowMs;
+        WaitMs := 0;
+      end;
+      // Atrasado (WaitMs < 0) sai na hora: é assim que recupera o atraso de uma
+      // rajada curta sem precisar re-ancorar.
+      if WaitMs > 0 then
+        Sleep(Cardinal(WaitMs));
     end;
-    // Atrasado (WaitMs < 0) sai na hora: é assim que recupera o atraso de uma
-    // rajada curta sem precisar re-ancorar.
-    if WaitMs > 0 then
-      Sleep(Cardinal(WaitMs));
 
     SetLength(SampleData, Sample.PayloadSize);
     if Sample.PayloadSize > 0 then

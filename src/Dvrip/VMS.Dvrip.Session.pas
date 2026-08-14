@@ -36,7 +36,8 @@ type
     FLastKeepAliveMs: Int64;
     FVideoNotified: Boolean;
     FAudioNotified: Boolean;
-    FPts: Int64;
+    FPtsBaseMs: Int64;   // instante do 1º quadro; origem da linha de tempo
+    FPtsBaseSet: Boolean;
     FAudioPts: Int64;
     FTag: string;
     FStreamType: string;
@@ -314,7 +315,7 @@ begin
   FLastKeepAliveMs := FClock.MonotonicMs;
   while not StopRequested do
   begin
-    if not DvripRecvResync(FTcp, Hdr, Payload, 4000, Skipped, FailReason) then
+    if not DvripRecvResync(FTcp, Hdr, Payload, 4000, FSessionID, Skipped, FailReason) then
       raise EVmsIoError.Create('DVRIP recv: ' + FailReason);
     if Skipped > 0 then
     begin
@@ -492,6 +493,7 @@ procedure TDvripSession.HandleVideo(const AnnexB: TBytes; Keyframe: Boolean; Cod
 var
   S: TSample;
   Csd: TBytes;
+  NowMs: Int64;
 begin
   if not FVideoNotified then
   begin
@@ -509,8 +511,26 @@ begin
   Inc(FWinVidBytes, Length(AnnexB));
   S.Kind := tkVideo;
   S.TrackId := 0;
-  S.Pts := FPts;
-  Inc(FPts, 3600); // ~40ms @ 90kHz (só p/ ordem; display não depende disso)
+  // PTS pelo relógio de chegada, em 90 kHz.
+  //
+  // O incremento fixo que havia aqui (3600 = 40 ms = 25 fps) era só para manter
+  // a ORDEM, e não é a taxa real: esta câmera manda 10 fps, então a linha de
+  // tempo do .vms corria 2,5x mais rápido que o relógio (257 s de gravação
+  // viraram 103 s de mídia). Enquanto ninguém olhava o PTS isso não aparecia;
+  // agora o servidor RTSP usa o PTS para dar o ritmo do ao vivo, e o arquivo
+  // "acaba" antes da hora — o cliente recebe aos trancos.
+  //
+  // Não dá para usar o timestamp da câmera: só o header de I-frame (16 bytes)
+  // tem esse campo; o de P-frame (FD) só traz o length. O instante em que o
+  // quadro ficou completo é a melhor referência disponível, e é o que reproduz
+  // a cadência real na saída.
+  NowMs := FClock.MonotonicMs;
+  if not FPtsBaseSet then
+  begin
+    FPtsBaseSet := True;
+    FPtsBaseMs := NowMs;
+  end;
+  S.Pts := (NowMs - FPtsBaseMs) * 90;
   if Keyframe then S.Flags := [sfKeyframe] else S.Flags := [];
   S.Data := AnnexB;
   if FMediaSink <> nil then
@@ -533,7 +553,9 @@ begin
   S.Kind := tkAudio;
   S.TrackId := 1;
   S.Pts := FAudioPts;
-  Inc(FAudioPts, 320); // ~40ms @ 8kHz
+  // G711 a 8 kHz é 1 byte por amostra: a duração do frame É o tamanho dele.
+  // O +320 fixo de antes só valia se todo frame tivesse 320 bytes.
+  Inc(FAudioPts, Length(Data));
   S.Flags := [];
   S.Data := Data;
   if FMediaSink <> nil then
@@ -546,6 +568,7 @@ var
   NowMs: Int64;
   ElapsedMs: Int64;
   Kbps: Integer;
+  Frames: string;
 begin
   NowMs := FClock.MonotonicMs;
   if FStatsTickMs = 0 then
@@ -555,11 +578,15 @@ begin
   end;
   ElapsedMs := NowMs - FStatsTickMs;
   if ElapsedMs < 5000 then Exit;
+  // Os contadores do parser incluem os frames DESCARTADOS; a soma deles com o
+  // que virou mídia é tudo que veio no fluxo. Se faltar áudio, é aqui que se vê
+  // se ele chegou em algum marcador que estamos ignorando.
+  Frames := FParser.TakeFrameStats;
   if (FWinI or FWinP or FWinAud) <> 0 then
   begin
     Kbps := Integer((FWinVidBytes * 8) div (ElapsedMs)); // bytes*8/ms = kbps
-    FLogger.Info(FTag, Format('stats %ds: vid I=%d P=%d (%d kbps) | audio=%d frames',
-      [ElapsedMs div 1000, FWinI, FWinP, Kbps, FWinAud]));
+    FLogger.Info(FTag, Format('stats %ds: vid I=%d P=%d (%d kbps) | audio=%d frames | parser: %s',
+      [ElapsedMs div 1000, FWinI, FWinP, Kbps, FWinAud, Frames]));
   end
   else
     FLogger.Warn(FTag, Format('stats %ds: SEM mídia nessa janela', [ElapsedMs div 1000]));
@@ -577,7 +604,8 @@ begin
   FSeq := 0;
   FVideoNotified := False;
   FAudioNotified := False;
-  FPts := 0;
+  FPtsBaseSet := False;
+  FPtsBaseMs := 0;
   FAudioPts := 0;
   FWinI := 0; FWinP := 0; FWinAud := 0;
   FWinVidBytes := 0; FWinAudBytes := 0;

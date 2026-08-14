@@ -719,6 +719,11 @@ end;
 
 procedure TCameraSession.SetupDepacketizers;
 begin
+  // Idempotente: solta o demux anterior antes de trocar. Sem isto, chamar duas
+  // vezes vazava um TRtpDemux por conexão — e o de antes ficava sem dono, com
+  // as rotas apontando para depacketizadores já descartados.
+  if FDemux <> nil then
+    FreeAndNil(FDemux);
   FDemux := TRtpDemux.Create;
   FVideoDepk := nil;
   FAudioDepk := nil;
@@ -1108,7 +1113,10 @@ begin
     OpenConnections;
     if not HandshakeRtsp then
       raise EVmsProtocolError.Create('Handshake failed');
-    SetupDepacketizers;
+    // Os depacketizadores já foram montados dentro do HandshakeRtsp, antes do
+    // ValidateFirstRtp — que precisa deles para reconhecer o 1º RTP. Refazê-los
+    // aqui só jogava fora o estado do pacote que acabou de chegar (se era o
+    // início de um FU-A, o quadro se perdia) e vazava o demux anterior.
     WriteHeaderFromSdp;
     NotifySinkFormat;
     FStreamStartMs := FClock.MonotonicMs;

@@ -80,8 +80,14 @@ function DvripRecv(const Stream: ITcpStream; out Hdr: TDvripHeader;
 // SkippedBytes = quantos bytes foram descartados até reencontrar o início
 // (0 = leitura limpa). Se vier sempre o mesmo número, é tamanho mal calculado
 // em algum tipo de mensagem, e aí o conserto é no comprimento, não aqui.
+// ExpectedSession = SessionID desta sessão (0 antes do login = não confere).
+// Sem ele, "começa com 0xFF e o tamanho cabe em 16 MB" aceita header falso
+// dentro de vídeo comprimido — foi medido: um 0xFF 14 bytes ANTES de um header
+// de verdade faz o DataLen ser lido em cima do próprio SessionID do header
+// seguinte (0x00BF0000 = 12,4 MB), e a sessão morre ali.
 function DvripRecvResync(const Stream: ITcpStream; out Hdr: TDvripHeader;
                          out Payload: TBytes; TimeoutMs: Cardinal;
+                         ExpectedSession: Cardinal;
                          out SkippedBytes: Integer;
                          out FailReason: string): Boolean;
 
@@ -126,7 +132,6 @@ var
   Deadline: UInt64;
 begin
   if Size <= 0 then Exit(True);
-  Result := False;
   if Length(Buf) < Size then SetLength(Buf, Size);
   SetLength(Chunk, 64 * 1024);
   Deadline := UInt64(TThread.GetTickCount64) + TotalMs;
@@ -255,22 +260,31 @@ begin
   Result := True;
 end;
 
-// Um header só é aceito se o marcador bate E o tamanho é sanidade. Só o 0xFF
-// não serve: dentro de vídeo comprimido ele aparece toda hora — foi assim que
-// um "header" com DataLen de 1,4 GB passou pela checagem antiga.
-function HeaderPlausible(const HBuf: TBytes; out MsgID: Word; out DataLen: Cardinal): Boolean;
+// Um header só é aceito se TODOS os campos fixos baterem. Só o 0xFF não serve:
+// dentro de vídeo comprimido ele aparece toda hora. E só somar o teto de
+// tamanho também não bastou — na prática os falsos positivos caíam a poucos
+// bytes de um header verdadeiro, e o DataLen acabava lido em cima dos campos
+// dele (SessionID, reservado), dando valores enormes mas "válidos".
+//
+// Os dois campos que um trecho de vídeo não imita por acaso:
+//   - bytes 2-3 reservados, sempre 00 00
+//   - SessionID, um valor de 32 bits que só esta sessão conhece
+function HeaderPlausible(const HBuf: TBytes; out MsgID: Word; out DataLen: Cardinal;
+  ExpectedSession: Cardinal): Boolean;
 begin
   Result := False;
   if Length(HBuf) < 20 then Exit;
   if HBuf[0] <> DVRIP_HEAD then Exit;
+  if (HBuf[2] <> 0) or (HBuf[3] <> 0) then Exit;
+  if (ExpectedSession <> 0) and (GetLE32(HBuf, 4) <> ExpectedSession) then Exit;
   MsgID := Word(HBuf[14]) or (Word(HBuf[15]) shl 8);
   DataLen := GetLE32(HBuf, 16);
   Result := DataLen <= MAX_PAYLOAD;
 end;
 
 function DvripRecvResync(const Stream: ITcpStream; out Hdr: TDvripHeader;
-  out Payload: TBytes; TimeoutMs: Cardinal; out SkippedBytes: Integer;
-  out FailReason: string): Boolean;
+  out Payload: TBytes; TimeoutMs: Cardinal; ExpectedSession: Cardinal;
+  out SkippedBytes: Integer; out FailReason: string): Boolean;
 const
   MAX_RESYNC_SCAN = 4 * 1024 * 1024; // desiste em vez de varrer para sempre
 var
@@ -292,7 +306,7 @@ begin
   end;
 
   // desliza a janela de 20 bytes até ela parecer um header de verdade
-  while not HeaderPlausible(HBuf, MsgID, DataLen) do
+  while not HeaderPlausible(HBuf, MsgID, DataLen, ExpectedSession) do
   begin
     if SkippedBytes >= MAX_RESYNC_SCAN then
     begin
