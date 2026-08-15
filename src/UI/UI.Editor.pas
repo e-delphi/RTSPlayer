@@ -63,6 +63,8 @@ type
     edAudioDelay: TEdit;
     lblVideoDelay: TLabel;
     edVideoDelay: TEdit;
+    lblTailscale: TLabel;
+    swTailscale: TSwitch;
     Layout1: TLayout;
     btnTestConn: TRectangle;
     lblTestConn: TLabel;
@@ -201,6 +203,7 @@ begin
     edMaxRetries.Text := IntToStr(Cameras[Index].MaxReconnectAttempts);
     edAudioDelay.Text := IntToStr(Cameras[Index].AudioDelayMs);
     edVideoDelay.Text := IntToStr(Cameras[Index].VideoDelayMs);
+    swTailscale.IsChecked := Cameras[Index].UsesTailscale;
     lblEditTitle.Text := 'Editar câmera';
     btnDelete.Visible := True;
   end
@@ -217,6 +220,7 @@ begin
     edMaxRetries.Text := '0';
     edAudioDelay.Text := '200';
     edVideoDelay.Text := '200';
+    swTailscale.IsChecked := False;
     lblEditTitle.Text := 'Nova câmera';
     btnDelete.Visible := False;
   end;
@@ -285,9 +289,12 @@ begin
     lblTestResult.Text := 'Informe o host/IP';
     Exit;
   end;
+  // O teste passa pelo mesmo caminho de conexão, então precisa do mesmo tratamento
+  // de VPN: testar câmera da tailnet com o túnel baixo falharia sempre.
   Cam := MakeCamera(Trim(edName.Text),
     BuildUrl(ProtoStr(FSelectedProto), edHost.Text, edPort.Text, edPath.Text),
-    edUser.Text, edPass.Text, ParseTransports(ChipToStr(FSelectedChip)));
+    edUser.Text, edPass.Text, ParseTransports(ChipToStr(FSelectedChip)),
+    0, 200, 200, swTailscale.IsChecked);
   Cfg := BuildSessionConfig(FAppCfg, Cam);
   Cfg.RecordEnabled := False;
   Cfg.ConnectTimeoutMs := 4000;
@@ -351,7 +358,8 @@ begin
                     ParseTransports(ChipToStr(FSelectedChip)),
                     StrToIntDef(Trim(edMaxRetries.Text), 0),
                     StrToIntDef(Trim(edAudioDelay.Text), 200),
-                    StrToIntDef(Trim(edVideoDelay.Text), 200));
+                    StrToIntDef(Trim(edVideoDelay.Text), 200),
+                    swTailscale.IsChecked);
   if Assigned(FOnSave) then FOnSave(Self, Cam, FEditIndex);
 end;
 

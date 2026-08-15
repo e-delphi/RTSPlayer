@@ -30,6 +30,7 @@ uses
   VMS.Domain.Supervisor in '..\src\Domain\VMS.Domain.Supervisor.pas',
   VMS.Net.Intf in '..\src\Net\VMS.Net.Intf.pas',
   VMS.Net.Tcp in '..\src\Net\VMS.Net.Tcp.pas',
+  VMS.Net.Tailscale in '..\src\Net\VMS.Net.Tailscale.pas',
   VMS.Net.Udp in '..\src\Net\VMS.Net.Udp.pas',
   VMS.Rtp.Demux in '..\src\Rtp\VMS.Rtp.Demux.pas',
   VMS.Rtp.Packet in '..\src\Rtp\VMS.Rtp.Packet.pas',

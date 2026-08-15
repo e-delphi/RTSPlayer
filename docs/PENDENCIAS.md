@@ -86,18 +86,18 @@ A retenção automática já está implementada (`retention` no `vmsserver.json`
 
 **Próximo passo.** Apontar `storageDir` para uma pasta fora de qualquer pasta sincronizada (ex.: `D:\vms\recordings`) e, no código, avisar na partida quando o caminho estiver sob OneDrive/Dropbox/Google Drive.
 
-### P1-4 · Android: subir o Tailscale quando a câmera precisar
+### P1-4 · Tailscale: o que falta depois da primeira versão
 
-**Motivo.** O acesso do celular ao vmsserver é por Tailscale — o `bindAddress` recomendado é o IP 100.x justamente para não expor o servidor na LAN. Se o Tailscale não está conectado no celular, a câmera que aponta para um IP 100.x simplesmente não conecta, e o app não explica o porquê: fica na cara de "não consegui conectar", igual a câmera desligada.
+Já implementado (`VMS.Net.Tailscale`, campo `tailscale` por câmera, switch no editor): antes de cada tentativa de conexão, se a câmera está marcada, o app testa a porta real da câmera; se não responde, abre o app do Tailscale e espera até 30 s a rota aparecer, testando de 500 em 500 ms. Vale também nas reconexões e no botão *Testar conexão*.
 
-**O que precisa acontecer.**
+**O limite da plataforma, que não tem como contornar por Intent:** o Android não deixa um app ligar a VPN de outro app — só o dono do `VpnService` sobe o túnel, e com consentimento do usuário. Então o app do Tailscale vai para a frente e **quem liga é o usuário**, a menos que ele já esteja configurado para conectar ao abrir. O que ficou em aberto por causa disso:
 
-1. Saber que aquela câmera depende do Tailscale. Dá para detectar pelo destino, sem campo novo na config: faixa `100.64.0.0/10` (CGNAT, que é o que o Tailscale usa) ou nome em `*.ts.net`. Um campo explícito na câmera continua sendo opção se a detecção pegar falso positivo.
-2. Saber se o túnel está de pé, antes de tentar conectar.
-3. Se não estiver, subir. **Aqui está a parte a investigar:** o Android não deixa um app ligar a VPN de outro app. Os caminhos plausíveis, em ordem de esforço: abrir o app do Tailscale por Intent (`com.tailscale.ipn`) e pedir a confirmação do usuário; configuração via MDM/política em dispositivo gerenciado; ou embutir o `tsnet` e ser o próprio `VpnService` (muito mais trabalho, e passa a concorrer com o app oficial). Precisa testar o que funciona sem root.
-4. Enquanto não subir, mensagem específica na tela — "a câmera está numa rede Tailscale e o túnel está desligado" é diferente de "não consegui conectar".
-
-**Sem isso**, usar o servidor de fora de casa depende de lembrar de abrir o Tailscale antes, e o diagnóstico quando esquece é enganoso.
+1. **Feedback na tela.** Hoje a espera aparece só como "Conectando" mais as linhas no log de depuração. Falta um estado próprio — "aguardando a VPN" é diferente de "conectando na câmera", e o usuário precisa saber que tem que tocar em algo no outro app.
+2. **Saber se a VPN está de pé, e não só se a câmera responde.** Com `ConnectivityManager` + `NetworkCapabilities.TRANSPORT_VPN` dava para distinguir "túnel caído" de "túnel de pé e câmera desligada", e evitar jogar o usuário no Tailscale quando o problema é a câmera. Ficou de fora para não depender de classes JNI que talvez não estejam declaradas nesta versão do Delphi — precisa testar.
+3. **Voltar para o app sozinho** depois de o túnel subir. Hoje o usuário volta na mão.
+4. **Tailscale ausente.** Se o app não está instalado, o log avisa e a conexão falha normalmente; não há convite para instalar.
+5. **Detecção automática não liga nada.** `LooksLikeTailnetHost` (CGNAT `100.64.0.0/10` e `*.ts.net`) só emite aviso no log quando o host parece da tailnet e a opção está desligada. É de propósito: ligar sozinho mudaria o comportamento de quem não pediu. Se na prática o aviso sempre significar "esqueci de marcar", vale pré-marcar o switch no editor quando o host casar.
+6. **Verificar em campo pelo 4G** — o caminho todo foi escrito, mas ainda não foi exercitado fora da LAN.
 
 ### P2-1 · SDP do servidor propaga parameter sets falsos
 

@@ -77,6 +77,11 @@ dá para copiar as câmeras de um arquivo para o outro sem traduzir nada. Array
 
 `logLevel` não vale para o servidor: ele grava todos os níveis (ver Logs).
 
+`tailscale: true` numa câmera faz o servidor esperar rota até ela antes de
+conectar (útil se a câmera só existe dentro da tailnet). No Windows isso é só
+espera: o Tailscale é serviço do sistema, não app que se abra — quem abre o app é
+o RTSPlayer no Android.
+
 Dois cuidados na hora de preencher:
 
 - **Use nomes ASCII e minúsculos** para as câmeras (`isis`, não `Ísis`): o nome

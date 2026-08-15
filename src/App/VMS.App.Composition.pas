@@ -96,6 +96,7 @@ begin
   Result.RtspTimeoutMs := 10000;
   Result.RecordEnabled := True;
   Result.MaxReconnectAttempts := Cam.MaxReconnectAttempts;
+  Result.UsesTailscale := Cam.UsesTailscale;
 end;
 
 function BuildReconnectPolicy(const Cam: TCameraConfigEntry): IReconnectPolicy;

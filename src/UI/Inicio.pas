@@ -224,7 +224,8 @@ begin
                             ParseTransports(JsonStr(O, 'transport')),
                             JsonInt(O, 'maxRetries', 0),
                             JsonInt(O, 'audioDelayMs', 200),
-                            JsonInt(O, 'videoDelayMs', 200)));
+                            JsonInt(O, 'videoDelayMs', 200),
+                            JsonBool(O, 'tailscale', False)));
       end;
     FCameras := List.ToArray;
   finally
@@ -252,6 +253,7 @@ begin
       O.AddPair('maxRetries', TJSONNumber.Create(FCameras[I].MaxReconnectAttempts));
       O.AddPair('audioDelayMs', TJSONNumber.Create(FCameras[I].AudioDelayMs));
       O.AddPair('videoDelayMs', TJSONNumber.Create(FCameras[I].VideoDelayMs));
+      O.AddPair('tailscale', TJSONBool.Create(FCameras[I].UsesTailscale));
       Arr.AddElement(O);
     end;
     TFile.WriteAllText(CamerasFilePath, Arr.ToJSON, TEncoding.UTF8);

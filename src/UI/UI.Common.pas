@@ -49,6 +49,7 @@ type
 
 function JsonStr(O: TJSONObject; const Name: string): string;
 function JsonInt(O: TJSONObject; const Name: string; Def: Integer): Integer;
+function JsonBool(O: TJSONObject; const Name: string; Def: Boolean): Boolean;
 
 function ParseTransports(const S: string): TArray<TTransportKind>;
 function TransportsToStr(const T: TArray<TTransportKind>): string;
@@ -63,7 +64,8 @@ function ProtoStr(Idx: Integer): string;
 
 function MakeCamera(const Name, Url, User, Pass: string;
   const Transports: TArray<TTransportKind>; MaxRetries: Integer = 0;
-  AudioDelay: Integer = 200; VideoDelay: Integer = 200): TCameraConfigEntry;
+  AudioDelay: Integer = 200; VideoDelay: Integer = 200;
+  UsesTailscale: Boolean = False): TCameraConfigEntry;
 
 implementation
 
@@ -89,6 +91,19 @@ begin
     Result := TJSONNumber(V).AsInt
   else if V is TJSONString then
     Result := StrToIntDef(TJSONString(V).Value, Def);
+end;
+
+function JsonBool(O: TJSONObject; const Name: string; Def: Boolean): Boolean;
+var
+  V: TJSONValue;
+begin
+  Result := Def;
+  if O = nil then Exit;
+  V := O.GetValue(Name);
+  if V is TJSONBool then
+    Result := TJSONBool(V).AsBoolean
+  else if V is TJSONString then
+    Result := SameText(Trim(TJSONString(V).Value), 'true');
 end;
 
 function ParseTransports(const S: string): TArray<TTransportKind>;
@@ -214,7 +229,8 @@ end;
 
 function MakeCamera(const Name, Url, User, Pass: string;
   const Transports: TArray<TTransportKind>; MaxRetries: Integer = 0;
-  AudioDelay: Integer = 200; VideoDelay: Integer = 200): TCameraConfigEntry;
+  AudioDelay: Integer = 200; VideoDelay: Integer = 200;
+  UsesTailscale: Boolean = False): TCameraConfigEntry;
 begin
   Result.Name := Name;
   Result.Enabled := True;
@@ -239,6 +255,7 @@ begin
   if VideoDelay < 0 then VideoDelay := 0;
   Result.AudioDelayMs := AudioDelay;
   Result.VideoDelayMs := VideoDelay;
+  Result.UsesTailscale := UsesTailscale;
 end;
 
 end.

@@ -11,6 +11,11 @@
     <uses-feature android:glEsVersion="0x00020000" android:required="true"/>
     <queries>
 <%queries-child-elements%>
+        <!-- Sem isto, no Android 11+ o getLaunchIntentForPackage do Tailscale
+             volta nil mesmo com o app instalado: a visibilidade de pacotes é
+             filtrada, e só quem está declarado aqui aparece. Necessário para a
+             câmera marcada como "rede Tailscale" (ver VMS.Net.Tailscale). -->
+        <package android:name="com.tailscale.ipn" />
     </queries>
     <application
         android:persistent="%persistent%"

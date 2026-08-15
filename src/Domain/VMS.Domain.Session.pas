@@ -30,7 +30,8 @@ uses
   VMS.Depk.PCM,
   VMS.Rec.Format,
   VMS.Rec.Block,
-  VMS.Rec.Writer;
+  VMS.Rec.Writer,
+  VMS.Net.Tailscale;
 
 type
   TCameraSessionConfig = record
@@ -53,6 +54,9 @@ type
     RecordEnabled: Boolean;
     // 0 = reconecta pra sempre; N > 0 = desiste após N falhas seguidas
     MaxReconnectAttempts: Integer;
+    // Câmera dentro da tailnet: espera o túnel antes de cada tentativa de
+    // conexão (inclusive nas reconexões, que é quando a VPN costuma ter caído).
+    UsesTailscale: Boolean;
   end;
 
   TDepacketizerFactoryFn = reference to function(VideoCodec: TVideoCodec; AudioCodec: TAudioCodec;
@@ -311,6 +315,16 @@ var
 begin
   if not ParseRtspUrl(FConfig.Url, Parsed) then
     raise EVmsConfigError.CreateFmt('Invalid RTSP URL: %s', [FConfig.Url]);
+
+  // Antes de qualquer socket: se a câmera vive na tailnet, não há rota até ela
+  // sem VPN, e o erro de conexão não diria isso. Roda em toda tentativa, não só
+  // na primeira — a reconexão é justamente quando o túnel caiu.
+  if FConfig.UsesTailscale then
+    EnsureTailnetUp(Parsed.Host, Parsed.Port, FLogger, FStopEvent)
+  else if LooksLikeTailnetHost(Parsed.Host) then
+    FLogger.Warn('session.' + FConfig.Name,
+      Format('%s parece ser endereco de tailnet, mas a opcao Tailscale desta camera' +
+             ' esta desligada', [Parsed.Host]));
 
   FTcp := TIndyTcpStream.Create;
   try

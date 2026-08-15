@@ -36,6 +36,10 @@ type
     // atrasos (ms) p/ sincronizar A/V no Windows (jitter buffer). Default 200.
     AudioDelayMs: Integer;
     VideoDelayMs: Integer;
+    // Câmera que só existe dentro da tailnet: antes de conectar, garante que o
+    // túnel do Tailscale esteja de pé (ver VMS.App.Tailscale). Fica desligado
+    // por padrão — quem está na LAN não deve pagar por essa espera.
+    UsesTailscale: Boolean;
   end;
 
   TAppConfig = record
@@ -208,6 +212,7 @@ begin
   Result.MaxReconnectAttempts := GetJsonInt(Obj, 'maxRetries', 0);
   Result.AudioDelayMs := GetJsonInt(Obj, 'audioDelayMs', 200);
   Result.VideoDelayMs := GetJsonInt(Obj, 'videoDelayMs', 200);
+  Result.UsesTailscale := GetJsonBool(Obj, 'tailscale', False);
 end;
 
 procedure ValidateConfig(const Cfg: TAppConfig);

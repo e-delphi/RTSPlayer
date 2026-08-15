@@ -12,6 +12,7 @@ uses
   System.SyncObjs,
   VMS.Net.Intf,
   VMS.Net.Tcp,
+  VMS.Net.Tailscale,
   VMS.Domain.Types,
   VMS.Domain.Logging,
   VMS.Domain.Clock,
@@ -142,6 +143,8 @@ begin
       Info := 'URL DVRIP inválida';
       Exit;
     end;
+    if FConfig.UsesTailscale then
+      EnsureTailnetUp(Host, Port, FLogger, FStopEvent);
     FTcp := TIndyTcpStream.Create;
     try
       FTcp.Connect(Host, Port, FConfig.ConnectTimeoutMs);
@@ -619,6 +622,14 @@ begin
   FParser.Reset;
   if not ParseHostPort(Host, Port) then
     raise EVmsConfigError.Create('URL DVRIP inválida: ' + FConfig.Url);
+
+  // Câmera na tailnet: sem o túnel não existe rota, e o timeout de conexão não
+  // explicaria isso. Vale para toda tentativa, inclusive reconexão.
+  if FConfig.UsesTailscale then
+    EnsureTailnetUp(Host, Port, FLogger, FStopEvent)
+  else if LooksLikeTailnetHost(Host) then
+    FLogger.Warn(FTag, Format('%s parece ser endereco de tailnet, mas a opcao' +
+      ' Tailscale desta camera esta desligada', [Host]));
 
   FTcp := TIndyTcpStream.Create;
   try

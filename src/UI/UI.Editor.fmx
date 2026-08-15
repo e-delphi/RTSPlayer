@@ -501,6 +501,33 @@ object FrameEditor: TFrameEditor
       Size.PlatformDefault = False
       TextPrompt = '200'
     end
+    object lblTailscale: TLabel
+      Align = Top
+      StyledSettings = [Family, Style]
+      Margins.Left = 16.000000000000000000
+      Margins.Top = 16.000000000000000000
+      Position.X = 16.000000000000000000
+      Position.Y = 731.000000000000000000
+      Size.Width = 328.000000000000000000
+      Size.Height = 20.000000000000000000
+      Size.PlatformDefault = False
+      TextSettings.Font.Size = 13.000000000000000000
+      TextSettings.FontColor = xFFB0B0B0
+      Text = 'C'#226'mera na rede Tailscale (sobe a VPN antes de conectar)'
+      TabOrder = 13
+    end
+    object swTailscale: TSwitch
+      Align = Top
+      IsChecked = False
+      Margins.Left = 16.000000000000000000
+      Margins.Top = 8.000000000000000000
+      Position.X = 16.000000000000000000
+      Position.Y = 759.000000000000000000
+      Size.Width = 60.000000000000000000
+      Size.Height = 30.000000000000000000
+      Size.PlatformDefault = False
+      TabOrder = 14
+    end
     object Layout1: TLayout
       Align = Top
       Position.Y = 432.000000000000000000

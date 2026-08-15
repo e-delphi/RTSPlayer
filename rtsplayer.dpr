@@ -45,6 +45,7 @@ uses
   VMS.Domain.Types in 'src\Domain\VMS.Domain.Types.pas',
   VMS.Net.Intf in 'src\Net\VMS.Net.Intf.pas',
   VMS.Net.Tcp in 'src\Net\VMS.Net.Tcp.pas',
+  VMS.Net.Tailscale in 'src\Net\VMS.Net.Tailscale.pas',
   VMS.Net.Udp in 'src\Net\VMS.Net.Udp.pas',
   VMS.Rec.Block in 'src\Recording\VMS.Rec.Block.pas',
   VMS.Rec.Crc32 in 'src\Recording\VMS.Rec.Crc32.pas',
