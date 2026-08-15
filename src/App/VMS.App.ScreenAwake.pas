@@ -1,4 +1,4 @@
-unit VMS.App.ScreenAwake;
+﻿unit VMS.App.ScreenAwake;
 
 // Mantém a tela acesa enquanto uma câmera está sendo exibida. No Android liga o
 // FLAG_KEEP_SCREEN_ON na janela da Activity: não exige permissão (ao contrário
@@ -15,6 +15,7 @@ implementation
 {$IFDEF ANDROID}
 
 uses
+  System.SysUtils,
   Androidapi.Helpers,
   Androidapi.JNI.App,
   Androidapi.JNI.GraphicsContentViewText,

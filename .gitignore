@@ -13,3 +13,4 @@ __recovery/
 !/bin/Win64/Release/*.dll
 /vms/dcu/
 /vms/bin/
+*.pyc

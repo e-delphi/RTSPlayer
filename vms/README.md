@@ -39,12 +39,36 @@ O servidor então acha o arquivo mais recente de cada câmera
 ## Configuração
 
 `vmsserver.json`, ao lado do executável (ou passado como primeiro argumento).
-É o mesmo formato do gravador, mais duas chaves:
+É o mesmo formato do gravador, mais três chaves:
 
 - `rtspPort` — porta única onde tudo é publicado (padrão 8554).
 - `bindAddress` — IP onde escutar. **Vazio = 0.0.0.0**, ou seja, a LAN inteira
   enxerga. Coloque aqui o IP `100.x` do Tailscale desta máquina para que só o
   tailnet alcance o servidor.
+- `retention` — limpeza automática das gravações. **Sem ela o disco enche**: são
+  ~7 GB por dia por câmera a 1 Mbps.
+
+```json
+"retention": {
+  "maxDays": 7,          // idade máxima do arquivo
+  "maxTotalGB": 50,      // tamanho somado dos .vms da pasta
+  "minFreeGB": 20,       // espaço que deve continuar livre no disco
+  "intervalMinutes": 5   // de quanto em quanto tempo varre
+}
+```
+
+Cada limite é opcional; `0` desliga aquele limite, e o bloco ausente desliga a
+limpeza inteira (nada apaga gravação velha). Vale o que estourar primeiro, e
+apaga-se sempre o arquivo **mais antigo** — com três câmeras a 21 GB/dia, o
+`maxTotalGB: 50` acima dá ~2 dias e meio de histórico, então é ele que manda, não
+o `maxDays`. A gravação em curso e qualquer arquivo aberto por uma sessão ao vivo
+nunca são apagados: ficam para a varredura seguinte. A partida loga o regime em
+vigor e o espaço livre:
+
+```
+[INFO ] main: Espaco livre: 184.2 GB | retencao: 7 dia(s), max 50.0 GB gravados, min 20.0 GB livres; varredura a cada 5 min
+[INFO ] retencao: apagado ayla_2026-08-13_19-12-38.vms (3.2 MB, limite de tamanho)
+```
 
 O campo `transport` é uma **string separada por vírgula**: `"tcp"`, `"udp"`,
 `"tcp,udp"` — o mesmo formato que o app RTSPlayer grava no `cameras.json`, então

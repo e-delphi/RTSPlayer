@@ -6,8 +6,11 @@
 //
 // Header (20 bytes):
 //   0    : 0xFF (head)
-//   1    : versão (0x00)
-//   2-3  : reservado
+//   1    : versão (0x01 nas mensagens que a câmera manda)
+//   2    : reservado (0x00)
+//   3    : flags — NÃO é reservado. Medido na câmera XM: 0x00 nas mensagens de
+//          vídeo e 0x80 nas de áudio. Tratar como "tem que ser zero" descarta
+//          todo o áudio.
 //   4-7  : SessionID (LE)
 //   8-11 : sequence   (LE)
 //   12   : total de pacotes
@@ -85,10 +88,14 @@ function DvripRecv(const Stream: ITcpStream; out Hdr: TDvripHeader;
 // dentro de vídeo comprimido — foi medido: um 0xFF 14 bytes ANTES de um header
 // de verdade faz o DataLen ser lido em cima do próprio SessionID do header
 // seguinte (0x00BF0000 = 12,4 MB), e a sessão morre ali.
+// RejectInfo = motivo e hex do header recusado na posição corrente ('' se a
+// leitura foi limpa). Mensagem recusada é descartada inteira, então este campo é
+// a única pista de que isso aconteceu.
 function DvripRecvResync(const Stream: ITcpStream; out Hdr: TDvripHeader;
                          out Payload: TBytes; TimeoutMs: Cardinal;
                          ExpectedSession: Cardinal;
                          out SkippedBytes: Integer;
+                         out RejectInfo: string;
                          out FailReason: string): Boolean;
 
 // Classifica a mensagem pelo MsgID do header. mkUnknown = ID fora da tabela;
@@ -110,7 +117,11 @@ function BytesToHex(const B: TBytes; MaxCount: Integer): string;
 implementation
 
 const
-  MAX_PAYLOAD = 16 * 1024 * 1024; // teto de sanidade (16 MB)
+  // Teto de sanidade para UMA mensagem. Uma mensagem DVRIP carrega um quadro:
+  // medido, o I-frame de 1080p desta câmera dá ~34 KB e o de H265 da outra
+  // ~116 KB. 4 MB deixa folga de 30x e ainda recusa a família de tamanhos falsos
+  // que derrubava a sessão (0,8 a 13 MB).
+  MAX_PAYLOAD = 4 * 1024 * 1024;
   // Prazo TOTAL para juntar o payload de UMA mensagem. Uma mensagem DVRIP é um
   // quadro; em qualquer bitrate real ela chega em muito menos que isto.
   MAX_PAYLOAD_MS = 5000;
@@ -260,31 +271,58 @@ begin
   Result := True;
 end;
 
-// Um header só é aceito se TODOS os campos fixos baterem. Só o 0xFF não serve:
-// dentro de vídeo comprimido ele aparece toda hora. E só somar o teto de
-// tamanho também não bastou — na prática os falsos positivos caíam a poucos
-// bytes de um header verdadeiro, e o DataLen acabava lido em cima dos campos
-// dele (SessionID, reservado), dando valores enormes mas "válidos".
+// Motivo pelo qual um candidato a header foi recusado; '' = aceito.
 //
-// Os dois campos que um trecho de vídeo não imita por acaso:
-//   - bytes 2-3 reservados, sempre 00 00
-//   - SessionID, um valor de 32 bits que só esta sessão conhece
+// Só o 0xFF não serve para reconhecer header: dentro de vídeo comprimido ele
+// aparece toda hora. Só somar o teto de tamanho também não basta — os falsos
+// positivos medidos caíam a poucos bytes de um header VERDADEIRO, e o DataLen
+// acabava lido em cima dos campos dele (reservado, SessionID), dando valores
+// enormes mas dentro do teto: 0x00BF0000 = 12,4 MB, que é o SessionID 0xBF
+// deslocado.
+//
+// Cada regra aqui tem um custo se estiver errada: recusar header verdadeiro
+// descarta a mensagem inteira em silêncio. Já aconteceu — exigir o byte 3 em
+// zero descartou TODO o áudio da câmera XM, que manda 0x80 ali (ver o mapa do
+// header no topo da unit). O header recusado era legítimo: SessionID certo,
+// MsgID de mídia, DataLen=328 (frame G711 de 320 B + 8 de header).
+//
+// Quem faz o trabalho de filtrar header falso é o SessionID: são 32 bits que só
+// esta sessão conhece, e o vídeo comprimido não os imita por acaso. O byte 2 e o
+// teto de DataLen entram como reforço barato.
+function HeaderReject(const HBuf: TBytes; ExpectedSession: Cardinal): string;
+var
+  Session: Cardinal;
+begin
+  Result := '';
+  if Length(HBuf) < 20 then Exit('curto');
+  if HBuf[0] <> DVRIP_HEAD then Exit('sem 0xFF');
+  if HBuf[2] <> 0 then
+    Exit(Format('reservado=%.2x', [HBuf[2]]));
+  if ExpectedSession <> 0 then
+  begin
+    Session := GetLE32(HBuf, 4);
+    if (Session <> ExpectedSession) and (Session <> 0) then
+      Exit(Format('sessao=%x (esperada %x)', [Session, ExpectedSession]));
+  end;
+  if GetLE32(HBuf, 16) > MAX_PAYLOAD then
+    Exit(Format('DataLen=%u', [GetLE32(HBuf, 16)]));
+end;
+
 function HeaderPlausible(const HBuf: TBytes; out MsgID: Word; out DataLen: Cardinal;
   ExpectedSession: Cardinal): Boolean;
 begin
-  Result := False;
-  if Length(HBuf) < 20 then Exit;
-  if HBuf[0] <> DVRIP_HEAD then Exit;
-  if (HBuf[2] <> 0) or (HBuf[3] <> 0) then Exit;
-  if (ExpectedSession <> 0) and (GetLE32(HBuf, 4) <> ExpectedSession) then Exit;
+  MsgID := 0;
+  DataLen := 0;
+  Result := HeaderReject(HBuf, ExpectedSession) = '';
+  if not Result then Exit;
   MsgID := Word(HBuf[14]) or (Word(HBuf[15]) shl 8);
   DataLen := GetLE32(HBuf, 16);
-  Result := DataLen <= MAX_PAYLOAD;
 end;
 
 function DvripRecvResync(const Stream: ITcpStream; out Hdr: TDvripHeader;
   out Payload: TBytes; TimeoutMs: Cardinal; ExpectedSession: Cardinal;
-  out SkippedBytes: Integer; out FailReason: string): Boolean;
+  out SkippedBytes: Integer; out RejectInfo: string;
+  out FailReason: string): Boolean;
 const
   MAX_RESYNC_SCAN = 4 * 1024 * 1024; // desiste em vez de varrer para sempre
 var
@@ -294,6 +332,7 @@ var
 begin
   Result := False;
   SkippedBytes := 0;
+  RejectInfo := '';
   FailReason := '';
   SetLength(Payload, 0);
   SetLength(HBuf, 20);
@@ -303,6 +342,17 @@ begin
   begin
     FailReason := 'header incompleto';
     Exit;
+  end;
+
+  // O motivo da PRIMEIRA recusa é o que interessa: é o header que estava na
+  // posição em que devia haver um. Mensagem recusada é mensagem descartada, e
+  // sem isso no log não se distingue "lixo" de "mensagem legítima que a regra
+  // não reconhece" — foi assim que o áudio sumiu sem deixar rastro.
+  if Length(HBuf) >= 20 then
+  begin
+    RejectInfo := HeaderReject(HBuf, ExpectedSession);
+    if RejectInfo <> '' then
+      RejectInfo := RejectInfo + ' [' + BytesToHex(HBuf, 20) + ']';
   end;
 
   // desliza a janela de 20 bytes até ela parecer um header de verdade

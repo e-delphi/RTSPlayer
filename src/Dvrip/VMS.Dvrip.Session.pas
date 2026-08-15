@@ -309,22 +309,25 @@ procedure TDvripSession.ReceiveLoop;
 var
   Hdr: TDvripHeader;
   Payload: TBytes;
-  FailReason: string;
+  FailReason, RejectInfo: string;
   Skipped: Integer;
 begin
   FLastKeepAliveMs := FClock.MonotonicMs;
   while not StopRequested do
   begin
-    if not DvripRecvResync(FTcp, Hdr, Payload, 4000, FSessionID, Skipped, FailReason) then
+    if not DvripRecvResync(FTcp, Hdr, Payload, 4000, FSessionID, Skipped,
+                           RejectInfo, FailReason) then
       raise EVmsIoError.Create('DVRIP recv: ' + FailReason);
     if Skipped > 0 then
     begin
       // Perder o enquadramento não derruba mais a conexão, mas continua sendo
       // defeito: o número de bytes pulados é a pista de onde o tamanho errou.
+      // Múltiplo exato do tamanho de uma mensagem = mensagem legítima recusada,
+      // não lixo — o RejectInfo diz qual campo não passou.
       Inc(FFramingResyncs);
       if (FLogger <> nil) and (FFramingResyncs <= 20) then
-        FLogger.Warn(FTag, Format('enquadramento: pulou %d bytes ate o proximo header (MsgID=%d, %d ocorrencia(s))',
-          [Skipped, Hdr.MsgID, FFramingResyncs]));
+        FLogger.Warn(FTag, Format('enquadramento: pulou %d bytes ate o proximo header (MsgID=%d, %d ocorrencia(s)) recusado: %s',
+          [Skipped, Hdr.MsgID, FFramingResyncs, RejectInfo]));
     end;
     DispatchMessage(Hdr.MsgID, Payload);
     LogStatsIfDue;

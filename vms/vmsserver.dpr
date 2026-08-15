@@ -80,6 +80,7 @@ uses
   // ---- deste app ----
   Vms.Server.RecSink in 'src\Recording\Vms.Server.RecSink.pas',
   Vms.Server.Logger in 'src\App\Vms.Server.Logger.pas',
+  Vms.Server.Retention in 'src\App\Vms.Server.Retention.pas',
   Vms.Server.Config in 'src\App\Vms.Server.Config.pas',
   Vms.Server.Composition in 'src\App\Vms.Server.Composition.pas';
 
@@ -124,6 +125,8 @@ var
   Cfg: TVmsServerConfig;
   App: TAppConfig;
   RtspPort: Word;
+  Retention: TRetentionPolicy;
+  Sweeper: TRetentionThread;
   Logger: ILogger;
   Clock: IClock;
   Supervisors: TAppSupervisorList;
@@ -137,6 +140,7 @@ begin
     App := Cfg.Config;          // parte comum, igual à do RTSPlayer
     RtspPort := Cfg.RtspPort;   // campos que só o servidor tem
     BindAddress := Cfg.BindAddress;
+    Retention := Cfg.Retention;
   finally
     Cfg.Free;
   end;
@@ -151,11 +155,25 @@ begin
 
   Logger.Info('main', 'Config: ' + ConfigPath);
   Logger.Info('main', 'Gravacoes: ' + StorageDir);
+  Logger.Info('main', Format('Espaco livre: %.1f GB | retencao: %s',
+    [FreeSpaceOf(StorageDir) / GIGABYTE, Retention.Describe]));
+
+  // Uma varredura antes de começar a gravar: se o disco já está no limite, é
+  // agora que se abre espaço, não cinco minutos depois.
+  Sweeper := nil;
+  if Retention.Enabled then
+    SweepRetention(StorageDir, Retention, Logger);
 
   Supervisors := BuildServerSupervisors(App, Logger, Clock);
   try
     for I := 0 to Supervisors.Count - 1 do
       Supervisors[I].Start;
+
+    if Retention.Enabled then
+    begin
+      Sweeper := TRetentionThread.Create(StorageDir, Retention, Logger, GStopEvent);
+      Sweeper.Start;
+    end;
 
     // loop=False: modo ao vivo sempre segue o arquivo que está sendo gravado
     Listener := TTxServerListener.Create(RtspPort, BindAddress, StorageDir, False,
@@ -175,6 +193,12 @@ begin
       Listener.Free;
     end;
   finally
+    if Sweeper <> nil then
+    begin
+      Sweeper.Terminate;
+      Sweeper.WaitFor;
+      Sweeper.Free;
+    end;
     // sinaliza todos antes de liberar: o destrutor de cada supervisor faz
     // WaitFor, então parar em série custaria o tempo de cada um somado
     for I := 0 to Supervisors.Count - 1 do
