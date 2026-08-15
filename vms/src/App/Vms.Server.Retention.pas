@@ -174,7 +174,9 @@ begin
       Inc(N);
     until FindNext(SR) <> 0;
   finally
-    FindClose(SR);
+    // Qualificado: esta unit usa Winapi.Windows na implementation, e o
+    // FindClose de lá fecha um handle de busca, não um TSearchRec.
+    System.SysUtils.FindClose(SR);
   end;
   SetLength(Result, N);
   TArray.Sort<TRecFile>(Result, TComparer<TRecFile>.Construct(

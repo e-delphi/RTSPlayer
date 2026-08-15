@@ -1,5 +1,14 @@
 ﻿unit Tx.Server.Session;
 
+// Uma sessão RTSP por cliente conectado. Duas fontes possíveis:
+//
+//   memória — /live/<camera> quando o hub tem a câmera publicando. O sample sai
+//             para o cliente no instante em que chega da câmera; é o caminho de
+//             baixa latência, e não toca no disco.
+//   arquivo — playback de um .vms e o plano B do ao vivo (câmera que ainda não
+//             conectou nesta execução). Aqui a mídia é ritmada pelo PTS, porque
+//             o arquivo entrega um bloco fechado de cada vez.
+
 interface
 
 uses
@@ -18,6 +27,7 @@ uses
   VMS.Rtsp.Messages,
   VMS.Rec.Format,
   VMS.Rec.Reader,
+  Vms.Server.LiveHub,
   Tx.Server.Types,
   Tx.Server.Sdp,
   Tx.Pkt.Intf,
@@ -60,11 +70,18 @@ type
     FClock: IClock;
     FRecordingsDir: string;
     FLoop: Boolean;
+    FHub: TLiveHub;
     FSessionId: string;
     FState: TTxSessionState;
     FWriteLock: TCriticalSection;
     FVmsFile: string;
     FReader: TVmsReader;
+    // Formatos que o SDP desta sessão descreve. Vêm do header do arquivo ou dos
+    // formatos correntes do hub; o SETUP responde a partir daqui, para não
+    // depender de qual das duas fontes está em uso.
+    FHeader: TVmsHeader;
+    FLive: TLiveStream;   // nil = fonte é o arquivo
+    FCursor: TLiveCursor;
     FVideo: TTxTrackBinding;
     FAudio: TTxTrackBinding;
     FStopFlag: Boolean;
@@ -81,7 +98,11 @@ type
     procedure SendInterleaved(Channel: Byte; const RtpBytes: TBytes);
     procedure SendUdp(Sock: TIdUDPClient; const PeerHost: string; PeerPort: Word; const RtpBytes: TBytes);
     function ParseTransportRequest(const Header: string; out Tx: TTxClientTransport): Boolean;
-    function ResolveFileFromUri(const Uri: string): string;
+    function ParseRoute(const Uri: string): string;
+    function ResolveVmsFile(const PathPart: string): string;
+    function LiveHeaderMatchesSdp(const H: TVmsHeader): Boolean;
+    procedure RunFilePacerOnce;
+    procedure RunLivePacerOnce(AStream: TLiveStream);
     procedure HandleOptions(Req: TRtspRequest);
     procedure HandleDescribe(Req: TRtspRequest);
     procedure HandleSetup(Req: TRtspRequest);
@@ -99,7 +120,7 @@ type
     procedure StopPacer;
   public
     constructor Create(AContext: TIdContext; const ALogger: ILogger; const AClock: IClock;
-                       const ARecordingsDir: string; ALoop: Boolean);
+                       const ARecordingsDir: string; ALoop: Boolean; AHub: TLiveHub = nil);
     destructor Destroy; override;
     procedure HandleRequest(Req: TRtspRequest);
     procedure RunPacerOnce;
@@ -125,6 +146,10 @@ const
   // Quanto o leitor ao vivo espera por um bloco novo antes de devolver o
   // controle ao pacer (não é erro: ele só tenta de novo).
   LIVE_READ_WAIT_MS = 2000;
+  // Espera do pacer por sample novo na memória. Só define de quanto em quanto
+  // tempo a thread reavalia StopFlag/estado: o sample em si acorda a espera na
+  // hora em que a câmera o entrega.
+  LIVE_FETCH_WAIT_MS = 200;
 
 { TTxPacerThread }
 
@@ -156,7 +181,7 @@ end;
 { TTxSession }
 
 constructor TTxSession.Create(AContext: TIdContext; const ALogger: ILogger; const AClock: IClock;
-                              const ARecordingsDir: string; ALoop: Boolean);
+                              const ARecordingsDir: string; ALoop: Boolean; AHub: TLiveHub);
 begin
   inherited Create;
   FContext := AContext;
@@ -164,6 +189,7 @@ begin
   FClock := AClock;
   FRecordingsDir := ARecordingsDir;
   FLoop := ALoop;
+  FHub := AHub;
   FState := sssInit;
   FWriteLock := TCriticalSection.Create;
   FSessionId := GenerateSessionId;
@@ -180,6 +206,8 @@ procedure TTxSession.Cleanup;
 begin
   FStopFlag := True;
   StopPacer;
+  FLive := nil;   // o stream é do hub; a sessão só apontava para ele
+  FCursor.Valid := False;
   if FVideo.UdpSock <> nil then
   begin
     try FVideo.UdpSock.Active := False; except end;
@@ -319,12 +347,14 @@ begin
   end;
 end;
 
-function TTxSession.ResolveFileFromUri(const Uri: string): string;
+// Lê a rota pedida e devolve o caminho limpo (sem esquema, sem trackID, sem
+// query). Só isso: achar o arquivo é outro passo, porque a rota ao vivo pode
+// nem precisar de arquivo.
+function TTxSession.ParseRoute(const Uri: string): string;
 var
   P, SchemeEnd, PathStart: Integer;
-  PathPart, BaseName: string;
+  PathPart: string;
 begin
-  Result := '';
   FLiveMode := False;
   FCameraName := '';
   SchemeEnd := Pos('://', Uri);
@@ -349,6 +379,17 @@ begin
   begin
     FLiveMode := True;
     FCameraName := Copy(PathPart, Length('live/') + 1, MaxInt);
+  end;
+  Result := PathPart;
+end;
+
+function TTxSession.ResolveVmsFile(const PathPart: string): string;
+var
+  BaseName: string;
+begin
+  Result := '';
+  if FLiveMode then
+  begin
     if FCameraName = '' then Exit;
     Result := FindMostRecentVmsForCamera(FRecordingsDir, FCameraName);
     if Result = '' then
@@ -397,28 +438,55 @@ end;
 procedure TTxSession.HandleDescribe(Req: TRtspRequest);
 var
   Resp: TRtspResponse;
-  VmsPath: string;
+  Route, VmsPath, SdpName: string;
   Sdp: string;
   Body: TBytes;
+  Stream: TLiveStream;
 begin
-  VmsPath := ResolveFileFromUri(Req.Uri);
-  if (VmsPath = '') or (not FileExists(VmsPath)) then
+  Route := ParseRoute(Req.Uri);
+  FLive := nil;
+
+  // Memória primeiro: se a câmera está publicando agora, é dela que sai a
+  // mídia, e o arquivo nem é aberto. Sem formatos ainda (câmera desligada,
+  // servidor recém-subido) cai no arquivo, que é o histórico dela.
+  if FLiveMode and (FHub <> nil) and (FCameraName <> '') then
   begin
-    Log(llWarn, 'DESCRIBE file not found: ' + VmsPath);
-    SendError(Req, 404);
-    Exit;
+    Stream := FHub.Find(FCameraName);
+    if (Stream <> nil) and Stream.TryGetHeader(FHeader) then
+      FLive := Stream;
   end;
-  try
-    OpenReader(VmsPath);
-  except
-    on E: Exception do
+
+  if FLive = nil then
+  begin
+    VmsPath := ResolveVmsFile(Route);
+    if (VmsPath = '') or (not FileExists(VmsPath)) then
     begin
-      Log(llError, 'OpenReader failed: ' + E.Message);
-      SendError(Req, 500);
+      Log(llWarn, 'DESCRIBE file not found: ' + VmsPath);
+      SendError(Req, 404);
       Exit;
     end;
+    try
+      OpenReader(VmsPath);
+    except
+      on E: Exception do
+      begin
+        Log(llError, 'OpenReader failed: ' + E.Message);
+        SendError(Req, 500);
+        Exit;
+      end;
+    end;
+    FHeader := FReader.Header;
+    SdpName := ExtractFileName(VmsPath);
+    if FLiveMode then
+      Log(llInfo, 'ao vivo pelo arquivo (camera sem publicacao na memoria)');
+  end
+  else
+  begin
+    SdpName := FCameraName;
+    Log(llInfo, 'ao vivo pela memoria');
   end;
-  Sdp := BuildSdpForHeader(FReader.Header, ExtractFileName(VmsPath));
+
+  Sdp := BuildSdpForHeader(FHeader, SdpName);
   Body := TEncoding.UTF8.GetBytes(Sdp);
   Resp := TRtspResponse.Create;
   try
@@ -499,7 +567,7 @@ var
   IsAudio: Boolean;
   UriLow: string;
 begin
-  if FReader = nil then
+  if FState = sssInit then   // sem DESCRIBE não há formato para descrever
   begin
     SendError(Req, 455);
     Exit;
@@ -532,22 +600,22 @@ begin
 
   if IsAudio then
   begin
-    if not FReader.Header.AudioPresent then
+    if not FHeader.AudioPresent then
     begin
       SendError(Req, 404);
       Exit;
     end;
     FAudio.Transport := Tx;
     FAudio.Active := True;
-    FAudio.Codec := Integer(FReader.Header.Audio.Codec);
-    FAudio.Timescale := FReader.Header.Audio.Timescale;
-    case FReader.Header.Audio.Codec of
+    FAudio.Codec := Integer(FHeader.Audio.Codec);
+    FAudio.Timescale := FHeader.Audio.Timescale;
+    case FHeader.Audio.Codec of
       acG711U: FAudio.PayloadType := 0;
       acG711A: FAudio.PayloadType := 8;
     else
       FAudio.PayloadType := TX_TRACK_AUDIO_PT;
     end;
-    FAudio.Packetizer := CreateAudioPacketizer(FReader.Header.Audio.Codec);
+    FAudio.Packetizer := CreateAudioPacketizer(FHeader.Audio.Codec);
     if FAudio.Packetizer <> nil then
     begin
       WireUpPacketizer(FAudio);
@@ -556,20 +624,20 @@ begin
   end
   else
   begin
-    if not FReader.Header.VideoPresent then
+    if not FHeader.VideoPresent then
     begin
       SendError(Req, 404);
       Exit;
     end;
     FVideo.Transport := Tx;
     FVideo.Active := True;
-    FVideo.Codec := Integer(FReader.Header.Video.Codec);
-    FVideo.Timescale := FReader.Header.Video.Timescale;
-    if FReader.Header.Video.Codec = vcMJPEG then
+    FVideo.Codec := Integer(FHeader.Video.Codec);
+    FVideo.Timescale := FHeader.Video.Timescale;
+    if FHeader.Video.Codec = vcMJPEG then
       FVideo.PayloadType := 26
     else
       FVideo.PayloadType := TX_TRACK_VIDEO_PT;
-    FVideo.Packetizer := CreateVideoPacketizer(FReader.Header.Video.Codec);
+    FVideo.Packetizer := CreateVideoPacketizer(FHeader.Video.Codec);
     if FVideo.Packetizer <> nil then
     begin
       WireUpPacketizer(FVideo);
@@ -633,11 +701,18 @@ var
   StartSec: Double;
   TargetUnixMs: Int64;
 begin
-  if (FReader = nil) or ((FState <> sssSetupDone) and (FState <> sssPaused)) then
+  if ((FReader = nil) and (FLive = nil)) or
+     ((FState <> sssSetupDone) and (FState <> sssPaused)) then
   begin
     SendError(Req, 455);
     Exit;
   end;
+
+  // Assina agora, e de novo a cada PLAY: depois de um PAUSE o cliente quer
+  // voltar ao vivo, não retomar de onde parou.
+  if FLive <> nil then
+    if not FLive.Subscribe(FCursor) then
+      Log(llWarn, 'camera parou de publicar; aguardando ela voltar');
 
   RangeHeader := Req.Headers.Get('Range');
   if (not FLiveMode) and (RangeHeader <> '') and ParseRangeStartSec(RangeHeader, StartSec) then
@@ -840,6 +915,103 @@ begin
 end;
 
 procedure TTxSession.RunPacerOnce;
+var
+  Stream: TLiveStream;
+begin
+  // Uma leitura só do campo: quem escolhe a fonte é a thread da conexão (no
+  // DESCRIBE), e ela pode zerar FLive entre o teste e o uso.
+  Stream := FLive;
+  if Stream <> nil then
+    RunLivePacerOnce(Stream)
+  else
+    RunFilePacerOnce;
+end;
+
+// O SDP entregue ao cliente descreve os formatos de FHeader. Depois de a câmera
+// reconectar, isto diz se o que ela voltou a publicar ainda cabe naquele SDP.
+// Trilha de áudio que aparece depois não invalida nada para quem só pediu vídeo.
+function TTxSession.LiveHeaderMatchesSdp(const H: TVmsHeader): Boolean;
+begin
+  Result := False;
+  if FVideo.Active then
+  begin
+    if not H.VideoPresent then Exit;
+    if Integer(H.Video.Codec) <> FVideo.Codec then Exit;
+    // resolução nova quer parameter set novo, e o cliente já configurou o
+    // decodificador com o csd do SDP antigo
+    if (H.Video.Width <> FHeader.Video.Width) or (H.Video.Height <> FHeader.Video.Height) then
+      Exit;
+  end;
+  if FAudio.Active then
+  begin
+    if not H.AudioPresent then Exit;
+    if Integer(H.Audio.Codec) <> FAudio.Codec then Exit;
+    if H.Audio.Timescale <> FAudio.Timescale then Exit;
+  end;
+  Result := True;
+end;
+
+// Ao vivo pela memória: sem espera pelo PTS. O sample já chega no ritmo da
+// câmera, então segurar aqui só somaria latência — que é justamente o que este
+// caminho existe para tirar.
+procedure TTxSession.RunLivePacerOnce(AStream: TLiveStream);
+var
+  Items: TArray<TLiveSampleRec>;
+  Res: TLiveFetch;
+  I: Integer;
+  Track: ^TTxTrackBinding;
+  NewHeader: TVmsHeader;
+begin
+  if not FCursor.Valid then
+  begin
+    if not AStream.Subscribe(FCursor) then
+    begin
+      Sleep(50);
+      Exit;
+    end;
+  end;
+
+  Res := AStream.Fetch(FCursor, LIVE_FETCH_WAIT_MS, Items);
+  case Res of
+    lfNone:
+      Exit;
+    lfFormatChanged:
+      begin
+        if AStream.TryGetHeader(NewHeader) and LiveHeaderMatchesSdp(NewHeader) then
+        begin
+          AStream.Subscribe(FCursor);
+          Log(llInfo, 'camera reanunciou o formato; seguindo ao vivo');
+        end
+        else
+        begin
+          // Mandar outro codec no meio seria pior que cair: o cliente reconecta
+          // e faz DESCRIBE de novo. Mesma regra do SwitchToNewerLiveFile.
+          Log(llWarn, 'formato da camera mudou; encerrando para o cliente refazer o DESCRIBE');
+          FStopFlag := True;
+        end;
+        Exit;
+      end;
+    lfResync:
+      // Duas causas possíveis: cliente que não consome no ritmo da câmera, ou
+      // câmera que caiu e voltou (o buffer é esvaziado na queda).
+      Log(llWarn, 'reposicionado no keyframe mais recente (cliente atrasado ou camera reconectou)');
+  end;
+
+  for I := 0 to High(Items) do
+  begin
+    if FStopFlag then Exit;
+    if Items[I].TrackId = 0 then
+      Track := @FVideo
+    else if Items[I].TrackId = 1 then
+      Track := @FAudio
+    else
+      Continue;
+    if (not Track.Active) or (Track.Packetizer = nil) then Continue;
+    Track.Packetizer.PushSample(Items[I].Pts, Items[I].Data, Items[I].Keyframe);
+  end;
+end;
+
+procedure TTxSession.RunFilePacerOnce;
 var
   Block: TVmsBlock;
   I: Integer;

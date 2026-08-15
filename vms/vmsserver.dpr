@@ -79,6 +79,7 @@ uses
   Tx.Server.Session in 'src\Server\Tx.Server.Session.pas',
   Tx.Server.Listener in 'src\Server\Tx.Server.Listener.pas',
   // ---- deste app ----
+  Vms.Server.LiveHub in 'src\Live\Vms.Server.LiveHub.pas',
   Vms.Server.RecSink in 'src\Recording\Vms.Server.RecSink.pas',
   Vms.Server.Logger in 'src\App\Vms.Server.Logger.pas',
   Vms.Server.Retention in 'src\App\Vms.Server.Retention.pas',
@@ -128,6 +129,8 @@ var
   RtspPort: Word;
   Retention: TRetentionPolicy;
   Sweeper: TRetentionThread;
+  LiveCfg: TLiveConfig;
+  Hub: TLiveHub;
   Logger: ILogger;
   Clock: IClock;
   Supervisors: TAppSupervisorList;
@@ -142,6 +145,7 @@ begin
     RtspPort := Cfg.RtspPort;   // campos que só o servidor tem
     BindAddress := Cfg.BindAddress;
     Retention := Cfg.Retention;
+    LiveCfg := Cfg.Live;
   finally
     Cfg.Free;
   end;
@@ -158,6 +162,7 @@ begin
   Logger.Info('main', 'Gravacoes: ' + StorageDir);
   Logger.Info('main', Format('Espaco livre: %.1f GB | retencao: %s',
     [FreeSpaceOf(StorageDir) / GIGABYTE, Retention.Describe]));
+  Logger.Info('main', 'Ao vivo: ' + LiveCfg.Describe);
 
   // Uma varredura antes de começar a gravar: se o disco já está no limite, é
   // agora que se abre espaço, não cinco minutos depois.
@@ -165,46 +170,56 @@ begin
   if Retention.Enabled then
     SweepRetention(StorageDir, Retention, Logger);
 
-  Supervisors := BuildServerSupervisors(App, Logger, Clock);
+  // O hub nasce antes dos supervisores (os sinks deles publicam nele) e morre
+  // depois (o servidor RTSP lê dele).
+  Hub := nil;
+  if LiveCfg.Enabled then
+    Hub := TLiveHub.Create(LiveCfg, Logger, Clock);
   try
-    for I := 0 to Supervisors.Count - 1 do
-      Supervisors[I].Start;
-
-    if Retention.Enabled then
-    begin
-      Sweeper := TRetentionThread.Create(StorageDir, Retention, Logger, GStopEvent);
-      Sweeper.Start;
-    end;
-
-    // loop=False: modo ao vivo sempre segue o arquivo que está sendo gravado
-    Listener := TTxServerListener.Create(RtspPort, BindAddress, StorageDir, False,
-                                         Logger, Clock);
+    Supervisors := BuildServerSupervisors(App, Logger, Clock, Hub);
     try
-      Listener.Start;
-      for I := 0 to High(App.Cameras) do
-        if App.Cameras[I].Enabled then
-          Logger.Info('main', Format('  rtsp://<host>:%d/live/%s', [RtspPort, App.Cameras[I].Name]));
-      Logger.Info('main', 'No ar. Ctrl+C para parar.');
+      for I := 0 to Supervisors.Count - 1 do
+        Supervisors[I].Start;
 
-      while GStopEvent.WaitFor(500) <> wrSignaled do ;
+      if Retention.Enabled then
+      begin
+        Sweeper := TRetentionThread.Create(StorageDir, Retention, Logger, GStopEvent);
+        Sweeper.Start;
+      end;
 
-      Logger.Info('main', 'Parando...');
-      Listener.Stop;
+      // loop=False: modo ao vivo nunca reinicia a gravação do começo. Com o hub,
+      // o /live/ sai da memória; sem ele (ou com a câmera fora do ar), do arquivo.
+      Listener := TTxServerListener.Create(RtspPort, BindAddress, StorageDir, False,
+                                           Logger, Clock, Hub);
+      try
+        Listener.Start;
+        for I := 0 to High(App.Cameras) do
+          if App.Cameras[I].Enabled then
+            Logger.Info('main', Format('  rtsp://<host>:%d/live/%s', [RtspPort, App.Cameras[I].Name]));
+        Logger.Info('main', 'No ar. Ctrl+C para parar.');
+
+        while GStopEvent.WaitFor(500) <> wrSignaled do ;
+
+        Logger.Info('main', 'Parando...');
+        Listener.Stop;
+      finally
+        Listener.Free;
+      end;
     finally
-      Listener.Free;
+      if Sweeper <> nil then
+      begin
+        Sweeper.Terminate;
+        Sweeper.WaitFor;
+        Sweeper.Free;
+      end;
+      // sinaliza todos antes de liberar: o destrutor de cada supervisor faz
+      // WaitFor, então parar em série custaria o tempo de cada um somado
+      for I := 0 to Supervisors.Count - 1 do
+        Supervisors[I].Stop;
+      Supervisors.Free;
     end;
   finally
-    if Sweeper <> nil then
-    begin
-      Sweeper.Terminate;
-      Sweeper.WaitFor;
-      Sweeper.Free;
-    end;
-    // sinaliza todos antes de liberar: o destrutor de cada supervisor faz
-    // WaitFor, então parar em série custaria o tempo de cada um somado
-    for I := 0 to Supervisors.Count - 1 do
-      Supervisors[I].Stop;
-    Supervisors.Free;
+    Hub.Free;
   end;
   Logger.Info('main', 'Parado.');
 end;

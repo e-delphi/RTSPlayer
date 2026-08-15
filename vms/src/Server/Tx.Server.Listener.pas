@@ -16,6 +16,7 @@ uses
   VMS.Domain.Logging,
   VMS.Domain.Clock,
   VMS.Rtsp.Messages,
+  Vms.Server.LiveHub,
   Tx.Server.Session;
 
 type
@@ -28,14 +29,16 @@ type
     FBindAddress: string;
     FRecordingsDir: string;
     FLoop: Boolean;
+    FHub: TLiveHub;
     procedure HandleConnect(AContext: TIdContext);
     procedure HandleDisconnect(AContext: TIdContext);
     procedure HandleExecute(AContext: TIdContext);
     function ReadRequest(AContext: TIdContext; out Req: TRtspRequest): Boolean;
   public
-    // ABindAddress vazio = escuta em todas as interfaces
+    // ABindAddress vazio = escuta em todas as interfaces.
+    // AHub nil = /live/<camera> sai do arquivo, sem o caminho de memória.
     constructor Create(APort: Word; const ABindAddress, ARecordingsDir: string; ALoop: Boolean;
-                       const ALogger: ILogger; const AClock: IClock);
+                       const ALogger: ILogger; const AClock: IClock; AHub: TLiveHub = nil);
     destructor Destroy; override;
     procedure Start;
     procedure Stop;
@@ -60,13 +63,15 @@ end;
 
 constructor TTxServerListener.Create(APort: Word; const ABindAddress, ARecordingsDir: string;
                                      ALoop: Boolean;
-                                     const ALogger: ILogger; const AClock: IClock);
+                                     const ALogger: ILogger; const AClock: IClock;
+                                     AHub: TLiveHub);
 begin
   inherited Create;
   FPort := APort;
   FBindAddress := Trim(ABindAddress);
   FRecordingsDir := ARecordingsDir;
   FLoop := ALoop;
+  FHub := AHub;
   FLogger := ALogger;
   FClock := AClock;
   FServer := TIdTCPServer.Create(nil);
@@ -116,7 +121,7 @@ var
   Holder: TSessionHolder;
 begin
   Holder := TSessionHolder.Create;
-  Holder.Session := TTxSession.Create(AContext, FLogger, FClock, FRecordingsDir, FLoop);
+  Holder.Session := TTxSession.Create(AContext, FLogger, FClock, FRecordingsDir, FLoop, FHub);
   AContext.Data := Holder;
   AContext.Connection.IOHandler.ReadTimeout := 500;
   FLogger.Info('tx.listener', 'Client connected: ' + AContext.Binding.PeerIP);

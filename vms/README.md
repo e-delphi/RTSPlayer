@@ -18,6 +18,7 @@ liberar rota para a LAN das câmeras.
 |---|---|
 | `src/Server/Tx.*` | servidor RTSP: listener, sessão (DESCRIBE/SETUP/PLAY) e SDP |
 | `src/Packetizer/Tx.*` | empacotamento em RTP (H264, H265, AAC, MJPEG) |
+| `src/Live/` | buffer em memória de onde o ao vivo é publicado |
 | `src/Recording/`, `src/App/` | gravação ao vivo, config e composição deste app |
 | `VMS.*`, em `..\src` | cliente (rtsp e dvrip), depacketizers, gravação e domínio |
 
@@ -33,13 +34,34 @@ Os dois caminhos gravam o mesmo `.vms`, por vias diferentes:
   entra o `TRecordingSink`, que usa as mesmas peças (`TBlockBuilder` +
   `TFileRecordingWriter`) para gerar um `.vms` idêntico.
 
-O servidor então acha o arquivo mais recente de cada câmera
-(`FindMostRecentVmsForCamera`, casa `<nome>_*.vms`) e o segue em modo live.
+## Como o ao vivo é publicado
+
+O mesmo sample que vai para a gravação vai também para um buffer circular em
+memória, um por câmera (`src/Live/Vms.Server.LiveHub.pas`), e é **de lá** que o
+`/live/<camera>` sai. O cliente recebe o quadro no instante em que ele chega da
+câmera, sem esperar o bloco de gravação fechar no disco.
+
+Quando a câmera ainda não publicou nada nesta execução (desligada, ou servidor
+recém-subido), o `DESCRIBE` cai no caminho antigo: acha o arquivo mais recente
+dela (`FindMostRecentVmsForCamera`, casa `<nome>_*.vms`) e o segue em modo live,
+ritmado pelo PTS. É também o que acontece com `live.enabled: false`.
+
+O que ainda pesa na latência, com o disco fora do caminho:
+
+- **o GOP da câmera** — o cliente entra no keyframe mais recente do buffer, para
+  não ficar com a tela preta; num GOP de 2 s isso pode custar até 2 s. Encurtar o
+  intervalo de keyframe na câmera é o que resolve.
+- **o jitter buffer do player** (`audioDelayMs`/`videoDelayMs`, 200 ms).
+
+O buffer guarda alguns segundos e descarta o mais antigo. Cliente que não
+consome no ritmo da câmera é reposicionado no keyframe mais recente — perde o
+intervalo, mas volta ao vivo em vez de acumular atraso; sai no log como
+`reposicionado no keyframe mais recente`.
 
 ## Configuração
 
 `vmsserver.json`, ao lado do executável (ou passado como primeiro argumento).
-É o mesmo formato do gravador, mais três chaves:
+É o mesmo formato do gravador, mais quatro chaves:
 
 - `rtspPort` — porta única onde tudo é publicado (padrão 8554).
 - `bindAddress` — IP onde escutar. **Vazio = 0.0.0.0**, ou seja, a LAN inteira
@@ -47,6 +69,20 @@ O servidor então acha o arquivo mais recente de cada câmera
   tailnet alcance o servidor.
 - `retention` — limpeza automática das gravações. **Sem ela o disco enche**: são
   ~7 GB por dia por câmera a 1 Mbps.
+- `live` — buffer em memória do ao vivo. Vem **ligado** por omissão; ao
+  contrário da retenção, ele não apaga nem altera nada.
+
+```json
+"live": {
+  "enabled": true,     // false volta a publicar lendo o .vms em gravação
+  "bufferMs": 4000,    // quanto de mídia recente fica guardado, por câmera
+  "maxBufferMB": 32    // teto de memória por câmera; o mais antigo é descartado
+}
+```
+
+`bufferMs` precisa cobrir com folga o GOP da câmera — é dele que sai o keyframe
+onde o cliente entra. Os dois tetos valem por câmera, e vale o que estourar
+primeiro.
 
 ```json
 "retention": {
@@ -126,12 +162,10 @@ pacotes de ~1400 bytes é descartado no túnel.
 
 ## Pendências conhecidas
 
-- **Retenção**: nada apaga `.vms` antigo. Três câmeras a ~2 Mbps gravando 24/7
-  passam de 60 GB/dia. Antes de deixar rodando direto, defina uma política
-  (apagar por idade ou por espaço livre, nunca o arquivo mais recente de cada
-  câmera, que é o que está sendo gravado e servido).
-- Cada reconexão da câmera começa um `.vms` novo; um cliente que estava
-  assistindo fica preso ao arquivo anterior até reconectar (o supervisor do app
-  faz isso sozinho pelo `noRtpTimeoutMs`).
-- Latência mínima é a do bloco de gravação (`block.maxDurationMs`, 2 s por
-  padrão), porque o vídeo passa por disco.
+A lista com prioridade e o que já foi medido está em
+[`docs/PENDENCIAS.md`](../docs/PENDENCIAS.md) — é a fonte da verdade. Do lado do
+servidor, o que mais aparece no uso:
+
+- Não há autenticação: quem alcança a porta assiste a qualquer câmera.
+- Cada reconexão da câmera começa um `.vms` novo, então o histórico fica picado
+  (o ao vivo não sente: ele vem da memória).

@@ -1,7 +1,6 @@
 unit Vms.Server.Composition;
 
-// Monta um supervisor por câmera habilitada, sempre gravando .vms — é do
-// arquivo ao vivo que o servidor RTSP lê para publicar /live/<camera>.
+// Monta um supervisor por câmera habilitada, sempre gravando .vms.
 //
 // Os dois caminhos gravam de formas diferentes:
 //   rtsp://  -> o próprio TCameraSession grava (SessionCfg.RecordEnabled)
@@ -9,6 +8,11 @@ unit Vms.Server.Composition;
 //               como IMediaSink para gravar o mesmo .vms
 // Reusa BuildSessionConfig/BuildReconnectPolicy/DefaultDepacketizerFactory do
 // VMS.App.Composition (compartilhado com o RTSPlayer).
+//
+// Com o hub ao vivo ligado, cada câmera ganha um TLiveSink por fora: o mesmo
+// sample vai para a memória (de onde o servidor RTSP publica /live/<camera>, sem
+// esperar o bloco fechar no disco) e para a gravação. Hub nil = servidor lê do
+// arquivo, como antes.
 
 interface
 
@@ -22,14 +26,17 @@ uses
   VMS.Domain.Supervisor,
   VMS.Depk.Intf,
   VMS.App.Config,
-  VMS.App.Composition;
+  VMS.App.Composition,
+  Vms.Server.LiveHub;
 
 function IsDvripUrl(const Url: string): Boolean;
 
 // Recebe só a config comum: os campos próprios do servidor (porta, bind) não
 // interessam aqui, então esta unit não precisa conhecer a config derivada.
+// Hub nil = sem publicação ao vivo pela memória.
 function BuildServerSupervisors(const App: TAppConfig; const Logger: ILogger;
-                                const Clock: IClock): TAppSupervisorList;
+                                const Clock: IClock;
+                                const Hub: TLiveHub = nil): TAppSupervisorList;
 
 implementation
 
@@ -42,7 +49,7 @@ begin
 end;
 
 function BuildServerSupervisors(const App: TAppConfig; const Logger: ILogger;
-  const Clock: IClock): TAppSupervisorList;
+  const Clock: IClock; const Hub: TLiveHub): TAppSupervisorList;
 var
   I: Integer;
   Cam: TCameraConfigEntry;
@@ -80,6 +87,16 @@ begin
       begin
         SessionCfg.RecordEnabled := True;
         Logger.Info('composition', Format('Camera "%s": rtsp, gravando na sessão', [Cam.Name]));
+      end;
+
+      // Por fora do que já existia: publica na memória e repassa para o sink de
+      // gravação (dvrip) ou para ninguém (rtsp, que grava dentro da sessão).
+      // O áudio segue a mesma regra da gravação — quem desligou recordAudio não
+      // quer a trilha, nem no arquivo nem ao vivo.
+      if Hub <> nil then
+      begin
+        Sink := TLiveSink.Create(Hub.GetOrCreate(Cam.Name), Sink, Cam.RecordAudio);
+        Logger.Info('composition', Format('Camera "%s": ao vivo pela memória', [Cam.Name]));
       end;
 
       Result.Add(TCameraSupervisor.Create(SessionCfg, Logger, Clock, Factory, Policy, Sink));

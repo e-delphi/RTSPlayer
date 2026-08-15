@@ -19,7 +19,7 @@ Verificado em teste com três câmeras, conectando **direto** e **pelo vmsserver
 | frente | RTSP/TCP+UDP | H.265 @13,6 fps | G711A 8 kHz | OK nos dois caminhos |
 | isis | DVRIP (Sofia/XM) | H.264 1080p @10 fps | G711A 8 kHz | vídeo OK; **áudio ~6%** |
 
-Base que já está de pé: RTSP (TCP interleaved e UDP, Digest, keep-alive, fallback de transporte), DVRIP com login Sofia e OPMonitor, depacketizers H264/H265/AAC/G711/G726/MJPEG/PCM, gravação `.vms` em blocos com limpeza automática por idade/tamanho/espaço livre, republicação ao vivo com ritmo pelo PTS, decodificação por MediaCodec (Android) e FFmpeg (Windows).
+Base que já está de pé: RTSP (TCP interleaved e UDP, Digest, keep-alive, fallback de transporte), DVRIP com login Sofia e OPMonitor, depacketizers H264/H265/AAC/G711/G726/MJPEG/PCM, gravação `.vms` em blocos com limpeza automática por idade/tamanho/espaço livre, republicação ao vivo por buffer em memória (o arquivo só entra no playback histórico e quando a câmera não está publicando), decodificação por MediaCodec (Android) e FFmpeg (Windows).
 
 ---
 
@@ -115,13 +115,9 @@ O player já ignora parameter sets do SDP quando o stream traz os seus in-band, 
 
 O `.vms` guarda PTS por trilha, cada uma na sua timescale, e nada que relacione as duas. O pacer ancora as duas trilhas no mesmo instante de parede, então a defasagem que existir **dentro** do primeiro bloco fica congelada na saída. Com áudio regular (ayla, frente) o erro é de dezenas de ms; com áudio esburacado (isis) não há sincronia possível.
 
+Vale para o caminho de arquivo — playback e o ao vivo de reserva. No ao vivo pela memória o sample sai na ordem e com o PTS que a câmera mandou, sem âncora nossa no meio.
+
 **Próximo passo.** Gravar o instante de parede de chegada por sample (ou uma âncora A/V por bloco) e usá-lo como base comum no pacer.
-
-### P2-4 · Latência do ao vivo é de 2 a 6 s
-
-O servidor lê do arquivo, e o arquivo só cresce quando o gravador **fecha** um bloco (`block.maxDurationMs`, hoje 2000 ms). Somando a idade do último keyframe, dá 2–6 s.
-
-**Mitigação hoje:** baixar `maxDurationMs` (500 ms) e o GOP da câmera. **Correção de verdade:** o servidor ler de um buffer circular em memória alimentado pela sessão, usando o arquivo só para playback histórico.
 
 ### P2-5 · `AVPacket` sem padding no backend FFmpeg
 
@@ -151,7 +147,7 @@ O player descarta o RTCP que recebe e não manda RR; o servidor não manda SR. S
 
 ### P3-5 · Um `.vms` novo por reconexão
 
-Cada queda da câmera fecha o arquivo e abre outro — na sessão da isis foram 11 arquivos em 24 min. O servidor já segue o arquivo novo automaticamente, mas o histórico fica picado. Continuar o mesmo arquivo quando a reconexão é rápida (ou consolidar depois).
+Cada queda da câmera fecha o arquivo e abre outro — na sessão da isis foram 11 arquivos em 24 min. Quem assiste ao vivo não sente mais (a mídia vem da memória, e o caminho de arquivo ainda segue o arquivo novo sozinho), mas o histórico fica picado. Continuar o mesmo arquivo quando a reconexão é rápida (ou consolidar depois).
 
 ### P3-6 · Ordem de notificação no primeiro pacote
 

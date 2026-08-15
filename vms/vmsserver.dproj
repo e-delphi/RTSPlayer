@@ -221,8 +221,10 @@
         <DCCReference Include="src\Server\Tx.Server.Sdp.pas"/>
         <DCCReference Include="src\Server\Tx.Server.Session.pas"/>
         <DCCReference Include="src\Server\Tx.Server.Listener.pas"/>
+        <DCCReference Include="src\Live\Vms.Server.LiveHub.pas"/>
         <DCCReference Include="src\Recording\Vms.Server.RecSink.pas"/>
         <DCCReference Include="src\App\Vms.Server.Logger.pas"/>
+        <DCCReference Include="src\App\Vms.Server.Retention.pas"/>
         <DCCReference Include="src\App\Vms.Server.Config.pas"/>
         <DCCReference Include="src\App\Vms.Server.Composition.pas"/>
         <BuildConfiguration Include="Base">
