@@ -34,6 +34,9 @@ libVLC, sem wrapper, sem componente de terceiro. Só a decodificação de vídeo
   resultado, sem abrir o stream
 - **Gravação `.vms`** (formato próprio: blocos indexados com CRC32) — a engine
   suporta, o app roda com a gravação desligada
+- **Playback de gravação** quando a câmera está atrás de um vmsserver: o app puxa
+  a mídia pela API do servidor e toca no mesmo decodificador do ao vivo, com
+  ritmo próprio (nenhum dos dois renderers apresenta por PTS)
 - **Log em tela**, útil para diagnosticar câmera que não abre
 
 ## Codecs
@@ -61,6 +64,8 @@ src/
 ├── Sdp/          parser de SDP
 ├── Rtp/          pacote RTP e demux por canal interleaved ou payload type
 ├── Depacketizer/ RTP → frames (H264, H265, MJPEG, AAC, PCM, G711, G726)
+├── Api/          cliente das rotas de gravação do vmsserver
+├── Playback/     engine que toca gravação: busca, fila e ritmo
 ├── Dvrip/        protocolo Sofia/DVRIP: handshake, comandos e mídia
 ├── Domain/       sessão, supervisor, política de reconexão, tipos e portas
 ├── Recording/    escrita e leitura do formato .vms
@@ -115,6 +120,48 @@ gravada em `cameras.json`, na pasta Documentos do dispositivo:
 - `audioDelayMs` / `videoDelayMs` ajustam o jitter buffer de cada trilha
 - para DVRIP, use `dvrip://host:34567` como URL
 
+### Vários caminhos até a mesma câmera
+
+A mesma câmera costuma ter mais de um endereço: o IP dela na LAN, o servidor que
+a republica em casa, e o mesmo servidor pela tailnet. Em vez de três cadastros
+iguais, **uma câmera com uma lista de caminhos**, em ordem de prioridade:
+
+```json
+{
+  "name": "Frente",
+  "endpoints": [
+    { "name": "Local",  "url": "rtsp://192.168.100.9:8554/live/frente" },
+    { "name": "Online", "url": "rtsp://100.102.246.119:8554/live/frente",
+      "tailscale": true },
+    { "name": "Direto", "url": "rtsp://192.168.100.2:555",
+      "user": "admin", "password": "…", "transport": "tcp,udp" }
+  ],
+  "maxRetries": 0, "audioDelayMs": 200, "videoDelayMs": 200
+}
+```
+
+Antes de **cada** tentativa de conexão o app testa os caminhos na ordem (um TCP
+connect com 700 ms) e usa o primeiro que responder. Isso vale também nas
+reconexões, que é o que faz sair de casa trocar de caminho sozinho. Nenhum
+respondendo, ele tenta o marcado como `tailscale` (o túnel pode estar caído, e é
+a sessão dele que sabe pedir para subir) ou o primeiro da lista.
+
+No caminho `tailscale`, se a rota não existe o app abre o Tailscale e espera até
+30 s a rota aparecer, mostrando **"Aguardando a VPN"** — que é diferente de
+"Conectando", porque a ação que falta está no outro app. Quem liga a VPN é o
+usuário: o Android não deixa um app subir o `VpnService` de outro. Com o túnel
+já de pé e a câmera muda, ele nem abre o Tailscale — o problema ali é a câmera.
+
+Pela interface, isso fica no topo da tela de cadastro: **"+ caminho"** cria mais
+um, as abas numeradas escolhem qual está sendo editado (os campos de baixo —
+protocolo, host, porta, credenciais, transporte, Tailscale — são **do caminho
+selecionado**), e o **x** apaga o caminho atual. O nome da câmera é um só; o
+campo logo abaixo das abas é o nome daquele caminho ("Local", "Online"...).
+
+Cadastro no formato antigo (uma `url` por câmera) continua valendo: vira uma
+câmera de um caminho só. Os campos `url`/`user`/`password`/`transport` fora da
+lista são o espelho do primeiro caminho.
+
 > ⚠️ As senhas ficam em texto puro nesse arquivo, como acontece na maioria dos
 > clientes RTSP (o protocolo precisa da senha em claro para calcular o Digest).
 > Ele vive na área privada do app, mas não é um cofre — trate o dispositivo como
@@ -128,12 +175,22 @@ queda de energia:
 - **Header** `VMS1` com metadados das trilhas (codec, resolução, extradata)
 - **Blocos** `BLK` com índice de samples + payload e um CRC32 ao final —
   cada bloco é fechado a cada N samples, N ms ou N bytes, o que vier primeiro
-- **Footer** `VEOF` com total de blocos, duração e offset do último bloco
+- **Âncora A/V** `BANC` no fim do índice de cada bloco: o instante de parede em
+  que cada trilha começou ali, que é o que relaciona dois PTS em bases diferentes
+- **Índice** `VIDX` com tempo, posição e "tem keyframe" de cada bloco, escrito
+  quando a gravação fecha: achar um instante vira uma busca binária em vez de
+  uma varredura do arquivo
+- **Footer** `VEOF` com total de blocos, duração, offset do último bloco e
+  ponteiro para o índice
 
 Um arquivo truncado continua legível até o último bloco completo: o leitor para
 quando faltam bytes, em vez de falhar o arquivo inteiro. Ele também tem um modo
-"live", que aguarda o escritor em vez de terminar no fim do arquivo. O CRC é
-gravado, mas o leitor ainda não o valida.
+"live", que aguarda o escritor em vez de terminar no fim do arquivo. O CRC de cada
+bloco é conferido na leitura: bloco corrompido é pulado com aviso, em vez de
+envenenar o decodificador.
+
+O formato está em desenvolvimento e **não carrega compatibilidade**: existe um
+layout só. Mudou o layout, as gravações antigas se apagam.
 
 ## Licença
 

@@ -436,7 +436,10 @@ begin
   if AacLen = 0 then Exit;
   // Envelopa em ADTS (7 bytes, sem CRC) — auto-descritivo, dispensa extradata.
   FrameLen := AacLen + 7;
-  SetLength(Buf, FrameLen);
+  // Mesmo contrato do vídeo: o buffer leva os bytes zerados de padding depois do
+  // tamanho declarado, porque o decodificador lê à frente (ver FFmpegLib).
+  SetLength(Buf, FrameLen + AV_INPUT_BUFFER_PADDING_SIZE);
+  FillChar(Buf[FrameLen], AV_INPUT_BUFFER_PADDING_SIZE, 0);
   Buf[0] := $FF;
   Buf[1] := $F1; // MPEG-4, layer 0, sem proteção (CRC ausente)
   Buf[2] := Byte((1 shl 6) or ((FAdtsFreqIdx and $0F) shl 2) or ((FAdtsChan shr 2) and 1)); // profile AAC-LC=1

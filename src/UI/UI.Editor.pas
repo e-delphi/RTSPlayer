@@ -18,7 +18,8 @@ uses
   VMS.Dvrip.Session,
   VMS.App.Config,
   VMS.App.Composition,
-  UI.Common;
+  UI.Common,
+  UI.Editor.Paths;
 
 type
   TFrameEditor = class(TFrame)
@@ -64,7 +65,9 @@ type
     lblVideoDelay: TLabel;
     edVideoDelay: TEdit;
     lblTailscale: TLabel;
+    layTailscale: TLayout;
     swTailscale: TSwitch;
+    layPaths: TLayout;
     Layout1: TLayout;
     btnTestConn: TRectangle;
     lblTestConn: TLabel;
@@ -77,6 +80,9 @@ type
     FSelectedChip: Integer;
     FSelectedProto: Integer; // 0=rtsp, 1=dvrip
     FEditIndex: Integer;
+    FEndpoints: TCameraEndpoints;   // sendo editados; índice 0 = prioridade
+    FEpIndex: Integer;              // qual está na tela
+    FPaths: TFrameCameraPaths;      // a barra de caminhos (UI.Editor.Paths)
     FKbShown: Boolean;
     FKbTop: Single;
     FLayBody: TLayout;
@@ -96,6 +102,17 @@ type
     procedure btnSaveClick(Sender: TObject);
     procedure btnCancelClick(Sender: TObject);
     procedure btnDeleteClick(Sender: TObject);
+    // Caminhos até a câmera (ver TCameraEndpoint). O editor mostra um por vez;
+    // trocar de aba guarda o que estava na tela e carrega o outro.
+    procedure CreatePathsFrame;
+    procedure RefreshPaths;
+    procedure CommitEndpoint;
+    procedure LoadEndpoint(Index: Integer);
+    procedure EndpointTabClick(Sender: TObject; Index: Integer);
+    procedure EndpointAddClick(Sender: TObject);
+    procedure EndpointRemoveClick(Sender: TObject);
+    procedure EndpointNameChange(Sender: TObject);
+    function SuggestEndpointName(const Host: string): string;
     procedure AdjustForFocused(Ctrl: TControl);
   public
     constructor Create(AOwner: TComponent); override;
@@ -171,6 +188,9 @@ begin
 
   SelectChip(0);
   SelectProto(0);
+
+  // Depois dos SetupEdit: o campo da barra usa o mesmo estilo escuro.
+  CreatePathsFrame;
 end;
 
 procedure TFrameEditor.Bind(const AppCfg: TAppConfig; const Logger: ILogger;
@@ -192,38 +212,43 @@ begin
   if (Index >= 0) and (Index <= High(Cameras)) then
   begin
     edName.Text := Cameras[Index].Name;
-    SplitUrl(Cameras[Index].Url, Proto, Host, Port, Path);
-    if Proto = 'dvrip' then SelectProto(1) else SelectProto(0);
-    edHost.Text := Host;
-    edPort.Text := Port;
-    edPath.Text := Path;
-    edUser.Text := Cameras[Index].User;
-    edPass.Text := Cameras[Index].Password;
-    SelectChip(StrToChip(TransportsToStr(Cameras[Index].Transports)));
+    // Os caminhos vêm da câmera; cadastro antigo (uma url só) vira um caminho.
+    FEndpoints := Copy(Cameras[Index].Endpoints);
+    if Length(FEndpoints) = 0 then
+    begin
+      SetLength(FEndpoints, 1);
+      FEndpoints[0] := Default(TCameraEndpoint);
+      SplitUrl(Cameras[Index].Url, Proto, Host, Port, Path);
+      FEndpoints[0].Name := SuggestEndpointName(Host);
+      FEndpoints[0].Url := Cameras[Index].Url;
+      FEndpoints[0].User := Cameras[Index].User;
+      FEndpoints[0].Password := Cameras[Index].Password;
+      FEndpoints[0].Transports := Cameras[Index].Transports;
+      FEndpoints[0].UsesTailscale := Cameras[Index].UsesTailscale;
+    end;
     edMaxRetries.Text := IntToStr(Cameras[Index].MaxReconnectAttempts);
     edAudioDelay.Text := IntToStr(Cameras[Index].AudioDelayMs);
     edVideoDelay.Text := IntToStr(Cameras[Index].VideoDelayMs);
-    swTailscale.IsChecked := Cameras[Index].UsesTailscale;
     lblEditTitle.Text := 'Editar câmera';
     btnDelete.Visible := True;
   end
   else
   begin
     edName.Text := '';
-    SelectProto(0);
-    edHost.Text := '';
-    edPort.Text := '554';
-    edPath.Text := '';
-    edUser.Text := '';
-    edPass.Text := '';
-    SelectChip(0);
+    SetLength(FEndpoints, 1);
+    FEndpoints[0] := Default(TCameraEndpoint);
+    FEndpoints[0].Name := 'principal';
+    FEndpoints[0].Url := 'rtsp://:554';
+    FEndpoints[0].Transports := ParseTransports('tcp,udp');
     edMaxRetries.Text := '0';
     edAudioDelay.Text := '200';
     edVideoDelay.Text := '200';
-    swTailscale.IsChecked := False;
     lblEditTitle.Text := 'Nova câmera';
     btnDelete.Visible := False;
   end;
+  // os campos de conexão saem daqui: um caminho por vez na tela
+  FEpIndex := 0;
+  LoadEndpoint(0);
 end;
 
 procedure TFrameEditor.SelectChip(Idx: Integer);
@@ -343,6 +368,135 @@ begin
     end).Start;
 end;
 
+// ---------------------------------------------------------------- endpoints
+
+// A barra de caminhos mora num hospedeiro posto no designer (layPaths, logo
+// depois do nome da câmera). Assim a ordem da tela é decidida lá, e não por
+// conta de índice em tempo de execução — que foi o que já mandou a barra e o
+// switch do Tailscale para o lugar errado.
+procedure TFrameEditor.CreatePathsFrame;
+begin
+  FPaths := TFrameCameraPaths.Create(Self);
+  FPaths.Parent := layPaths;
+  FPaths.Align := TAlignLayout.Client;
+  layPaths.Height := PATHS_BAR_HEIGHT;
+  // O campo de nome do caminho é do frame, mas o fundo escuro e o
+  // reposicionamento com o teclado aberto são regra desta tela.
+  SetupEdit(FPaths.NameEdit);
+  FPaths.OnSelect := EndpointTabClick;
+  FPaths.OnAdd := EndpointAddClick;
+  FPaths.OnRemove := EndpointRemoveClick;
+  FPaths.OnRename := EndpointNameChange;
+end;
+
+// Abas + rótulo dos campos. O rótulo diz de quem os campos são: sem isso,
+// trocar de aba parece não ter feito nada.
+procedure TFrameEditor.RefreshPaths;
+var
+  Names: TArray<string>;
+  I: Integer;
+begin
+  if FPaths = nil then Exit;
+  SetLength(Names, Length(FEndpoints));
+  for I := 0 to High(FEndpoints) do
+    Names[I] := FEndpoints[I].Name;
+  FPaths.ShowPaths(Names, FEpIndex);
+
+  if lblProto <> nil then
+    if Length(FEndpoints) > 1 then
+      lblProto.Text := Format('Protocolo (caminho %d de %d)',
+        [FEpIndex + 1, Length(FEndpoints)])
+    else
+      lblProto.Text := 'Protocolo';
+end;
+
+// Fields -> endpoint corrente. Chamado antes de trocar de aba e ao salvar.
+procedure TFrameEditor.CommitEndpoint;
+begin
+  if (FEpIndex < 0) or (FEpIndex > High(FEndpoints)) then Exit;
+  FEndpoints[FEpIndex].Url :=
+    BuildUrl(ProtoStr(FSelectedProto), edHost.Text, edPort.Text, edPath.Text);
+  FEndpoints[FEpIndex].User := edUser.Text;
+  FEndpoints[FEpIndex].Password := edPass.Text;
+  FEndpoints[FEpIndex].Transports := ParseTransports(ChipToStr(FSelectedChip));
+  FEndpoints[FEpIndex].UsesTailscale := swTailscale.IsChecked;
+  if FPaths.CurrentName <> '' then
+    FEndpoints[FEpIndex].Name := FPaths.CurrentName;
+end;
+
+procedure TFrameEditor.LoadEndpoint(Index: Integer);
+var
+  Proto, Host, Port, Path: string;
+begin
+  if (Index < 0) or (Index > High(FEndpoints)) then Exit;
+  FEpIndex := Index;
+  SplitUrl(FEndpoints[Index].Url, Proto, Host, Port, Path);
+  if Proto = 'dvrip' then SelectProto(1) else SelectProto(0);
+  edHost.Text := Host;
+  edPort.Text := Port;
+  edPath.Text := Path;
+  edUser.Text := FEndpoints[Index].User;
+  edPass.Text := FEndpoints[Index].Password;
+  SelectChip(StrToChip(TransportsToStr(FEndpoints[Index].Transports)));
+  swTailscale.IsChecked := FEndpoints[Index].UsesTailscale;
+  FPaths.SetCurrentName(FEndpoints[Index].Name);
+  lblTestResult.Text := '';
+  RefreshPaths;
+end;
+
+procedure TFrameEditor.EndpointTabClick(Sender: TObject; Index: Integer);
+begin
+  CommitEndpoint;
+  LoadEndpoint(Index);
+end;
+
+// Sugestão de nome pelo endereço: quem cadastra pensa "esse é o de fora", não
+// "esse é o 100.102.x". Só um palpite — o campo continua editável.
+function TFrameEditor.SuggestEndpointName(const Host: string): string;
+var
+  H: string;
+begin
+  H := LowerCase(Trim(Host));
+  if (H = 'localhost') or (H = '127.0.0.1') then Exit('Local');
+  if H.StartsWith('100.') then Exit('Online');
+  if H.StartsWith('192.168.') or H.StartsWith('10.') then Exit('LAN');
+  Result := Format('conex'#$E3'o %d', [Length(FEndpoints) + 1]);
+end;
+
+procedure TFrameEditor.EndpointAddClick(Sender: TObject);
+var
+  Novo: TCameraEndpoint;
+begin
+  CommitEndpoint;
+  Novo := Default(TCameraEndpoint);
+  Novo.Name := Format('conex'#$E3'o %d', [Length(FEndpoints) + 1]);
+  Novo.Url := 'rtsp://:554';
+  Novo.Transports := ParseTransports('tcp,udp');
+  FEndpoints := FEndpoints + [Novo];
+  LoadEndpoint(High(FEndpoints));
+end;
+
+procedure TFrameEditor.EndpointRemoveClick(Sender: TObject);
+var
+  I: Integer;
+begin
+  // Uma câmera sem caminho nenhum não existe: o último não se apaga.
+  if Length(FEndpoints) <= 1 then Exit;
+  for I := FEpIndex to High(FEndpoints) - 1 do
+    FEndpoints[I] := FEndpoints[I + 1];
+  SetLength(FEndpoints, Length(FEndpoints) - 1);
+  if FEpIndex > High(FEndpoints) then FEpIndex := High(FEndpoints);
+  LoadEndpoint(FEpIndex);
+end;
+
+procedure TFrameEditor.EndpointNameChange(Sender: TObject);
+begin
+  if (FEpIndex < 0) or (FEpIndex > High(FEndpoints)) then Exit;
+  if FPaths.CurrentName = '' then Exit;
+  FEndpoints[FEpIndex].Name := FPaths.CurrentName;
+  RefreshPaths;
+end;
+
 procedure TFrameEditor.btnSaveClick(Sender: TObject);
 var
   Cam: TCameraConfigEntry;
@@ -352,14 +506,21 @@ begin
     lblEditTitle.Text := 'Informe o host/IP';
     Exit;
   end;
+  CommitEndpoint;
+  // Se o nome do caminho ficou vazio, um palpite pelo endereço é melhor que
+  // "conexão 2" numa aba.
+  if Trim(FEndpoints[FEpIndex].Name) = '' then
+    FEndpoints[FEpIndex].Name := SuggestEndpointName(edHost.Text);
+
   Cam := MakeCamera(Trim(edName.Text),
-                    BuildUrl(ProtoStr(FSelectedProto), edHost.Text, edPort.Text, edPath.Text),
-                    edUser.Text, edPass.Text,
-                    ParseTransports(ChipToStr(FSelectedChip)),
+                    FEndpoints[0].Url,
+                    FEndpoints[0].User, FEndpoints[0].Password,
+                    FEndpoints[0].Transports,
                     StrToIntDef(Trim(edMaxRetries.Text), 0),
                     StrToIntDef(Trim(edAudioDelay.Text), 200),
                     StrToIntDef(Trim(edVideoDelay.Text), 200),
-                    swTailscale.IsChecked);
+                    FEndpoints[0].UsesTailscale);
+  Cam.Endpoints := Copy(FEndpoints);
   if Assigned(FOnSave) then FOnSave(Self, Cam, FEditIndex);
 end;
 

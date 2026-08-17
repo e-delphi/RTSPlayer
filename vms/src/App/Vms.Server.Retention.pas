@@ -146,8 +146,41 @@ begin
   {$ENDIF}
 end;
 
-// Lista os .vms com tamanho e data numa varredura só (FindFirst já traz os
-// três), do mais antigo para o mais novo — que é a ordem em que se apaga.
+// Acrescenta os .vms de UMA pasta (sem descer). FindFirst já traz nome, tamanho
+// e data numa varredura só, que é o motivo de não usar TDirectory aqui.
+procedure ScanVmsFolder(const Dir: string; var Files: TArray<TRecFile>; var N: Integer);
+var
+  SR: TSearchRec;
+  Base: string;
+begin
+  Base := IncludeTrailingPathDelimiter(Dir);
+  if FindFirst(Base + '*.vms', faAnyFile, SR) <> 0 then Exit;
+  try
+    repeat
+      if (SR.Attr and faDirectory) <> 0 then Continue;
+      if N >= Length(Files) then
+        if Length(Files) = 0 then
+          SetLength(Files, 64)
+        else
+          SetLength(Files, Length(Files) * 2);
+      Files[N].Path := Base + SR.Name;
+      Files[N].Size := SR.Size;
+      Files[N].Written := SR.TimeStamp;
+      Files[N].Deleted := False;
+      Files[N].Skip := False;
+      Inc(N);
+    until FindNext(SR) <> 0;
+  finally
+    // Qualificado: esta unit usa Winapi.Windows na implementation, e o
+    // FindClose de lá fecha um handle de busca, não um TSearchRec.
+    System.SysUtils.FindClose(SR);
+  end;
+end;
+
+// Lista os .vms com tamanho e data, do mais antigo para o mais novo — que é a
+// ordem em que se apaga. Cada câmera grava na SUA pasta (ver VMS.Rec.Paths),
+// então a varredura desce um nível; a raiz ainda é lida por causa de gravação
+// antiga, de quando tudo morava lá.
 function ListRecordings(const Dir: string): TArray<TRecFile>;
 var
   SR: TSearchRec;
@@ -157,25 +190,15 @@ begin
   Result := nil;
   N := 0;
   Base := IncludeTrailingPathDelimiter(Dir);
-  if FindFirst(Base + '*.vms', faAnyFile, SR) <> 0 then Exit;
+  ScanVmsFolder(Dir, Result, N);
+  if FindFirst(Base + '*', faDirectory, SR) = 0 then
   try
     repeat
-      if (SR.Attr and faDirectory) <> 0 then Continue;
-      if N >= Length(Result) then
-        if Length(Result) = 0 then
-          SetLength(Result, 64)
-        else
-          SetLength(Result, Length(Result) * 2);
-      Result[N].Path := Base + SR.Name;
-      Result[N].Size := SR.Size;
-      Result[N].Written := SR.TimeStamp;
-      Result[N].Deleted := False;
-      Result[N].Skip := False;
-      Inc(N);
+      if (SR.Attr and faDirectory) = 0 then Continue;
+      if (SR.Name = '.') or (SR.Name = '..') then Continue;
+      ScanVmsFolder(Base + SR.Name, Result, N);
     until FindNext(SR) <> 0;
   finally
-    // Qualificado: esta unit usa Winapi.Windows na implementation, e o
-    // FindClose de lá fecha um handle de busca, não um TSearchRec.
     System.SysUtils.FindClose(SR);
   end;
   SetLength(Result, N);

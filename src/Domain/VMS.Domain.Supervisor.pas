@@ -38,6 +38,8 @@ type
     FCurrentSession: TCameraSession;
     procedure SetState(NewState: TSupervisorState);
     procedure SleepResponsive(Ms: Cardinal);
+    // Config desta tentativa: igual à da câmera, com o endpoint que respondeu.
+    function ConfigForAttempt: TCameraSessionConfig;
   protected
     procedure Execute; override;
   public
@@ -53,7 +55,43 @@ type
 implementation
 
 uses
+  VMS.Net.Probe,
   VMS.Dvrip.Session;
+
+// A escolha é por TENTATIVA, não por sessão: sair de casa derruba o endereço
+// local, e é a reconexão seguinte que tem de achar o caminho de fora sozinha.
+// Ninguém respondendo, vai no primeiro assim mesmo — errar o palpite é melhor
+// que não tentar, e o erro real aparece no log da conexão.
+function TCameraSupervisor.ConfigForAttempt: TCameraSessionConfig;
+var
+  Idx, I: Integer;
+begin
+  Result := FConfig;
+  if Length(FConfig.Endpoints) = 0 then Exit;
+  if not SelectEndpoint(FConfig.Endpoints, FLogger, 'supervisor.' + FConfig.Name,
+                        PROBE_TIMEOUT_MS, Idx) then
+  begin
+    // Ninguém respondeu. Se algum caminho é da tailnet, é ELE que se tenta: o
+    // túnel pode estar caído, e é a sessão dele que sabe pedir para subir (ver
+    // UsesTailscale). Senão, o primeiro da lista.
+    Idx := 0;
+    for I := 0 to High(FConfig.Endpoints) do
+      if FConfig.Endpoints[I].UsesTailscale then
+      begin
+        Idx := I;
+        Break;
+      end;
+    FLogger.Warn('supervisor.' + FConfig.Name,
+      Format('nenhum dos %d caminhos respondeu; tentando "%s" assim mesmo',
+        [Length(FConfig.Endpoints), FConfig.Endpoints[Idx].Name]));
+  end;
+  Result.Url := FConfig.Endpoints[Idx].Url;
+  Result.User := FConfig.Endpoints[Idx].User;
+  Result.Password := FConfig.Endpoints[Idx].Password;
+  if Length(FConfig.Endpoints[Idx].Transports) > 0 then
+    Result.Transports := FConfig.Endpoints[Idx].Transports;
+  Result.UsesTailscale := FConfig.Endpoints[Idx].UsesTailscale;
+end;
 
 function StateToStr(S: TSupervisorState): string;
 begin
@@ -139,6 +177,7 @@ var
   WasStreaming: Boolean;
   UseDvrip: Boolean;
   StreamedOk: Boolean;
+  Attempt: TCameraSessionConfig;
 begin
   while FStopEvent.WaitFor(0) <> wrSignaled do
   begin
@@ -146,18 +185,19 @@ begin
     WasStreaming := False;
     Session := nil;
     Dvrip := nil;
-    UseDvrip := SameText(Copy(Trim(FConfig.Url), 1, 5), 'dvrip');
+    Attempt := ConfigForAttempt;
+    UseDvrip := SameText(Copy(Trim(Attempt.Url), 1, 5), 'dvrip');
     try
       try
         if UseDvrip then
         begin
-          Dvrip := TDvripSession.Create(FConfig, FLogger, FClock, FStopEvent, FMediaSink);
+          Dvrip := TDvripSession.Create(Attempt, FLogger, FClock, FStopEvent, FMediaSink);
           SetState(svStreaming);
           Dvrip.Run;
         end
         else
         begin
-          Session := TCameraSession.Create(FConfig, FLogger, FClock, FDepkFactory, FStopEvent, FMediaSink);
+          Session := TCameraSession.Create(Attempt, FLogger, FClock, FDepkFactory, FStopEvent, FMediaSink);
           FCurrentSession := Session;
           SetState(svStreaming);
           Session.Run;

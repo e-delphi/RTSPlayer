@@ -40,6 +40,12 @@ const
                 'L17.6 9.1 L19 10.5 L17.9 11.6 L19 12.7 L17.6 14.1 L16.5 13 L15.4 14.1 ' +
                 'L14 12.7 L15.1 11.6 Z';
   ICON_TRASH  = 'M10 3 L14 3 L14 5 L10 5 Z M5 5 L19 5 L19 7 L5 7 Z M7 7 L17 7 L16 21 L8 21 Z';
+  // relógio (mostrador + ponteiros): a entrada do playback de gravação. Só
+  // M/L/Z, como os outros, para não depender do parser de arcos.
+  ICON_CLOCK  = 'M12 3 L14 4 L16.5 5.5 L18.5 7.5 L20 10 L20.5 12 L20 14 L18.5 16.5 ' +
+                'L16.5 18.5 L14 20 L12 20.5 L10 20 L7.5 18.5 L5.5 16.5 L4 14 L3.5 12 ' +
+                'L4 10 L5.5 7.5 L7.5 5.5 L10 4 Z M11 6 L13 6 L13 12 L11 12 Z ' +
+                'M12 11 L17 14 L16 15.7 L11 12.7 Z';
 
 type
   // eventos usados pelos frames para avisar o shell

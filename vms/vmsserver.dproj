@@ -176,6 +176,7 @@
         <DCCReference Include="..\src\Net\VMS.Net.Intf.pas"/>
         <DCCReference Include="..\src\Net\VMS.Net.Tcp.pas"/>
         <DCCReference Include="..\src\Net\VMS.Net.Udp.pas"/>
+        <DCCReference Include="..\src\Net\VMS.Net.Probe.pas"/>
         <DCCReference Include="..\src\Rtp\VMS.Rtp.Demux.pas"/>
         <DCCReference Include="..\src\Rtp\VMS.Rtp.Packet.pas"/>
         <DCCReference Include="..\src\Rtsp\VMS.Rtsp.Auth.pas"/>
@@ -204,6 +205,7 @@
         <DCCReference Include="..\src\Recording\VMS.Rec.Block.pas"/>
         <DCCReference Include="..\src\Recording\VMS.Rec.Writer.pas"/>
         <DCCReference Include="..\src\Recording\VMS.Rec.Reader.pas"/>
+        <DCCReference Include="..\src\Recording\VMS.Rec.Paths.pas"/>
         <DCCReference Include="..\src\App\VMS.App.Clock.pas"/>
         <DCCReference Include="..\src\App\VMS.App.Logger.pas"/>
         <DCCReference Include="..\src\App\VMS.App.Config.pas"/>
@@ -222,6 +224,9 @@
         <DCCReference Include="src\Server\Tx.Server.Session.pas"/>
         <DCCReference Include="src\Server\Tx.Server.Listener.pas"/>
         <DCCReference Include="src\Live\Vms.Server.LiveHub.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.IndexCache.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.Media.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.Api.pas"/>
         <DCCReference Include="src\Recording\Vms.Server.RecSink.pas"/>
         <DCCReference Include="src\App\Vms.Server.Logger.pas"/>
         <DCCReference Include="src\App\Vms.Server.Retention.pas"/>

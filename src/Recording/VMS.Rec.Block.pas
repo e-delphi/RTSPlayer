@@ -16,6 +16,10 @@ type
     FSeq: Cardinal;
     FStartUnixMs: Int64;
     FStartMonotonicMs: Int64;
+    // instante de parede do primeiro sample de cada trilha neste bloco (0 = a
+    // trilha ainda não apareceu); é a âncora A/V que vai no bloco
+    FFirstVideoMs: Int64;
+    FFirstAudioMs: Int64;
     FSamples: array of TVmsSampleEntry;
     FSampleCount: Integer;
     FPayload: TBytes;
@@ -84,6 +88,8 @@ begin
   FPayloadSize := 0;
   FStartUnixMs := NowUnixMs;
   FStartMonotonicMs := NowMonotonicMs;
+  FFirstVideoMs := 0;
+  FFirstAudioMs := 0;
 end;
 
 function TBlockBuilder.ShouldClose(NowMonotonicMs: Int64): Boolean;
@@ -103,6 +109,8 @@ begin
   if FSampleCount = 0 then Exit;
   Block.BlockSeq := FSeq;
   Block.StartUnixMs := FStartUnixMs;
+  Block.VideoAnchorMs := FFirstVideoMs;
+  Block.AudioAnchorMs := FFirstAudioMs;
   SetLength(Block.Samples, FSampleCount);
   for I := 0 to FSampleCount - 1 do
     Block.Samples[I] := FSamples[I];
@@ -129,6 +137,16 @@ begin
   if FSampleCount >= Length(FSamples) then
     SetLength(FSamples, Length(FSamples) * 2);
   GrowPayload(FPayloadSize + DataSize);
+
+  // Primeiro sample de cada trilha no bloco: guarda o instante de parede. É o
+  // único ponto do sistema que sabe QUANDO cada trilha começou aqui — depois só
+  // restam PTS em bases diferentes.
+  if Sample.Kind = tkVideo then
+  begin
+    if FFirstVideoMs = 0 then FFirstVideoMs := NowUnixMs;
+  end
+  else
+    if FFirstAudioMs = 0 then FFirstAudioMs := NowUnixMs;
 
   Entry.TrackId := Sample.TrackId;
   Entry.FlagsByte := FlagsToByte(Sample.Flags);

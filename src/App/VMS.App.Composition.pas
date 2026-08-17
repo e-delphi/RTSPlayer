@@ -97,6 +97,9 @@ begin
   Result.RecordEnabled := True;
   Result.MaxReconnectAttempts := Cam.MaxReconnectAttempts;
   Result.UsesTailscale := Cam.UsesTailscale;
+  // A lista inteira vai junto: quem escolhe o caminho é o supervisor, a cada
+  // tentativa, e não a composição uma vez só.
+  Result.Endpoints := Copy(Cam.Endpoints, 0, Length(Cam.Endpoints));
 end;
 
 function BuildReconnectPolicy(const Cam: TCameraConfigEntry): IReconnectPolicy;

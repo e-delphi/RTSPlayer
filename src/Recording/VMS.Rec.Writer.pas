@@ -31,6 +31,13 @@ type
     FFirstUnixMs: Int64;
     FLastUnixMs: Int64;
     FLastBlockOffset: UInt64;
+    // índice acumulado em memória e despejado no Close; 17 bytes por bloco, ou
+    // ~30 KB por hora de gravação
+    FIndex: TVmsIndex;
+    FIndexCount: Integer;
+    FIndexOverflow: Boolean;
+    procedure NoteBlockInIndex(const Block: TVmsBlock; Offset: UInt64);
+    function WriteIndexChunk: UInt64;
     procedure FlushDisk;
   public
     constructor Create(const AFilePath: string);
@@ -50,6 +57,12 @@ implementation
 uses
   Winapi.Windows;
 {$ENDIF}
+
+const
+  // Válvula de segurança: acima disto o índice é abandonado e o arquivo fecha
+  // sem ele (quem precisar varre). São ~23 dias de gravação com blocos de 2 s —
+  // se chegou lá, alguma coisa está errada e é melhor não segurar 17 MB de RAM.
+  MAX_INDEX_ENTRIES = 1000000;
 
 procedure WriteU16ToBytes(var Buf: TBytes; var Offset: Integer; V: Word);
 begin
@@ -113,6 +126,8 @@ begin
   FFirstUnixMs := 0;
   FLastUnixMs := 0;
   FLastBlockOffset := 0;
+  FIndexCount := 0;
+  FIndexOverflow := False;
 end;
 
 destructor TFileRecordingWriter.Destroy;
@@ -214,11 +229,19 @@ var
   I: Integer;
   Crc: Cardinal;
   StartOffset: UInt64;
+  HasAnchor: Boolean;
 begin
   if not FHeaderDone then
     raise EVmsIoError.Create('Header must be written before blocks');
 
-  IndexSize := Length(Block.Samples) * (1 + 1 + 8 + 4 + 4);
+  // A âncora A/V entra DENTRO da área de índice, depois das entradas de sample:
+  // leitor que não a conhece percorre só `sampleCount` entradas e acha o payload
+  // por `indexSize`, então ignora estes bytes sem sair do lugar (ver
+  // VMS.Rec.Format). Bloco sem nenhuma trilha datada não leva âncora.
+  HasAnchor := (Block.VideoAnchorMs > 0) or (Block.AudioAnchorMs > 0);
+  IndexSize := Length(Block.Samples) * VMS_SAMPLE_ENTRY_SIZE;
+  if HasAnchor then
+    Inc(IndexSize, VMS_ANCHOR_SIZE);
   PayloadSize := Length(Block.Payload);
   TotalSize :=
     4 +              // magic
@@ -249,6 +272,13 @@ begin
     WriteU32ToBytes(Buf, Offset, Block.Samples[I].PayloadSize);
   end;
 
+  if HasAnchor then
+  begin
+    Move(VMS_MAGIC_ANCHOR[0], Buf[Offset], 4); Inc(Offset, 4);
+    WriteI64ToBytes(Buf, Offset, Block.VideoAnchorMs);
+    WriteI64ToBytes(Buf, Offset, Block.AudioAnchorMs);
+  end;
+
   if PayloadSize > 0 then
   begin
     Move(Block.Payload[0], Buf[Offset], PayloadSize);
@@ -264,6 +294,64 @@ begin
   FLastBlockOffset := StartOffset;
   Inc(FBlocks);
   FLastUnixMs := Block.StartUnixMs;
+  NoteBlockInIndex(Block, StartOffset);
+end;
+
+procedure TFileRecordingWriter.NoteBlockInIndex(const Block: TVmsBlock; Offset: UInt64);
+begin
+  if FIndexOverflow then Exit;
+  if FIndexCount >= MAX_INDEX_ENTRIES then
+  begin
+    FIndexOverflow := True;
+    SetLength(FIndex, 0);
+    FIndexCount := 0;
+    Exit;
+  end;
+  if FIndexCount >= Length(FIndex) then
+    if Length(FIndex) = 0 then
+      SetLength(FIndex, 1024)
+    else
+      SetLength(FIndex, Length(FIndex) * 2);
+  FIndex[FIndexCount].Offset := Int64(Offset);
+  FIndex[FIndexCount].StartUnixMs := Block.StartUnixMs;
+  if SamplesHaveKeyframe(Block.Samples) then
+    FIndex[FIndexCount].Flags := VMS_IDX_FLAG_KEYFRAME
+  else
+    FIndex[FIndexCount].Flags := 0;
+  Inc(FIndexCount);
+end;
+
+// Devolve o offset onde o chunk começou, ou 0 se não escreveu nada (é o valor
+// que o rodapé usa para dizer "sem índice").
+function TFileRecordingWriter.WriteIndexChunk: UInt64;
+var
+  Buf: TBytes;
+  Offset, I, TotalSize: Integer;
+  Crc: Cardinal;
+  StartOffset: UInt64;
+begin
+  Result := 0;
+  if (FIndexCount = 0) or FIndexOverflow then Exit;
+
+  TotalSize := VMS_INDEX_HEADER_SIZE + FIndexCount * VMS_INDEX_ENTRY_SIZE + 4;
+  SetLength(Buf, TotalSize);
+  Offset := 0;
+  Move(VMS_MAGIC_INDEX[0], Buf[Offset], 4); Inc(Offset, 4);
+  WriteU32ToBytes(Buf, Offset, Cardinal(TotalSize));
+  WriteU32ToBytes(Buf, Offset, Cardinal(FIndexCount));
+  for I := 0 to FIndexCount - 1 do
+  begin
+    WriteI64ToBytes(Buf, Offset, FIndex[I].Offset);
+    WriteI64ToBytes(Buf, Offset, FIndex[I].StartUnixMs);
+    Buf[Offset] := FIndex[I].Flags; Inc(Offset);
+  end;
+  Crc := Crc32Update(0, Buf, 0, Offset);
+  WriteU32ToBytes(Buf, Offset, Crc);
+
+  StartOffset := UInt64(FBytes);
+  FStream.WriteBuffer(Buf[0], Length(Buf));
+  Inc(FBytes, Length(Buf));
+  Result := StartOffset;
 end;
 
 procedure TFileRecordingWriter.Close(WriteFooter: Boolean);
@@ -272,12 +360,21 @@ var
   Offset: Integer;
   Crc: Cardinal;
   Duration: Int64;
+  IndexOffset: UInt64;
 begin
   if FStream = nil then Exit;
 
   if WriteFooter and FHeaderDone then
   begin
-    SetLength(Buf, 4 + 4 + 8 + 8 + 4);
+    // Índice primeiro, rodapé depois: é o rodapé que aponta para ele, e ele
+    // precisa estar no fim para ser achado a partir do tamanho do arquivo.
+    try
+      IndexOffset := WriteIndexChunk;
+    except
+      IndexOffset := 0; // sem índice o arquivo continua válido; quem precisar varre
+    end;
+
+    SetLength(Buf, VMS_FOOTER_SIZE);
     Offset := 0;
     Move(VMS_MAGIC_FOOTER[0], Buf[Offset], 4); Inc(Offset, 4);
     WriteU32ToBytes(Buf, Offset, FBlocks);
@@ -286,6 +383,11 @@ begin
       Duration := FLastUnixMs - FFirstUnixMs;
     WriteI64ToBytes(Buf, Offset, Duration);
     WriteU64ToBytes(Buf, Offset, FLastBlockOffset);
+    WriteU64ToBytes(Buf, Offset, IndexOffset);
+    if IndexOffset = 0 then
+      WriteU32ToBytes(Buf, Offset, 0)
+    else
+      WriteU32ToBytes(Buf, Offset, Cardinal(FIndexCount));
     Crc := Crc32Update(0, Buf, 0, Offset);
     WriteU32ToBytes(Buf, Offset, Crc);
     try

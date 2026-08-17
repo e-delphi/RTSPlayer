@@ -92,6 +92,7 @@ type
     FVideo: TVideoTrackInfo;
     FHasAudio: Boolean;
     FAudio: TAudioTrackInfo;
+    FLastSampleMs: Int64;
     function SlotOf(Seq: Int64): Integer;
     procedure DropOldestLocked;
     procedure TrimLocked;
@@ -123,6 +124,14 @@ type
     function Subscribe(out Cursor: TLiveCursor): Boolean;
     function Fetch(var Cursor: TLiveCursor; TimeoutMs: Integer;
                    out Items: TArray<TLiveSampleRec>): TLiveFetch;
+    // A câmera entregou mídia há pouco? Diferente de "já anunciou formato": os
+    // formatos ficam guardados depois que a câmera cai, e o que interessa a quem
+    // pergunta (a API, para dizer se está ao vivo) é o agora.
+    function IsPublishing(WithinMs: Int64 = 10000): Boolean;
+    // Os samples de vídeo em memória, do keyframe mais recente em diante, para
+    // quem precisa olhar dentro do bitstream (o SDP tira daí os parameter sets
+    // de verdade, em vez de confiar no que a câmera anunciou).
+    function RecentVideoSamples(Max: Integer): TArray<TBytes>;
 
     property Name: string read FName;
   end;
@@ -333,6 +342,7 @@ begin
     FItems[Slot].Keyframe := sfKeyframe in Sample.Flags;
     FItems[Slot].WallMs := FClock.MonotonicMs;
     FItems[Slot].Data := Sample.Data;   // TBytes é COW: cópia é só a referência
+    FLastSampleMs := FItems[Slot].WallMs;
     Inc(FBytes, Length(Sample.Data));
     Inc(FNextSeq);
     TrimLocked;
@@ -383,6 +393,49 @@ begin
     TMonitor.Exit(Self);
   end;
   Header := H;
+end;
+
+function TLiveStream.IsPublishing(WithinMs: Int64): Boolean;
+begin
+  TMonitor.Enter(Self);
+  try
+    Result := (FLastSampleMs > 0) and ((FClock.MonotonicMs - FLastSampleMs) <= WithinMs);
+  finally
+    TMonitor.Exit(Self);
+  end;
+end;
+
+function TLiveStream.RecentVideoSamples(Max: Integer): TArray<TBytes>;
+var
+  Seq, From: Int64;
+  Count: Integer;
+  It: TLiveSampleRec;
+begin
+  Result := nil;
+  if Max <= 0 then Exit;
+  TMonitor.Enter(Self);
+  try
+    // Do keyframe mais recente em diante: é onde a câmera costuma pôr os
+    // parameter sets. Sem keyframe guardado, pega o começo do que houver.
+    From := LastKeyframeSeqLocked;
+    if From < 0 then From := FFirstSeq;
+    SetLength(Result, Max);
+    Count := 0;
+    Seq := From;
+    while (Seq < FNextSeq) and (Count < Max) do
+    begin
+      It := FItems[SlotOf(Seq)];
+      if It.TrackId = 0 then
+      begin
+        Result[Count] := It.Data;
+        Inc(Count);
+      end;
+      Inc(Seq);
+    end;
+    SetLength(Result, Count);
+  finally
+    TMonitor.Exit(Self);
+  end;
 end;
 
 function TLiveStream.LastKeyframeSeqLocked: Int64;

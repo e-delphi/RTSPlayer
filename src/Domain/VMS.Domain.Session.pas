@@ -30,6 +30,7 @@ uses
   VMS.Depk.PCM,
   VMS.Rec.Format,
   VMS.Rec.Block,
+  VMS.Rec.Paths,
   VMS.Rec.Writer,
   VMS.Net.Tailscale;
 
@@ -57,6 +58,11 @@ type
     // Câmera dentro da tailnet: espera o túnel antes de cada tentativa de
     // conexão (inclusive nas reconexões, que é quando a VPN costuma ter caído).
     UsesTailscale: Boolean;
+    // Caminhos alternativos até a mesma câmera, em ordem de prioridade. Quem
+    // escolhe é o supervisor, antes de CADA tentativa (ver VMS.Net.Probe); os
+    // campos Url/User/Password/Transports acima são os do endpoint escolhido.
+    // Lista vazia = câmera com um caminho só, que são os campos acima.
+    Endpoints: TCameraEndpoints;
   end;
 
   TDepacketizerFactoryFn = reference to function(VideoCodec: TVideoCodec; AudioCodec: TAudioCodec;
@@ -86,6 +92,7 @@ type
     FBlockBuilder: TBlockBuilder;
     FWriter: IRecordingWriter;
     FMediaSink: IMediaSink;
+    FFormatNotified: Boolean;  // o sink já soube do formato desta sessão
     FUsedTransport: TTransportKind;
     FVideoTransport: TRtspTransportSpec;
     FAudioTransport: TRtspTransportSpec;
@@ -301,11 +308,8 @@ var
 begin
   CreationUtc := TTimeZone.Local.ToUniversalTime(Now);
   Filename := FormatFilename(FConfig.FilenamePattern, FConfig.Name, CreationUtc);
-  Dir := FConfig.StorageDir;
-  if Dir = '' then Dir := 'recordings';
-  Dir := ExpandFileName(Dir);
-  if not DirectoryExists(Dir) then
-    ForceDirectories(Dir);
+  // Cada câmera na sua pasta (ver VMS.Rec.Paths).
+  Dir := EnsureCameraDir(FConfig.StorageDir, FConfig.Name);
   Result := IncludeTrailingPathDelimiter(Dir) + Filename;
 end;
 
@@ -638,6 +642,12 @@ begin
     end;
 
     SetupDepacketizers;
+    // Formato ANTES do primeiro RTP: o ValidateFirstRtp despacha o pacote que
+    // recebe, e se ele completar um sample o sink receberia mídia sem saber
+    // configurar o decodificador. Hoje os três sinks (renderer, gravação, hub)
+    // descartam nesse caso, mas depender disso é depender de todo sink futuro
+    // ser tolerante.
+    NotifySinkFormat;
     FStreamStartMs := FClock.MonotonicMs;
     FFirstRtpReceived := False;
     if ValidateFirstRtp(FConfig.TransportFallbackTimeoutMs) then
@@ -839,6 +849,11 @@ end;
 procedure TCameraSession.NotifySinkFormat;
 begin
   if FMediaSink = nil then Exit;
+  // Idempotente: a busca de transporte pode passar por aqui uma vez por
+  // tentativa, e reanunciar o mesmo formato faria o renderer reconfigurar o
+  // decodificador à toa.
+  if FFormatNotified then Exit;
+  FFormatNotified := True;
   if (FVideoTrack <> nil) and (FVideoInfo.VideoCodec <> vcNone) then
   begin
     FLogger.Info('session.' + FConfig.Name,

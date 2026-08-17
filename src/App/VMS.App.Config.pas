@@ -24,6 +24,12 @@ type
   TCameraConfigEntry = record
     Name: string;
     Enabled: Boolean;
+    // Caminhos até ESTA câmera, em ordem de prioridade (a LAN dela, o servidor
+    // que a republica, o mesmo servidor pela tailnet). Quem conecta testa qual
+    // responde — ver VMS.Net.Probe. Os campos Url/User/Password/Transports/
+    // UsesTailscale abaixo espelham o PRIMEIRO endpoint: é o que a lista mostra,
+    // e o que vale quando a câmera tem um caminho só.
+    Endpoints: TCameraEndpoints;
     Url: string;
     User: string;
     Password: string;
@@ -80,6 +86,12 @@ function GetJsonDouble(Obj: TJSONObject; const Name: string; Default: Double): D
 
 // Atalho para quem não precisa de campos extras (é o TAppConfigLoader puro).
 function LoadAppConfig(const FilePath: string): TAppConfig;
+
+// Um caminho até a câmera, do array "endpoints". Exportado porque o app lê o
+// cameras.json dele com regras próprias de reconexão (ver MakeCamera), mas o
+// objeto do caminho tem que ser lido do MESMO jeito nos dois lados — foi
+// justamente ler diferente que fez o app carregar só o primeiro caminho.
+function ParseEndpoint(Obj: TJSONObject; Index: Integer): TCameraEndpoint;
 
 implementation
 
@@ -192,16 +204,64 @@ begin
   Result.NoRtpTimeoutMs := Cardinal(GetJsonInt(Obj, 'noRtpTimeoutMs', 10000));
 end;
 
-function ParseCamera(Obj: TJSONObject): TCameraConfigEntry;
-var
-  ReconnectObj: TJSONValue;
+function ParseEndpoint(Obj: TJSONObject; Index: Integer): TCameraEndpoint;
 begin
   Result.Name := GetJsonStr(Obj, 'name', '');
-  Result.Enabled := GetJsonBool(Obj, 'enabled', True);
+  if Result.Name = '' then
+    Result.Name := Format('conex'#$E3'o %d', [Index + 1]);
   Result.Url := GetJsonStr(Obj, 'url', '');
   Result.User := GetJsonStr(Obj, 'user', '');
   Result.Password := GetJsonStr(Obj, 'password', '');
   Result.Transports := ParseTransportValue(Obj.GetValue('transport'));
+  Result.UsesTailscale := GetJsonBool(Obj, 'tailscale', False);
+end;
+
+function ParseCamera(Obj: TJSONObject): TCameraConfigEntry;
+var
+  ReconnectObj, EpValue: TJSONValue;
+  Arr: TJSONArray;
+  I, Count: Integer;
+begin
+  Result.Name := GetJsonStr(Obj, 'name', '');
+  Result.Enabled := GetJsonBool(Obj, 'enabled', True);
+
+  // Formato novo: lista de caminhos. Formato antigo (uma url por câmera)
+  // continua sendo lido — vira uma câmera com um endpoint só, e nada muda para
+  // quem não tem mais de um jeito de chegar na câmera.
+  Result.Endpoints := nil;
+  EpValue := Obj.GetValue('endpoints');
+  if EpValue is TJSONArray then
+  begin
+    Arr := TJSONArray(EpValue);
+    SetLength(Result.Endpoints, Arr.Count);
+    Count := 0;
+    for I := 0 to Arr.Count - 1 do
+      if Arr.Items[I] is TJSONObject then
+      begin
+        Result.Endpoints[Count] := ParseEndpoint(TJSONObject(Arr.Items[I]), Count);
+        if Trim(Result.Endpoints[Count].Url) <> '' then
+          Inc(Count);
+      end;
+    SetLength(Result.Endpoints, Count);
+  end;
+
+  if Length(Result.Endpoints) > 0 then
+  begin
+    // espelho do primeiro: é o que a lista mostra e o que vale como padrão
+    Result.Url := Result.Endpoints[0].Url;
+    Result.User := Result.Endpoints[0].User;
+    Result.Password := Result.Endpoints[0].Password;
+    Result.Transports := Result.Endpoints[0].Transports;
+    Result.UsesTailscale := Result.Endpoints[0].UsesTailscale;
+  end
+  else
+  begin
+    Result.Url := GetJsonStr(Obj, 'url', '');
+    Result.User := GetJsonStr(Obj, 'user', '');
+    Result.Password := GetJsonStr(Obj, 'password', '');
+    Result.Transports := ParseTransportValue(Obj.GetValue('transport'));
+    Result.UsesTailscale := GetJsonBool(Obj, 'tailscale', False);
+  end;
   Result.RecordAudio := GetJsonBool(Obj, 'recordAudio', True);
   Result.FilenamePattern := GetJsonStr(Obj, 'filenamePattern', '{name}_{yyyy-MM-dd_HH-mm-ss}.vms');
   ReconnectObj := Obj.GetValue('reconnect');
@@ -212,7 +272,6 @@ begin
   Result.MaxReconnectAttempts := GetJsonInt(Obj, 'maxRetries', 0);
   Result.AudioDelayMs := GetJsonInt(Obj, 'audioDelayMs', 200);
   Result.VideoDelayMs := GetJsonInt(Obj, 'videoDelayMs', 200);
-  Result.UsesTailscale := GetJsonBool(Obj, 'tailscale', False);
 end;
 
 procedure ValidateConfig(const Cfg: TAppConfig);

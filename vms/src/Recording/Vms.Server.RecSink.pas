@@ -24,6 +24,7 @@ uses
   VMS.Domain.MediaSink,
   VMS.Rec.Format,
   VMS.Rec.Block,
+  VMS.Rec.Paths,
   VMS.Rec.Writer;
 
 type
@@ -187,11 +188,8 @@ var
   Dir, Filename: string;
 begin
   Filename := FormatRecFilename(FPattern, FName, TTimeZone.Local.ToUniversalTime(Now));
-  Dir := FStorageDir;
-  if Dir = '' then Dir := 'recordings';
-  Dir := ExpandFileName(Dir);
-  if not DirectoryExists(Dir) then
-    ForceDirectories(Dir);
+  // Cada câmera na sua pasta (ver VMS.Rec.Paths).
+  Dir := EnsureCameraDir(FStorageDir, FName);
   Result := IncludeTrailingPathDelimiter(Dir) + Filename;
 end;
 

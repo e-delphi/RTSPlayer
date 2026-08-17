@@ -244,6 +244,12 @@ const
   AVERROR_EAGAIN                = -11;
   AVERROR_EOF                   = -541478725; // FFERRTAG('E','O','F',' ') as int32
   AVSEEK_FLAG_BACKWARD          = 1;
+  // Bytes zerados que todo buffer de entrada precisa ter DEPOIS do tamanho
+  // declarado: os decodificadores leem à frente de propósito (é assim que o
+  // bitreader deles dispensa um teste de limite por bit). Sem eles, é leitura
+  // fora do buffer — funciona quase sempre, e quando não funciona é artefato
+  // no fim do último NAL.
+  AV_INPUT_BUFFER_PADDING_SIZE  = 64;
 
   // SWS_BICUBIC algorithm flag
   SWS_BICUBIC = 4;

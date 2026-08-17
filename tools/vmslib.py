@@ -11,10 +11,19 @@ descrito em VMS.Rec.Format.pas / VMS.Rec.Writer.pas — se mudar lá, muda aqui.
   bloco:  'BLK\\x01' | block_size(4) | seq(4) | start_unix_ms(8)
           | sample_count(4) | index_size(4) | index | payload | crc32(4)
   índice: track_id(1) flags(1) pts(8) payload_offset(4) payload_size(4)
+  BANC:   'BANC' | video_anchor_ms(8) | audio_anchor_ms(8)   [no fim do índice]
+  VIDX:   'VIDX' | chunk_size(4) | count(4)
+          | count × (offset(8) start_unix_ms(8) flags(1)) | crc32(4)
+  VEOF:   'VEOF' | total_blocks(4) | duration_ms(8) | last_block_offset(8)
+          | index_offset(8) index_count(4) | crc32(4)
 
 Inteiros são little-endian. track_id 0 = vídeo, 1 = áudio. flags bit 0 =
 keyframe, 1 = início de quadro, 2 = fim de quadro. O CRC é o CRC-32 padrão
 (polinômio 0xEDB88320), igual ao do zlib.
+
+O VIDX é o índice tempo → posição, escrito quando a gravação fecha; nele, flags
+bit 0 = o bloco contém keyframe de vídeo. O formato está em desenvolvimento e não
+carrega compatibilidade: existe um layout só, e gravação de layout antigo se apaga.
 """
 
 import struct
@@ -31,14 +40,23 @@ except (AttributeError, OSError):  # stdout redirecionado para algo sem reconfig
 MAGIC_FILE = b'VMS1'
 MAGIC_BLOCK = b'BLK\x01'
 MAGIC_FOOTER = b'VEOF'
+MAGIC_INDEX = b'VIDX'
+MAGIC_ANCHOR = b'BANC'
+
+# Versão única do formato: o Delphi recusa arquivo com outra (ver ReadHeader).
+FORMAT_VERSION = 1
 
 VIDEO_CODECS = {0: 'nenhum', 1: 'H264', 2: 'H265', 3: 'MJPEG'}
 AUDIO_CODECS = {0: 'nenhum', 1: 'PCM', 2: 'AAC', 3: 'G711U', 4: 'G711A',
                 5: 'G726-16', 6: 'G726-24', 7: 'G726-32', 8: 'G726-40'}
 
 FLAG_KEYFRAME = 0x01
-INDEX_ENTRY_SIZE = 18
+INDEX_ENTRY_SIZE = 18          # entrada do índice de samples, dentro do bloco
 BLOCK_HEADER_SIZE = 28
+BLOCK_INDEX_ENTRY_SIZE = 17    # entrada do VIDX, uma por bloco
+INDEX_HEADER_SIZE = 12
+ANCHOR_SIZE = 20            # 'BANC' + âncora de vídeo(8) + de áudio(8)
+FOOTER_SIZE = 40
 
 
 class VmsError(Exception):
@@ -48,6 +66,7 @@ class VmsError(Exception):
 def _u16(b, o): return struct.unpack_from('<H', b, o)[0]
 def _u32(b, o): return struct.unpack_from('<I', b, o)[0]
 def _i64(b, o): return struct.unpack_from('<q', b, o)[0]
+def _u64(b, o): return struct.unpack_from('<Q', b, o)[0]
 
 
 @dataclass
@@ -99,6 +118,10 @@ class Block:
     size: int
     crc_ok: bool
     samples: list = field(default_factory=list)
+    # âncora A/V (formato v3): instante de parede do primeiro sample de cada
+    # trilha neste bloco. 0 = arquivo anterior à v3, ou trilha ausente aqui.
+    video_anchor_ms: int = 0
+    audio_anchor_ms: int = 0
 
 
 def read_header(data):
@@ -158,6 +181,14 @@ def iter_blocks(data, header, with_data=True):
         blk = Block(seq, start, o, size, crc_ok)
         p = o + BLOCK_HEADER_SIZE
         payload = p + index_size
+        # A âncora fica DEPOIS das entradas de sample, ainda dentro da área de
+        # índice: quem não a conhece percorre só `count` entradas e acha o
+        # payload por index_size, ignorando estes bytes.
+        anchor_at = p + count * INDEX_ENTRY_SIZE
+        if (index_size >= count * INDEX_ENTRY_SIZE + ANCHOR_SIZE
+                and data[anchor_at:anchor_at + 4] == MAGIC_ANCHOR):
+            blk.video_anchor_ms = _i64(data, anchor_at + 4)
+            blk.audio_anchor_ms = _i64(data, anchor_at + 12)
         for _ in range(count):
             if p + INDEX_ENTRY_SIZE > o + size:
                 break
@@ -172,6 +203,97 @@ def iter_blocks(data, header, with_data=True):
                 data[payload + off:payload + off + sz] if with_data else b''))
         yield blk
         o += size
+
+
+@dataclass
+class Footer:
+    total_blocks: int
+    duration_ms: int
+    last_block_offset: int
+    index_offset: int       # 0 = arquivo fechado sem índice
+    index_count: int
+    crc_ok: bool
+
+
+@dataclass
+class IndexEntry:
+    offset: int
+    start_unix_ms: int
+    flags: int
+
+    @property
+    def keyframe(self):
+        return bool(self.flags & FLAG_KEYFRAME)
+
+
+def read_footer(data):
+    """O rodapé, ou None se o arquivo não tem (truncado ou em gravação).
+
+    Num arquivo em gravação o fim é o meio de um bloco; é o CRC que impede
+    confundir esses bytes com um rodapé."""
+    if len(data) < FOOTER_SIZE:
+        return None
+    f = data[-FOOTER_SIZE:]
+    if f[:4] != MAGIC_FOOTER:
+        return None
+    if zlib.crc32(f[:FOOTER_SIZE - 4]) != _u32(f, FOOTER_SIZE - 4):
+        return None
+    return Footer(_u32(f, 4), _i64(f, 8), _u64(f, 16),
+                  _u64(f, 24), _u32(f, 32), True)
+
+
+def read_block_index(data, footer=None):
+    """As entradas do VIDX, ou None se o arquivo não tem índice.
+
+    Levanta VmsError quando o índice existe mas está corrompido — silenciar isso
+    esconderia justamente o bug que se está procurando."""
+    if footer is None:
+        footer = read_footer(data)
+    if footer is None or not footer.index_offset:
+        return None
+    o = footer.index_offset
+    if o + INDEX_HEADER_SIZE > len(data) or data[o:o + 4] != MAGIC_INDEX:
+        raise VmsError('rodapé aponta para %d, onde não há VIDX' % o)
+    size = _u32(data, o + 4)
+    count = _u32(data, o + 8)
+    expected = INDEX_HEADER_SIZE + count * BLOCK_INDEX_ENTRY_SIZE + 4
+    if size != expected:
+        raise VmsError('VIDX com tamanho %d, esperado %d para %d entradas'
+                       % (size, expected, count))
+    if o + size > len(data):
+        raise VmsError('VIDX truncado')
+    if count != footer.index_count:
+        raise VmsError('VIDX diz %d entradas, rodapé diz %d' % (count, footer.index_count))
+    if zlib.crc32(data[o:o + size - 4]) != _u32(data, o + size - 4):
+        raise VmsError('crc do VIDX inválido')
+    out = []
+    p = o + INDEX_HEADER_SIZE
+    for _ in range(count):
+        out.append(IndexEntry(_u64(data, p), _i64(data, p + 8), data[p + 16]))
+        p += BLOCK_INDEX_ENTRY_SIZE
+    return out
+
+
+def check_index(blocks, entries):
+    """Compara o índice do rodapé com a varredura. Devolve a lista de
+    divergências (vazia = confere). É o teste do formato: o índice só vale se
+    disser exatamente o que está no arquivo."""
+    problems = []
+    if len(entries) != len(blocks):
+        problems.append('índice tem %d entradas, o arquivo tem %d blocos'
+                        % (len(entries), len(blocks)))
+    for i, (e, b) in enumerate(zip(entries, blocks)):
+        if e.offset != b.offset:
+            problems.append('bloco %d: índice aponta offset %d, o bloco está em %d'
+                            % (i, e.offset, b.offset))
+        if e.start_unix_ms != b.start_unix_ms:
+            problems.append('bloco %d: índice diz start %d, o bloco diz %d'
+                            % (i, e.start_unix_ms, b.start_unix_ms))
+        real_key = any(s.is_video and s.keyframe for s in b.samples)
+        if e.keyframe != real_key:
+            problems.append('bloco %d: índice diz keyframe=%s, o bloco tem %s'
+                            % (i, e.keyframe, real_key))
+    return problems
 
 
 def load(path, with_data=True):

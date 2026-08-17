@@ -15,8 +15,10 @@ uses
   IdExceptionCore,
   VMS.Domain.Logging,
   VMS.Domain.Clock,
+  System.StrUtils,
   VMS.Rtsp.Messages,
   Vms.Server.LiveHub,
+  Vms.Server.Api,
   Tx.Server.Session;
 
 type
@@ -30,6 +32,7 @@ type
     FRecordingsDir: string;
     FLoop: Boolean;
     FHub: TLiveHub;
+    FApi: TApiRouter;
     procedure HandleConnect(AContext: TIdContext);
     procedure HandleDisconnect(AContext: TIdContext);
     procedure HandleExecute(AContext: TIdContext);
@@ -37,8 +40,10 @@ type
   public
     // ABindAddress vazio = escuta em todas as interfaces.
     // AHub nil = /live/<camera> sai do arquivo, sem o caminho de memória.
+    // AApi nil = a porta só fala RTSP.
     constructor Create(APort: Word; const ABindAddress, ARecordingsDir: string; ALoop: Boolean;
-                       const ALogger: ILogger; const AClock: IClock; AHub: TLiveHub = nil);
+                       const ALogger: ILogger; const AClock: IClock; AHub: TLiveHub = nil;
+                       AApi: TApiRouter = nil);
     destructor Destroy; override;
     procedure Start;
     procedure Stop;
@@ -64,7 +69,7 @@ end;
 constructor TTxServerListener.Create(APort: Word; const ABindAddress, ARecordingsDir: string;
                                      ALoop: Boolean;
                                      const ALogger: ILogger; const AClock: IClock;
-                                     AHub: TLiveHub);
+                                     AHub: TLiveHub; AApi: TApiRouter);
 begin
   inherited Create;
   FPort := APort;
@@ -72,6 +77,7 @@ begin
   FRecordingsDir := ARecordingsDir;
   FLoop := ALoop;
   FHub := AHub;
+  FApi := AApi;
   FLogger := ALogger;
   FClock := AClock;
   FServer := TIdTCPServer.Create(nil);
@@ -121,7 +127,8 @@ var
   Holder: TSessionHolder;
 begin
   Holder := TSessionHolder.Create;
-  Holder.Session := TTxSession.Create(AContext, FLogger, FClock, FRecordingsDir, FLoop, FHub);
+  Holder.Session := TTxSession.Create(AContext, FLogger, FClock, FRecordingsDir, FLoop,
+                                      FHub, FApi);
   AContext.Data := Holder;
   AContext.Connection.IOHandler.ReadTimeout := 500;
   FLogger.Info('tx.listener', 'Client connected: ' + AContext.Binding.PeerIP);
@@ -244,8 +251,13 @@ begin
     end;
   end;
   try
-    FLogger.Debug('tx.listener', Format('< %s %s', [Req.Method, Req.Uri]));
-    Holder.Session.HandleRequest(Req);
+    FLogger.Debug('tx.listener', Format('< %s %s %s', [Req.Method, Req.Uri, Req.Version]));
+    // Quem decide é a VERSÃO, não o método: OPTIONS existe nos dois protocolos,
+    // e é o `HTTP/1.1` da linha do pedido que diz com quem se está falando.
+    if StartsText('HTTP/', Req.Version) then
+      Holder.Session.HandleHttpRequest(Req)
+    else
+      Holder.Session.HandleRequest(Req);
   finally
     Req.Free;
   end;

@@ -32,6 +32,7 @@ uses
   VMS.Net.Tcp in '..\src\Net\VMS.Net.Tcp.pas',
   VMS.Net.Tailscale in '..\src\Net\VMS.Net.Tailscale.pas',
   VMS.Net.Udp in '..\src\Net\VMS.Net.Udp.pas',
+  VMS.Net.Probe in '..\src\Net\VMS.Net.Probe.pas',
   VMS.Rtp.Demux in '..\src\Rtp\VMS.Rtp.Demux.pas',
   VMS.Rtp.Packet in '..\src\Rtp\VMS.Rtp.Packet.pas',
   VMS.Rtsp.Auth in '..\src\Rtsp\VMS.Rtsp.Auth.pas',
@@ -60,6 +61,7 @@ uses
   VMS.Rec.Block in '..\src\Recording\VMS.Rec.Block.pas',
   VMS.Rec.Writer in '..\src\Recording\VMS.Rec.Writer.pas',
   VMS.Rec.Reader in '..\src\Recording\VMS.Rec.Reader.pas',
+  VMS.Rec.Paths in '..\src\Recording\VMS.Rec.Paths.pas',
   VMS.App.Clock in '..\src\App\VMS.App.Clock.pas',
   VMS.App.Logger in '..\src\App\VMS.App.Logger.pas',
   VMS.App.Config in '..\src\App\VMS.App.Config.pas',
@@ -80,6 +82,9 @@ uses
   Tx.Server.Listener in 'src\Server\Tx.Server.Listener.pas',
   // ---- deste app ----
   Vms.Server.LiveHub in 'src\Live\Vms.Server.LiveHub.pas',
+  Vms.Server.IndexCache in 'src\Api\Vms.Server.IndexCache.pas',
+  Vms.Server.Media in 'src\Api\Vms.Server.Media.pas',
+  Vms.Server.Api in 'src\Api\Vms.Server.Api.pas',
   Vms.Server.RecSink in 'src\Recording\Vms.Server.RecSink.pas',
   Vms.Server.Logger in 'src\App\Vms.Server.Logger.pas',
   Vms.Server.Retention in 'src\App\Vms.Server.Retention.pas',
@@ -131,6 +136,9 @@ var
   Sweeper: TRetentionThread;
   LiveCfg: TLiveConfig;
   Hub: TLiveHub;
+  ApiCfg: TApiConfig;
+  Api: TApiRouter;
+  CameraNames: TArray<string>;
   Logger: ILogger;
   Clock: IClock;
   Supervisors: TAppSupervisorList;
@@ -146,6 +154,7 @@ begin
     BindAddress := Cfg.BindAddress;
     Retention := Cfg.Retention;
     LiveCfg := Cfg.Live;
+    ApiCfg := Cfg.Api;
   finally
     Cfg.Free;
   end;
@@ -163,6 +172,10 @@ begin
   Logger.Info('main', Format('Espaco livre: %.1f GB | retencao: %s',
     [FreeSpaceOf(StorageDir) / GIGABYTE, Retention.Describe]));
   Logger.Info('main', 'Ao vivo: ' + LiveCfg.Describe);
+  Logger.Info('main', 'API de gravacoes: ' + ApiCfg.Describe);
+  if ApiCfg.Enabled and (BindAddress = '') then
+    Logger.Warn('main', 'API sem autenticacao escutando em todas as interfaces: ' +
+      'quem alcanca esta porta baixa gravacao. Use bindAddress para limitar ao tailnet.');
 
   // Uma varredura antes de começar a gravar: se o disco já está no limite, é
   // agora que se abre espaço, não cinco minutos depois.
@@ -176,47 +189,64 @@ begin
   if LiveCfg.Enabled then
     Hub := TLiveHub.Create(LiveCfg, Logger, Clock);
   try
-    Supervisors := BuildServerSupervisors(App, Logger, Clock, Hub);
+    // A API só responde sobre as câmeras configuradas: nome que o cliente manda
+    // é conferido contra esta lista antes de virar caminho de arquivo.
+    SetLength(CameraNames, Length(App.Cameras));
+    for I := 0 to High(App.Cameras) do
+      CameraNames[I] := App.Cameras[I].Name;
+
+    Api := nil;
+    if ApiCfg.Enabled then
+      Api := TApiRouter.Create(ApiCfg, StorageDir, CameraNames, Hub, Logger);
     try
-      for I := 0 to Supervisors.Count - 1 do
-        Supervisors[I].Start;
-
-      if Retention.Enabled then
-      begin
-        Sweeper := TRetentionThread.Create(StorageDir, Retention, Logger, GStopEvent);
-        Sweeper.Start;
-      end;
-
-      // loop=False: modo ao vivo nunca reinicia a gravação do começo. Com o hub,
-      // o /live/ sai da memória; sem ele (ou com a câmera fora do ar), do arquivo.
-      Listener := TTxServerListener.Create(RtspPort, BindAddress, StorageDir, False,
-                                           Logger, Clock, Hub);
+      Supervisors := BuildServerSupervisors(App, Logger, Clock, Hub);
       try
-        Listener.Start;
-        for I := 0 to High(App.Cameras) do
-          if App.Cameras[I].Enabled then
-            Logger.Info('main', Format('  rtsp://<host>:%d/live/%s', [RtspPort, App.Cameras[I].Name]));
-        Logger.Info('main', 'No ar. Ctrl+C para parar.');
+        for I := 0 to Supervisors.Count - 1 do
+          Supervisors[I].Start;
 
-        while GStopEvent.WaitFor(500) <> wrSignaled do ;
+        if Retention.Enabled then
+        begin
+          Sweeper := TRetentionThread.Create(StorageDir, Retention, Logger, GStopEvent);
+          Sweeper.Start;
+        end;
 
-        Logger.Info('main', 'Parando...');
-        Listener.Stop;
+        // loop=False: modo ao vivo nunca reinicia a gravação do começo. Com o
+        // hub, o /live/ sai da memória; sem ele (ou com a câmera fora do ar), do
+        // arquivo. O mesmo listener responde a API HTTP das gravações.
+        Listener := TTxServerListener.Create(RtspPort, BindAddress, StorageDir, False,
+                                             Logger, Clock, Hub, Api);
+        try
+          Listener.Start;
+          for I := 0 to High(App.Cameras) do
+            if App.Cameras[I].Enabled then
+              Logger.Info('main', Format('  rtsp://<host>:%d/live/%s', [RtspPort, App.Cameras[I].Name]));
+          if Api <> nil then
+            Logger.Info('main', Format('  http://<host>:%d/api/cameras', [RtspPort]));
+          Logger.Info('main', 'No ar. Ctrl+C para parar.');
+
+          while GStopEvent.WaitFor(500) <> wrSignaled do ;
+
+          Logger.Info('main', 'Parando...');
+          Listener.Stop;
+        finally
+          Listener.Free;
+        end;
       finally
-        Listener.Free;
+        if Sweeper <> nil then
+        begin
+          Sweeper.Terminate;
+          Sweeper.WaitFor;
+          Sweeper.Free;
+        end;
+        // sinaliza todos antes de liberar: o destrutor de cada supervisor faz
+        // WaitFor, então parar em série custaria o tempo de cada um somado
+        for I := 0 to Supervisors.Count - 1 do
+          Supervisors[I].Stop;
+        Supervisors.Free;
       end;
     finally
-      if Sweeper <> nil then
-      begin
-        Sweeper.Terminate;
-        Sweeper.WaitFor;
-        Sweeper.Free;
-      end;
-      // sinaliza todos antes de liberar: o destrutor de cada supervisor faz
-      // WaitFor, então parar em série custaria o tempo de cada um somado
-      for I := 0 to Supervisors.Count - 1 do
-        Supervisors[I].Stop;
-      Supervisors.Free;
+      // depois do listener: são as sessões dele que consultam o roteador
+      Api.Free;
     end;
   finally
     Hub.Free;

@@ -5,10 +5,11 @@
         <FrameworkType>FMX</FrameworkType>
         <Base>True</Base>
         <Config Condition="'$(Config)'==''">Release</Config>
-        <Platform Condition="'$(Platform)'==''">Android64</Platform>
+        <Platform Condition="'$(Platform)'==''">Win64</Platform>
         <TargetedPlatforms>32786</TargetedPlatforms>
         <AppType>Application</AppType>
         <MainSource>rtsplayer.dpr</MainSource>
+        <ProjectName Condition="'$(ProjectName)'==''">rtsplayer</ProjectName>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
         <Base>true</Base>
@@ -301,10 +302,10 @@
             <FormType>fmx</FormType>
         </DCCReference>
         <DCCReference Include="src\Android\VMS.Android.JNIUtil.pas"/>
-        <DCCReference Include="src\Android\VMS.Android.VideoDecoder.pas"/>
-        <DCCReference Include="src\Android\VMS.Android.AudioDecoder.pas"/>
-        <DCCReference Include="src\Android\VMS.Android.MediaRenderer.pas"/>
         <DCCReference Include="src\Win\FFmpegLib.pas"/>
+        <DCCReference Include="src\Win\VMS.Win.VideoDecoder.pas"/>
+        <DCCReference Include="src\Win\VMS.Win.AudioDecoder.pas"/>
+        <DCCReference Include="src\Win\VMS.Win.MediaRenderer.pas"/>
         <DCCReference Include="src\Media\VMS.Media.Renderer.pas"/>
         <DCCReference Include="src\Android\VMS.Android.MemoLogger.pas"/>
         <DCCReference Include="src\Dvrip\VMS.Dvrip.Protocol.pas"/>
@@ -336,10 +337,12 @@
         <DCCReference Include="src\Net\VMS.Net.Tcp.pas"/>
         <DCCReference Include="src\Net\VMS.Net.Tailscale.pas"/>
         <DCCReference Include="src\Net\VMS.Net.Udp.pas"/>
+        <DCCReference Include="src\Net\VMS.Net.Probe.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Block.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Crc32.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Format.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Reader.pas"/>
+        <DCCReference Include="src\Recording\VMS.Rec.Paths.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Writer.pas"/>
         <DCCReference Include="src\Rtp\VMS.Rtp.Demux.pas"/>
         <DCCReference Include="src\Rtp\VMS.Rtp.Packet.pas"/>
@@ -351,6 +354,8 @@
         <DCCReference Include="src\Rtsp\VMS.Rtsp.WireReader.pas"/>
         <DCCReference Include="src\Sdp\VMS.Sdp.Parser.pas"/>
         <DCCReference Include="src\Sdp\VMS.Sdp.Types.pas"/>
+        <DCCReference Include="src\Api\VMS.Api.Client.pas"/>
+        <DCCReference Include="src\Playback\VMS.Play.Engine.pas"/>
         <DCCReference Include="src\UI\UI.Common.pas"/>
         <DCCReference Include="src\UI\UI.List.pas">
             <Form>FrameList</Form>
@@ -367,6 +372,9 @@
             <FormType>fmx</FormType>
             <DesignClass>TFrame</DesignClass>
         </DCCReference>
+        <DCCReference Include="src\UI\UI.Editor.Paths.pas"/>
+        <DCCReference Include="src\UI\UI.Days.pas"/>
+        <DCCReference Include="src\UI\UI.Timeline.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

@@ -4,15 +4,46 @@ Scripts Python 3 que leem as gravações `.vms` e os logs do vmsserver. Nasceram
 de depuração real: quase todo defeito difícil desta base foi resolvido lendo a
 gravação, não o log — a gravação mostra o que a câmera entregou de fato.
 
+Há dois grupos aqui. Os primeiros **leem gravação real** e servem para diagnosticar
+o que aconteceu; os quatro do fim **modelam** o que o Delphi deveria fazer, e
+servem para conferir formato e API sem câmera e sem build — foi com eles que
+saíram quatro bugs desta última leva antes de qualquer compilação:
+
+| script | modela |
+|---|---|
+| `genvms.py` | gera `.vms` sintético (com índice, sem índice, truncado) para usar de fixture |
+| `apimodel.py` | o que `/api/days` e `/api/segments` devem responder para uma pasta de gravações |
+| `fragment.py` | o que `/api/media` devolve, incluindo cursor e travessia de arquivo |
+| `pacemodel.py` | o ritmo do playback (1×/2×/4×, borrão do seek) com relógio virtual |
+| `selftest.py` | roda tudo acima sobre fixtures e diz passou/falhou |
+
+O `selftest.py` amarra os quatro numa suíte que roda em segundos e responde
+passou/falhou, sem Delphi, sem câmera e sem servidor:
+
+```bash
+cd tools
+python selftest.py
+```
+
+São 33 verificações sobre fixtures geradas na hora: formato e âncora A/V,
+enquadramento do bloco (a âncora não pode deslocar um byte de payload), índice do
+rodapé — inclusive um índice **mentiroso com CRC refeito**, que tem de ser pego —,
+CRC de bloco com um byte trocado, colagem de segmentos, a caminhada do
+`/api/media` atravessando arquivo, e o ritmo em 1×/2× com o borrão do seek.
+
+Ela não cobre o código Delphi: cobre o **contrato** que ele tem de cumprir, as
+mesmas contas sobre os mesmos bytes. Depois de mexer no formato ou na API, rode
+antes de compilar.
+
 Não têm dependência externa. `vmslib.py` é o único lugar que conhece o formato
 `.vms`; os outros são casca fina em cima dele.
 
 ```bash
 cd tools
-python vmsdump.py     ../vms/bin/recordings/ayla_2026-08-15_04-45-10.vms --samples 3
-python vmstimeline.py ../vms/bin/recordings/*.vms
-python vmscheck.py    ../vms/bin/recordings/isis_2026-08-15_04-45-33.vms
-python vmspipeline.py ../vms/bin/recordings/ayla_2026-08-15_04-45-10.vms
+python vmsdump.py     ../vms/bin/recordings/ayla/ayla_2026-08-15_04-45-10.vms --samples 3
+python vmstimeline.py ../vms/bin/recordings/ayla/*.vms
+python vmscheck.py    ../vms/bin/recordings/isis/isis_2026-08-15_04-45-33.vms
+python vmspipeline.py ../vms/bin/recordings/ayla/ayla_2026-08-15_04-45-10.vms
 python dvripstats.py  ../vms/bin/logs/isis_2026-08-15.log
 ```
 
@@ -56,7 +87,15 @@ bloco:  'BLK\x01' | block_size(4) | seq(4) | start_unix_ms(8)
 
 índice: track_id(1) flags(1) pts(8) payload_offset(4) payload_size(4)   [18B]
 
-rodapé: 'VEOF' | total_blocks(4) | duration_ms(8) | last_block_offset(8) | crc32(4)
+BANC:   'BANC' | video_anchor_ms(8) | audio_anchor_ms(8)               [20B]
+        (no FIM da área de índice, contado dentro de index_size)
+
+VIDX:   'VIDX' | chunk_size(4) | count(4)
+        | count × (offset(8) start_unix_ms(8) flags(1))                 [17B]
+        | crc32(4)
+
+rodapé: 'VEOF' | total_blocks(4) | duration_ms(8) | last_block_offset(8)
+        | index_offset(8) index_count(4) | crc32(4)          [40 bytes]
 ```
 
 Little-endian. `track_id` 0 = vídeo, 1 = áudio. `flags` bit 0 = keyframe.
@@ -64,3 +103,23 @@ Little-endian. `track_id` 0 = vídeo, 1 = áudio. `flags` bit 0 = keyframe.
 (start code de 4 bytes); áudio é o payload cru do codec. Arquivo em gravação não
 tem rodapé e o último bloco pode estar cortado — as ferramentas param no
 primeiro bloco incompleto, sem reclamar.
+
+A `BANC` é a âncora A/V do bloco: o instante de parede em que cada trilha começou
+ali. Sem ela, as duas trilhas só têm PTS em bases diferentes e quem toca precisa
+supor que começam juntas, congelando na saída a defasagem real. Ela mora no fim da
+área de índice porque ali não atrapalha: quem lê percorre exatamente
+`sample_count` entradas e acha o payload por `index_size`, então esses 20 bytes
+não deslocam nada — verificado no `selftest`.
+
+O `VIDX` é o índice tempo → posição, uma entrada por bloco, escrito quando a
+gravação fecha; nele `flags` bit 0 diz que aquele bloco contém keyframe de vídeo,
+que é o que permite achar por onde começar a decodificar sem varrer o arquivo. É
+o que a timeline do app usa (ver [PLANO-TIMELINE.md](../docs/PLANO-TIMELINE.md)).
+Arquivo fechado sem índice continua válido: quem precisar varre.
+
+O formato está **em desenvolvimento e não lê layout antigo**: a versão do header é
+sempre 1, não há caminho de leitura para arquivo de layout anterior, e mudança de
+layout se resolve apagando as gravações.
+
+O `vmsdump` confere o índice contra a varredura, entrada por entrada — é o teste
+que pega erro de formato antes de ele virar bug de playback.

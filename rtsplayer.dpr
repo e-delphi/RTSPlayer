@@ -47,10 +47,12 @@ uses
   VMS.Net.Tcp in 'src\Net\VMS.Net.Tcp.pas',
   VMS.Net.Tailscale in 'src\Net\VMS.Net.Tailscale.pas',
   VMS.Net.Udp in 'src\Net\VMS.Net.Udp.pas',
+  VMS.Net.Probe in 'src\Net\VMS.Net.Probe.pas',
   VMS.Rec.Block in 'src\Recording\VMS.Rec.Block.pas',
   VMS.Rec.Crc32 in 'src\Recording\VMS.Rec.Crc32.pas',
   VMS.Rec.Format in 'src\Recording\VMS.Rec.Format.pas',
   VMS.Rec.Reader in 'src\Recording\VMS.Rec.Reader.pas',
+  VMS.Rec.Paths in 'src\Recording\VMS.Rec.Paths.pas',
   VMS.Rec.Writer in 'src\Recording\VMS.Rec.Writer.pas',
   VMS.Rtp.Demux in 'src\Rtp\VMS.Rtp.Demux.pas',
   VMS.Rtp.Packet in 'src\Rtp\VMS.Rtp.Packet.pas',
@@ -62,10 +64,15 @@ uses
   VMS.Rtsp.WireReader in 'src\Rtsp\VMS.Rtsp.WireReader.pas',
   VMS.Sdp.Parser in 'src\Sdp\VMS.Sdp.Parser.pas',
   VMS.Sdp.Types in 'src\Sdp\VMS.Sdp.Types.pas',
+  VMS.Api.Client in 'src\Api\VMS.Api.Client.pas',
+  VMS.Play.Engine in 'src\Playback\VMS.Play.Engine.pas',
   UI.Common in 'src\UI\UI.Common.pas',
   UI.List in 'src\UI\UI.List.pas' {FrameList: TFrame},
   UI.Player in 'src\UI\UI.Player.pas' {FramePlayer: TFrame},
-  UI.Editor in 'src\UI\UI.Editor.pas' {FrameEditor: TFrame};
+  UI.Editor in 'src\UI\UI.Editor.pas' {FrameEditor: TFrame},
+  UI.Editor.Paths in 'src\UI\UI.Editor.Paths.pas',
+  UI.Days in 'src\UI\UI.Days.pas',
+  UI.Timeline in 'src\UI\UI.Timeline.pas';
 
 {$R *.res}
 

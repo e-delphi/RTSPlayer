@@ -9,6 +9,8 @@ unit Vms.Server.Config;
 //   "retention":   limpeza automática das gravações (ver Vms.Server.Retention).
 //   "live":        buffer em memória de onde o ao vivo é publicado, em vez de
 //                  reler o .vms que está sendo gravado (ver Vms.Server.LiveHub).
+//   "api":         rotas HTTP das gravações, na MESMA porta do RTSP (ver
+//                  Vms.Server.Api).
 //
 // A leitura da parte comum não é reimplementada aqui: só o gancho LoadExtra é
 // sobrescrito, e ele recebe a raiz do mesmo JSON que a base já carregou.
@@ -20,7 +22,8 @@ uses
   System.JSON,
   VMS.App.Config,
   Vms.Server.Retention,
-  Vms.Server.LiveHub;
+  Vms.Server.LiveHub,
+  Vms.Server.Api;
 
 type
   TVmsServerConfig = class(TAppConfigLoader)
@@ -29,6 +32,7 @@ type
     FBindAddress: string;
     FRetention: TRetentionPolicy;
     FLive: TLiveConfig;
+    FApi: TApiConfig;
   protected
     procedure LoadExtra(Root: TJSONObject); override;
   public
@@ -36,6 +40,7 @@ type
     property BindAddress: string read FBindAddress;
     property Retention: TRetentionPolicy read FRetention;
     property Live: TLiveConfig read FLive;
+    property Api: TApiConfig read FApi;
   end;
 
 implementation
@@ -83,6 +88,20 @@ begin
     Gb := GetJsonDouble(Obj, 'maxBufferMB', 0);
     if Gb > 0 then FLive.MaxBytes := Round(Gb * 1024 * 1024);
     if FLive.BufferMs < 500 then FLive.BufferMs := 500;
+  end;
+
+  // A API também vem ligada por omissão: ela só lê o que já está no disco, e sai
+  // pela mesma porta que já estava aberta. Quem não quer, escreve
+  // "api": { "enabled": false }.
+  FApi.Enabled := True;
+  FApi.MaxBlocksPerRequest := API_DEFAULT_MAX_BLOCKS;
+  V := Root.GetValue('api');
+  if V is TJSONObject then
+  begin
+    Obj := TJSONObject(V);
+    FApi.Enabled := GetJsonBool(Obj, 'enabled', True);
+    FApi.MaxBlocksPerRequest := GetJsonInt(Obj, 'maxBlocksPerRequest', API_DEFAULT_MAX_BLOCKS);
+    if FApi.MaxBlocksPerRequest < 1 then FApi.MaxBlocksPerRequest := 1;
   end;
 end;
 

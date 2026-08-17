@@ -14,6 +14,45 @@ import sys
 import vmslib
 
 
+def report_footer(data, blocks):
+    """Rodapé e índice tempo → posição, conferidos contra a varredura."""
+    footer = vmslib.read_footer(data)
+    if footer is None:
+        print('  rodapé: nenhum (arquivo em gravação, ou fechado sem rodapé)')
+        return
+    print('  rodapé: blocos=%d  duração=%.1fs  último bloco em %d' % (
+        footer.total_blocks, footer.duration_ms / 1000.0,
+        footer.last_block_offset))
+    if footer.total_blocks != len(blocks):
+        print('  ATENÇÃO: o rodapé diz %d blocos e a varredura achou %d'
+              % (footer.total_blocks, len(blocks)))
+
+    try:
+        entries = vmslib.read_block_index(data, footer)
+    except vmslib.VmsError as e:
+        print('  ATENÇÃO: índice ilegível — %s' % e)
+        return
+    if entries is None:
+        print('  índice: nenhum (gravação fechada sem conseguir escrevê-lo)')
+        return
+
+    keys = sum(1 for e in entries if e.keyframe)
+    print('  índice: %d entradas, %d com keyframe' % (len(entries), keys))
+    problems = vmslib.check_index(blocks, entries)
+    if problems:
+        print('  ATENÇÃO: o índice não bate com o arquivo (%d divergências):'
+              % len(problems))
+        for p in problems[:10]:
+            print('    %s' % p)
+        if len(problems) > 10:
+            print('    ... e mais %d' % (len(problems) - 10))
+    else:
+        print('  índice confere com a varredura, entrada por entrada')
+    if entries and not keys:
+        print('  ATENÇÃO: nenhum bloco marcado com keyframe no índice — seek de'
+              ' playback não tem por onde entrar')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('arquivo')
@@ -21,12 +60,20 @@ def main():
                     help='lista os N primeiros samples de vídeo')
     args = ap.parse_args()
 
-    header, blocks = vmslib.load(args.arquivo)
+    with open(args.arquivo, 'rb') as f:
+        data = f.read()
+    header = vmslib.read_header(data)
+    blocks = list(vmslib.iter_blocks(data, header))
     v, a = header.video, header.audio
 
     print('%s' % args.arquivo)
-    print('  uri=%s  header=%dB  crc=%s' % (
-        header.uri, header.size, 'ok' if header.crc_ok else 'INVÁLIDO'))
+    print('  uri=%s  header=%dB  v%d  crc=%s' % (
+        header.uri, header.size, header.version,
+        'ok' if header.crc_ok else 'INVÁLIDO'))
+    if header.version != vmslib.FORMAT_VERSION:
+        print('  ATENÇÃO: header diz v%d e o formato corrente é v%d — este arquivo'
+              ' é de um layout antigo, e o app se recusa a lê-lo'
+              % (header.version, vmslib.FORMAT_VERSION))
     if v.present:
         print('  vídeo: %s %dx%d timescale=%d extradata=%dB' % (
             v.codec_name, v.width, v.height, v.timescale, len(v.extradata)))
@@ -34,11 +81,30 @@ def main():
         print('  áudio: %s %dHz %dch %dbit timescale=%d' % (
             a.codec_name, a.sample_rate, a.channels, a.bits, a.timescale))
 
+    ancorados = [b for b in blocks if b.video_anchor_ms or b.audio_anchor_ms]
+    if ancorados:
+        # a defasagem A/V que o gravador registrou: sem isto, quem toca só pode
+        # supor que as duas trilhas começam juntas no bloco
+        defs = [b.audio_anchor_ms - b.video_anchor_ms for b in ancorados
+                if b.video_anchor_ms and b.audio_anchor_ms]
+        if defs:
+            print('  âncora A/V: %d de %d blocos; defasagem áudio-vídeo mín/méd/máx = '
+                  '%+d/%+d/%+d ms' % (len(ancorados), len(blocks), min(defs),
+                                      sum(defs) // len(defs), max(defs)))
+        else:
+            print('  âncora A/V: %d de %d blocos (só uma trilha por bloco)'
+                  % (len(ancorados), len(blocks)))
+    else:
+        print('  ATENÇÃO: nenhum bloco tem âncora A/V — as duas trilhas ficam sem'
+              ' base comum, e a defasagem real congela na saída')
+
     bad_crc = [b.seq for b in blocks if not b.crc_ok]
     wall = vmslib.wall_seconds(blocks)
     print('  blocos=%d  parede=%.1fs  bloco médio=%.2fs  crc inválido=%s' % (
         len(blocks), wall, wall / max(1, len(blocks) - 1),
         bad_crc if bad_crc else 'nenhum'))
+
+    report_footer(data, blocks)
 
     vid = [s for b in blocks for s in b.samples if s.is_video]
     aud = [s for b in blocks for s in b.samples if not s.is_video]

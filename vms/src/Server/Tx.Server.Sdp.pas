@@ -13,6 +13,19 @@ uses
 function BuildSdpForHeader(const Header: TVmsHeader; const SessionName: string): string;
 function SplitAnnexB(const Data: TBytes): TArray<TBytes>;
 
+// Os parameter sets que estiverem DENTRO de um sample de vídeo, devolvidos em
+// Annex-B (a mesma forma do extradata do header), ou vazio.
+//
+// Por que isto existe: o extradata do `.vms` veio do SDP da câmera, e há câmera
+// cujo SDP anuncia um SPS/PPS que não é o do stream (a ayla anuncia
+// Baseline/CAVLC e transmite Main/CABAC, com o mesmo sps_id). Quem consome o
+// nosso SDP — VLC, ffplay, e o csd-0 do MediaCodec no Android — configura o
+// decodificador com o parameter set errado. O que o stream traz é a verdade.
+function ParameterSetsOf(const Sample: TBytes; Codec: TVideoCodec): TBytes;
+// Já dá para configurar um decodificador com isto? H264 precisa de SPS+PPS;
+// H265, de VPS+SPS+PPS.
+function ParameterSetsComplete(const PS: TBytes; Codec: TVideoCodec): Boolean;
+
 implementation
 
 function SplitAnnexB(const Data: TBytes): TArray<TBytes>;
@@ -67,6 +80,95 @@ begin
     Inc(Count);
   end;
   Result := Copy(Tmp, 0, Count);
+end;
+
+function IsParameterSetNal(const Nal: TBytes; Codec: TVideoCodec): Boolean;
+var
+  T: Byte;
+begin
+  Result := False;
+  if Length(Nal) < 1 then Exit;
+  if Codec = vcH265 then
+  begin
+    if Length(Nal) < 2 then Exit;
+    T := (Nal[0] shr 1) and $3F;
+    Result := T in [32, 33, 34];   // VPS, SPS, PPS
+  end
+  else
+  begin
+    T := Nal[0] and $1F;
+    Result := T in [7, 8];         // SPS, PPS
+  end;
+end;
+
+function ParameterSetsOf(const Sample: TBytes; Codec: TVideoCodec): TBytes;
+var
+  Nals: TArray<TBytes>;
+  I, Total, Offset: Integer;
+  Keep: TArray<TBytes>;
+  Count: Integer;
+const
+  START_CODE: array[0..3] of Byte = (0, 0, 0, 1);
+begin
+  Result := nil;
+  if (Codec <> vcH264) and (Codec <> vcH265) then Exit;
+  Nals := SplitAnnexB(Sample);
+  SetLength(Keep, Length(Nals));
+  Count := 0;
+  Total := 0;
+  for I := 0 to High(Nals) do
+    if IsParameterSetNal(Nals[I], Codec) then
+    begin
+      Keep[Count] := Nals[I];
+      Inc(Total, 4 + Length(Nals[I]));
+      Inc(Count);
+    end;
+  if Count = 0 then Exit;
+
+  SetLength(Result, Total);
+  Offset := 0;
+  for I := 0 to Count - 1 do
+  begin
+    Move(START_CODE[0], Result[Offset], 4);
+    Inc(Offset, 4);
+    Move(Keep[I][0], Result[Offset], Length(Keep[I]));
+    Inc(Offset, Length(Keep[I]));
+  end;
+end;
+
+function ParameterSetsComplete(const PS: TBytes; Codec: TVideoCodec): Boolean;
+var
+  Nals: TArray<TBytes>;
+  I: Integer;
+  T: Byte;
+  HasVps, HasSps, HasPps: Boolean;
+begin
+  HasVps := False;
+  HasSps := False;
+  HasPps := False;
+  Nals := SplitAnnexB(PS);
+  for I := 0 to High(Nals) do
+  begin
+    if Length(Nals[I]) < 1 then Continue;
+    if Codec = vcH265 then
+    begin
+      if Length(Nals[I]) < 2 then Continue;
+      T := (Nals[I][0] shr 1) and $3F;
+      if T = 32 then HasVps := True;
+      if T = 33 then HasSps := True;
+      if T = 34 then HasPps := True;
+    end
+    else
+    begin
+      T := Nals[I][0] and $1F;
+      if T = 7 then HasSps := True;
+      if T = 8 then HasPps := True;
+    end;
+  end;
+  if Codec = vcH265 then
+    Result := HasVps and HasSps and HasPps
+  else
+    Result := HasSps and HasPps;
 end;
 
 function Base64Of(const Data: TBytes): string;

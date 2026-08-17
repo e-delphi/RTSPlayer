@@ -8,6 +8,11 @@
 //   arquivo — playback de um .vms e o plano B do ao vivo (câmera que ainda não
 //             conectou nesta execução). Aqui a mídia é ritmada pelo PTS, porque
 //             o arquivo entrega um bloco fechado de cada vez.
+//
+// A mesma conexão também atende HTTP (a API de gravações, ver Vms.Server.Api):
+// quem chega com `HTTP/1.1` na linha do pedido cai no HandleHttpRequest. A
+// resposta sai pelo mesmo lock de escrita do RTP interleaved — se saísse por
+// fora, um quadro no meio da resposta corromperia as duas coisas.
 
 interface
 
@@ -28,6 +33,7 @@ uses
   VMS.Rec.Format,
   VMS.Rec.Reader,
   Vms.Server.LiveHub,
+  Vms.Server.Api,
   Tx.Server.Types,
   Tx.Server.Sdp,
   Tx.Pkt.Intf,
@@ -71,6 +77,7 @@ type
     FRecordingsDir: string;
     FLoop: Boolean;
     FHub: TLiveHub;
+    FApi: TApiRouter;
     FSessionId: string;
     FState: TTxSessionState;
     FWriteLock: TCriticalSection;
@@ -95,12 +102,15 @@ type
     procedure Log(Level: TLogLevel; const Msg: string);
     function GenerateSessionId: string;
     procedure SendResponse(Resp: TRtspResponse);
+    procedure SendHttpBytes(const Head, Body: TBytes);
+    procedure SendApiResponse(Req: TRtspRequest; const Resp: TApiResponse);
     procedure SendInterleaved(Channel: Byte; const RtpBytes: TBytes);
     procedure SendUdp(Sock: TIdUDPClient; const PeerHost: string; PeerPort: Word; const RtpBytes: TBytes);
     function ParseTransportRequest(const Header: string; out Tx: TTxClientTransport): Boolean;
     function ParseRoute(const Uri: string): string;
     function ResolveVmsFile(const PathPart: string): string;
     function LiveHeaderMatchesSdp(const H: TVmsHeader): Boolean;
+    procedure PreferInbandParameterSets;
     procedure RunFilePacerOnce;
     procedure RunLivePacerOnce(AStream: TLiveStream);
     procedure HandleOptions(Req: TRtspRequest);
@@ -120,9 +130,13 @@ type
     procedure StopPacer;
   public
     constructor Create(AContext: TIdContext; const ALogger: ILogger; const AClock: IClock;
-                       const ARecordingsDir: string; ALoop: Boolean; AHub: TLiveHub = nil);
+                       const ARecordingsDir: string; ALoop: Boolean; AHub: TLiveHub = nil;
+                       AApi: TApiRouter = nil);
     destructor Destroy; override;
     procedure HandleRequest(Req: TRtspRequest);
+    // Pedido HTTP na mesma porta (a API de gravações). Separado do
+    // HandleRequest de propósito: nada aqui toca no estado da sessão RTSP.
+    procedure HandleHttpRequest(Req: TRtspRequest);
     procedure RunPacerOnce;
     procedure Cleanup;
     property State: TTxSessionState read FState;
@@ -181,7 +195,8 @@ end;
 { TTxSession }
 
 constructor TTxSession.Create(AContext: TIdContext; const ALogger: ILogger; const AClock: IClock;
-                              const ARecordingsDir: string; ALoop: Boolean; AHub: TLiveHub);
+                              const ARecordingsDir: string; ALoop: Boolean; AHub: TLiveHub;
+                              AApi: TApiRouter);
 begin
   inherited Create;
   FContext := AContext;
@@ -190,6 +205,7 @@ begin
   FRecordingsDir := ARecordingsDir;
   FLoop := ALoop;
   FHub := AHub;
+  FApi := AApi;
   FState := sssInit;
   FWriteLock := TCriticalSection.Create;
   FSessionId := GenerateSessionId;
@@ -277,6 +293,89 @@ begin
   finally
     FWriteLock.Leave;
   end;
+end;
+
+// Cabeçalho e corpo numa tomada só do lock. Em duas, um quadro RTP de um PLAY
+// em andamento nesta mesma conexão poderia entrar no meio da resposta HTTP.
+procedure TTxSession.SendHttpBytes(const Head, Body: TBytes);
+var
+  IdbHead, IdbBody: TIdBytes;
+begin
+  SetLength(IdbHead, Length(Head));
+  if Length(Head) > 0 then
+    Move(Head[0], IdbHead[0], Length(Head));
+  SetLength(IdbBody, Length(Body));
+  if Length(Body) > 0 then
+    Move(Body[0], IdbBody[0], Length(Body));
+  FWriteLock.Enter;
+  try
+    try
+      FContext.Connection.IOHandler.Write(IdbHead);
+      if Length(IdbBody) > 0 then
+        FContext.Connection.IOHandler.Write(IdbBody);
+    except
+      on E: Exception do
+      begin
+        FStopFlag := True;
+        Log(llWarn, 'falha ao escrever resposta HTTP: ' + E.Message);
+      end;
+    end;
+  finally
+    FWriteLock.Leave;
+  end;
+end;
+
+procedure TTxSession.SendApiResponse(Req: TRtspRequest; const Resp: TApiResponse);
+var
+  Sb: TStringBuilder;
+  I: Integer;
+  KeepAlive: Boolean;
+  Body: TBytes;
+begin
+  KeepAlive := not SameText(Trim(Req.Headers.Get('Connection')), 'close');
+  // HEAD responde igual, mas sem corpo — e com o Content-Length do corpo que
+  // teria, que é o que faz o HEAD servir para alguma coisa.
+  if SameText(Req.Method, 'HEAD') then
+    Body := nil
+  else
+    Body := Resp.Body;
+
+  Sb := TStringBuilder.Create;
+  try
+    Sb.AppendFormat('HTTP/1.1 %d %s'#13#10, [Resp.Status, StatusTextForCode(Resp.Status)]);
+    Sb.AppendFormat('Content-Type: %s'#13#10, [Resp.ContentType]);
+    Sb.AppendFormat('Content-Length: %d'#13#10, [Length(Resp.Body)]);
+    // Gravação muda o tempo todo (o arquivo do dia cresce): resposta guardada
+    // em cache seria resposta errada.
+    Sb.Append('Cache-Control: no-store'#13#10);
+    for I := 0 to High(Resp.Extra) do
+      Sb.Append(Resp.Extra[I]).Append(#13#10);
+    if KeepAlive then
+      Sb.Append('Connection: keep-alive'#13#10)
+    else
+      Sb.Append('Connection: close'#13#10);
+    Sb.Append(#13#10);
+    SendHttpBytes(TEncoding.UTF8.GetBytes(Sb.ToString), Body);
+  finally
+    Sb.Free;
+  end;
+
+  if not KeepAlive then
+    FStopFlag := True;
+end;
+
+procedure TTxSession.HandleHttpRequest(Req: TRtspRequest);
+var
+  Resp: TApiResponse;
+begin
+  if FApi = nil then
+  begin
+    Resp := TApiResponse.Error(404, 'api indisponivel');
+    SendApiResponse(Req, Resp);
+    Exit;
+  end;
+  Resp := FApi.Handle(Req.Method, Req.Uri);
+  SendApiResponse(Req, Resp);
 end;
 
 procedure TTxSession.SendInterleaved(Channel: Byte; const RtpBytes: TBytes);
@@ -408,6 +507,7 @@ procedure TTxSession.OpenReader(const VmsPath: string);
 begin
   if FReader <> nil then FreeAndNil(FReader);
   FReader := TVmsReader.Create(VmsPath);
+  FReader.Logger := FLogger;   // bloco corrompido vira aviso no log da câmera
   if not FReader.ReadHeader then
   begin
     FreeAndNil(FReader);
@@ -486,6 +586,9 @@ begin
     Log(llInfo, 'ao vivo pela memoria');
   end;
 
+  // Antes de montar o SDP: o extradata que veio do header pode não descrever o
+  // que a câmera realmente transmite. Ver PreferInbandParameterSets.
+  PreferInbandParameterSets;
   Sdp := BuildSdpForHeader(FHeader, SdpName);
   Body := TEncoding.UTF8.GetBytes(Sdp);
   Resp := TRtspResponse.Create;
@@ -582,20 +685,17 @@ begin
     Exit;
   end;
 
+  // UDP é recusado de propósito, com o código que o cliente entende (461
+  // Unsupported Transport): ele cai para TCP interleaved na hora. Aceitar era
+  // pior — o servidor respondia `server_port=0-0`, não mandava RTCP SR e o
+  // caminho nunca foi exercitado, então o cliente descobria o problema no meio
+  // do stream. E pelo túnel do Tailscale tem que ser TCP de qualquer forma: o
+  // WireGuard usa MTU 1280 e RTP em UDP de ~1400 bytes é descartado.
   if Tx.Kind = txUdp then
   begin
-    if IsAudio then
-    begin
-      if FAudio.UdpSock <> nil then FreeAndNil(FAudio.UdpSock);
-      FAudio.UdpSock := TIdUDPClient.Create(nil);
-      FAudio.UdpSock.BufferSize := 65535;
-    end
-    else
-    begin
-      if FVideo.UdpSock <> nil then FreeAndNil(FVideo.UdpSock);
-      FVideo.UdpSock := TIdUDPClient.Create(nil);
-      FVideo.UdpSock.BufferSize := 65535;
-    end;
+    Log(llInfo, 'SETUP em UDP recusado (461); o cliente deve tentar TCP interleaved');
+    SendError(Req, 461);
+    Exit;
   end;
 
   if IsAudio then
@@ -645,12 +745,9 @@ begin
     end;
   end;
 
-  if Tx.Kind = txTcp then
-    TransportResponse := Format('RTP/AVP/TCP;unicast;interleaved=%d-%d',
-      [Tx.InterleavedRtp, Tx.InterleavedRtcp])
-  else
-    TransportResponse := Format('RTP/AVP;unicast;client_port=%d-%d;server_port=0-0',
-      [Tx.ClientRtpPort, Tx.ClientRtcpPort]);
+  // Só chega aqui em TCP: o UDP foi recusado com 461 acima.
+  TransportResponse := Format('RTP/AVP/TCP;unicast;interleaved=%d-%d',
+    [Tx.InterleavedRtp, Tx.InterleavedRtcp]);
 
   Resp := TRtspResponse.Create;
   try
@@ -830,6 +927,9 @@ begin
     SendInterleaved(Track.Transport.InterleavedRtp, RtpBytes)
   else
   begin
+    // Inerte enquanto o SETUP recusa UDP (461). Fica aqui porque é a metade
+    // pronta do caminho: se o UDP voltar, falta abrir a porta de saída e
+    // responder o server_port de verdade — não isto.
     try
       PeerHost := FContext.Binding.PeerIP;
     except
@@ -930,6 +1030,85 @@ end;
 // O SDP entregue ao cliente descreve os formatos de FHeader. Depois de a câmera
 // reconectar, isto diz se o que ela voltou a publicar ainda cabe naquele SDP.
 // Trilha de áudio que aparece depois não invalida nada para quem só pediu vídeo.
+// Troca o extradata do header pelos parameter sets que o STREAM traz, quando ele
+// os traz. O extradata do `.vms` veio do SDP da câmera, e há câmera cujo SDP
+// mente: a ayla anuncia Baseline/CAVLC e transmite Main/CABAC, com o mesmo
+// sps_id. O nosso player já ignora o SDP quando vê parameter sets in-band, mas
+// VLC, ffplay e o csd-0 do MediaCodec configuram o decodificador pelo que o SDP
+// disser — e configuram errado.
+//
+// Não achando nada in-band (câmera que só manda parameter set no SDP), fica o
+// que estava: melhor um extradata duvidoso que nenhum.
+procedure TTxSession.PreferInbandParameterSets;
+const
+  MAX_SAMPLES = 24;   // ~2 s de vídeo: se não vier nos primeiros, não vem
+var
+  Samples: TArray<TBytes>;
+  Probe: TVmsReader;
+  Block: TVmsBlock;
+  PS, Found: TBytes;
+  I, Count, Idx: Integer;
+  Codec: TVideoCodec;
+begin
+  if not FHeader.VideoPresent then Exit;
+  Codec := FHeader.Video.Codec;
+  if (Codec <> vcH264) and (Codec <> vcH265) then Exit;
+
+  Samples := nil;
+  if FLive <> nil then
+    Samples := FLive.RecentVideoSamples(MAX_SAMPLES)
+  else if FVmsFile <> '' then
+  begin
+    // Leitor próprio, de vida curta: o FReader já está posicionado para tocar, e
+    // mexer nele aqui bagunçaria o começo da reprodução.
+    try
+      Probe := TVmsReader.Create(FVmsFile);
+    except
+      Exit;
+    end;
+    try
+      if not Probe.ReadHeader then Exit;
+      if not Probe.SeekToLastKeyframe then
+        if not Probe.SeekToStart then Exit;
+      Count := 0;
+      SetLength(Samples, MAX_SAMPLES);
+      while (Count < MAX_SAMPLES) and Probe.ReadNextBlock(Block) do
+        for I := 0 to High(Block.Samples) do
+        begin
+          if Block.Samples[I].TrackId <> 0 then Continue;
+          if Count >= MAX_SAMPLES then Break;
+          SetLength(Samples[Count], Block.Samples[I].PayloadSize);
+          if Block.Samples[I].PayloadSize > 0 then
+            Move(Block.Payload[Block.Samples[I].PayloadOffset], Samples[Count][0],
+                 Block.Samples[I].PayloadSize);
+          Inc(Count);
+        end;
+      SetLength(Samples, Count);
+    finally
+      Probe.Free;
+    end;
+  end;
+
+  Found := nil;
+  for Idx := 0 to High(Samples) do
+  begin
+    PS := ParameterSetsOf(Samples[Idx], Codec);
+    if Length(PS) = 0 then Continue;
+    // ACUMULA entre samples: quando a câmera manda cada NAL sozinha, o SPS vem
+    // num sample e o PPS no seguinte — substituir um pelo outro nunca fecharia
+    // o conjunto. Para assim que dá para configurar um decodificador.
+    Found := Found + PS;
+    if ParameterSetsComplete(Found, Codec) then Break;
+  end;
+
+  if (Length(Found) > 0) and ParameterSetsComplete(Found, Codec) then
+  begin
+    Log(llInfo, Format('SDP: parameter sets do stream (%d bytes) no lugar dos do header (%d)',
+      [Length(Found), Length(FHeader.Video.Extradata)]));
+    FHeader.Video.Extradata := Found;
+  end;
+end;
+
 function TTxSession.LiveHeaderMatchesSdp(const H: TVmsHeader): Boolean;
 begin
   Result := False;
@@ -1080,6 +1259,13 @@ begin
       Track.FirstPts := Pts;
       Track.FirstPtsKnown := True;
       Track.AnchorWallMs := FAnchorWallMs;
+      // Âncora A/V do bloco: quando ela existe, a distância real
+      // entre o começo do áudio e o do vídeo é preservada em vez de zerada.
+      // Vale para o caso em que o áudio dita o ritmo (stream sem vídeo); com
+      // vídeo presente ele sai na posição em que foi gravado, e o que carrega a
+      // relação até o cliente é o PTS dentro do RTP.
+      if (Sample.TrackId = 1) and (Block.AudioAnchorMs > 0) and (Block.VideoAnchorMs > 0) then
+        Track.AnchorWallMs := FAnchorWallMs + (Block.AudioAnchorMs - Block.VideoAnchorMs);
     end;
     // Ritmo pelo PTS TAMBÉM ao vivo. Antes o modo live saía sem espera nenhuma,
     // e como o arquivo só cresce quando o gravador FECHA um bloco (2 s), o

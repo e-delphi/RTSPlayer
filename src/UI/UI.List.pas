@@ -179,7 +179,13 @@ begin
     LblU.StyledSettings := LblU.StyledSettings - [TStyledSetting.FontColor, TStyledSetting.Size];
     LblU.TextSettings.FontColor := COLOR_DIM;
     LblU.TextSettings.Font.Size := 12;
-    LblU.Text := FCameras[I].Url + '   ·   ' + TransportsToStr(FCameras[I].Transports);
+    // Com mais de um caminho até a câmera, a URL sozinha mentiria (quem conecta
+    // escolhe na hora): mostra o principal e quantos caminhos existem.
+    if Length(FCameras[I].Endpoints) > 1 then
+      LblU.Text := Format('%s   ·   %d conex'#$F5'es',
+        [FCameras[I].Url, Length(FCameras[I].Endpoints)])
+    else
+      LblU.Text := FCameras[I].Url + '   ·   ' + TransportsToStr(FCameras[I].Transports);
   end;
 end;
 

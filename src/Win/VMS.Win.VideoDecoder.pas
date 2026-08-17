@@ -376,15 +376,21 @@ begin
 
   // Prefixa os parameter sets (Annex-B) no 1o AU e nos keyframes, caso a
   // câmera só os mande no SDP.
+  // O buffer entregue ao FFmpeg tem SEMPRE os AV_INPUT_BUFFER_PADDING_SIZE
+  // bytes zerados no fim que a API exige: os decodificadores leem à frente do
+  // tamanho declarado (é como o bitreader deles evita um teste de limite por
+  // bit). Apontar direto para o TBytes do sample funcionava na prática, mas era
+  // leitura fora do buffer por contrato — lixo no fim do último NAL vira
+  // artefato ou pior. O custo é uma cópia por sample, num caminho que já copia.
   if (Length(FExtradata) > 0) and (not FSawInbandPs) and
      (FNeedPrepend or (sfKeyframe in S.Flags)) then
   begin
     ExtraLen := Length(FExtradata);
-    SetLength(Buf, ExtraLen + Length(S.Data));
+    SetLength(Buf, ExtraLen + Length(S.Data) + AV_INPUT_BUFFER_PADDING_SIZE);
+    FillChar(Buf[ExtraLen + Length(S.Data)], AV_INPUT_BUFFER_PADDING_SIZE, 0);
     Move(FExtradata[0], Buf[0], ExtraLen);
     Move(S.Data[0], Buf[ExtraLen], Length(S.Data));
-    FPkt.data := PByte(@Buf[0]);
-    FPkt.size := Length(Buf);
+    FPkt.size := ExtraLen + Length(S.Data);
     // FNeedPrepend só é desligado quando um quadro sai de fato (ver
     // DrainFrames). Desligar aqui, no 1o sample, deixava o decoder órfão
     // quando o stream não traz IDR marcado: os parameter sets iam junto de um
@@ -392,9 +398,12 @@ begin
   end
   else
   begin
-    FPkt.data := PByte(@S.Data[0]);
+    SetLength(Buf, Length(S.Data) + AV_INPUT_BUFFER_PADDING_SIZE);
+    FillChar(Buf[Length(S.Data)], AV_INPUT_BUFFER_PADDING_SIZE, 0);
+    Move(S.Data[0], Buf[0], Length(S.Data));
     FPkt.size := Length(S.Data);
   end;
+  FPkt.data := PByte(@Buf[0]);
   FPkt.pts := FInPts;
   FPkt.dts := FInPts;
   Inc(FInPts);

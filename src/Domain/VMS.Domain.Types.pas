@@ -65,6 +65,21 @@ type
   TTransportKind = (txTcp, txUdp);
   TTransportList = array of TTransportKind;
 
+  // Um jeito de chegar na MESMA câmera. A mesma câmera costuma ter mais de um:
+  // o IP dela na LAN, o servidor que a republica na rede local, e o mesmo
+  // servidor pela tailnet. Em vez de três câmeras iguais no cadastro, uma
+  // câmera com três endpoints em ordem de prioridade — quem conecta testa qual
+  // responde (ver VMS.Net.Probe).
+  TCameraEndpoint = record
+    Name: string;          // rótulo só para a tela: 'Local', 'Online', 'Direto'
+    Url: string;
+    User: string;
+    Password: string;
+    Transports: TArray<TTransportKind>;
+    UsesTailscale: Boolean;
+  end;
+  TCameraEndpoints = TArray<TCameraEndpoint>;
+
   EVmsError         = class(Exception);
   EVmsConfigError   = class(EVmsError);
   EVmsProtocolError = class(EVmsError);

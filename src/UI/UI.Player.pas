@@ -46,9 +46,16 @@ type
     FLoggedShown: Boolean;
     FTmrHide: TTimer;
     FOnBack: TNotifyEvent;
+    FOnPlayback: TNotifyEvent;
+    // Criado em código, e não no .fmx: um controle a mais no arquivo de forma
+    // exigiria abrir o designer só para isto.
+    FBtnPlayback: TRectangle;
+    FPathPlayback: TPath;
+    procedure CreatePlaybackButton;
     procedure btnBackClick(Sender: TObject);
     procedure btnDebugClick(Sender: TObject);
     procedure btnMuteClick(Sender: TObject);
+    procedure btnPlaybackClick(Sender: TObject);
     procedure imgVideoClick(Sender: TObject);
     procedure tmrHideTimer(Sender: TObject);
     procedure UpdateMuteIcon;
@@ -69,6 +76,8 @@ type
     procedure ClearLog;
     property Muted: Boolean read FMuted write SetMuted;
     property OnBack: TNotifyEvent read FOnBack write FOnBack;
+    // Alterna entre ao vivo e gravação (o shell decide o que fazer).
+    property OnPlayback: TNotifyEvent read FOnPlayback write FOnPlayback;
   end;
 
 implementation
@@ -92,11 +101,43 @@ begin
   btnMute.OnClick := btnMuteClick;
   imgVideo.OnClick := imgVideoClick;
   UpdateMuteIcon;
+  CreatePlaybackButton;
 
   // layTop é overlay sobre o vídeo (não ocupa espaço): precisa ficar por cima do
   // placeholder e do vídeo na ordem-z. O spinner logo abaixo dele.
   laySpinner.BringToFront;
   layTop.BringToFront;
+end;
+
+// Mesmo desenho dos botões do .fmx (retângulo transparente, ícone centralizado,
+// Align=Right), para entrar na barra sem destoar.
+procedure TFramePlayer.CreatePlaybackButton;
+begin
+  FBtnPlayback := TRectangle.Create(Self);
+  FBtnPlayback.Parent := layTop;
+  FBtnPlayback.Align := TAlignLayout.Right;
+  FBtnPlayback.Width := 48;
+  FBtnPlayback.Fill.Kind := TBrushKind.None;
+  FBtnPlayback.Stroke.Kind := TBrushKind.None;
+  FBtnPlayback.HitTest := True;
+  FBtnPlayback.OnClick := btnPlaybackClick;
+
+  FPathPlayback := TPath.Create(Self);
+  FPathPlayback.Parent := FBtnPlayback;
+  FPathPlayback.Align := TAlignLayout.Center;
+  FPathPlayback.Width := 20;
+  FPathPlayback.Height := 20;
+  FPathPlayback.HitTest := False;
+  FPathPlayback.WrapMode := TPathWrapMode.Fit;
+  FPathPlayback.Fill.Color := COLOR_DIM;
+  FPathPlayback.Stroke.Kind := TBrushKind.None;
+  FPathPlayback.Data.Data := ICON_CLOCK;
+end;
+
+procedure TFramePlayer.btnPlaybackClick(Sender: TObject);
+begin
+  ShowControls; // o toque foi na barra: reinicia o auto-ocultar
+  if Assigned(FOnPlayback) then FOnPlayback(Self);
 end;
 
 procedure TFramePlayer.Bind(const Renderer: TMediaRenderer; const Logger: ILogger);

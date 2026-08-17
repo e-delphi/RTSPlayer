@@ -109,7 +109,19 @@ object FrameEditor: TFrameEditor
       Size.Width = 312.000000000000000000
       Size.Height = 32.000000000000000000
       Size.PlatformDefault = False
-      TextPrompt = 'Nome'
+      TextPrompt = 'Nome da c'#226'mera (aparece na lista)'
+    end
+    object layPaths: TLayout
+      Align = Top
+      Margins.Left = 16.000000000000000000
+      Margins.Top = 8.000000000000000000
+      Margins.Right = 16.000000000000000000
+      Position.X = 16.000000000000000000
+      Position.Y = 56.000000000000000000
+      Size.Width = 312.000000000000000000
+      Size.Height = 152.000000000000000000
+      Size.PlatformDefault = False
+      TabOrder = 31
     end
     object lblProto: TLabel
       Align = Top
@@ -124,7 +136,7 @@ object FrameEditor: TFrameEditor
       TextSettings.Font.Size = 13.000000000000000000
       TextSettings.FontColor = xFFB0B0B0
       Text = 'Protocolo'
-      TabOrder = 15
+      TabOrder = 13
     end
     object layProto: TLayout
       Align = Top
@@ -136,7 +148,7 @@ object FrameEditor: TFrameEditor
       Size.Width = 312.000000000000000000
       Size.Height = 40.000000000000000000
       Size.PlatformDefault = False
-      TabOrder = 16
+      TabOrder = 15
       object chipRtsp: TRectangle
         Align = Left
         Fill.Color = xFF2D9CDB
@@ -184,7 +196,7 @@ object FrameEditor: TFrameEditor
     object edHost: TEdit
       Touch.InteractiveGestures = [LongTap, DoubleTap]
       Align = Top
-      TabOrder = 17
+      TabOrder = 16
       KeyboardType = URL
       Position.X = 16.000000000000000000
       Position.Y = 140.000000000000000000
@@ -199,7 +211,7 @@ object FrameEditor: TFrameEditor
     object edPort: TEdit
       Touch.InteractiveGestures = [LongTap, DoubleTap]
       Align = Top
-      TabOrder = 18
+      TabOrder = 17
       KeyboardType = NumberPad
       Position.X = 16.000000000000000000
       Position.Y = 184.000000000000000000
@@ -214,7 +226,7 @@ object FrameEditor: TFrameEditor
     object edPath: TEdit
       Touch.InteractiveGestures = [LongTap, DoubleTap]
       Align = Top
-      TabOrder = 19
+      TabOrder = 18
       KeyboardType = URL
       Position.X = 16.000000000000000000
       Position.Y = 228.000000000000000000
@@ -257,9 +269,13 @@ object FrameEditor: TFrameEditor
       object btnShowPass: TRectangle
         Align = Right
         Fill.Color = xFF2A2A2A
-        Position.X = 240.000000000000000000
+        Margins.Top = 3.000000000000000000
+        Margins.Right = 3.000000000000000000
+        Margins.Bottom = 3.000000000000000000
+        Position.X = 237.000000000000000000
+        Position.Y = 3.000000000000000000
         Size.Width = 72.000000000000000000
-        Size.Height = 32.000000000000000000
+        Size.Height = 26.000000000000000000
         Size.PlatformDefault = False
         Stroke.Kind = None
         XRadius = 6.000000000000000000
@@ -268,7 +284,7 @@ object FrameEditor: TFrameEditor
           Align = Client
           StyledSettings = [Family, Style]
           Size.Width = 72.000000000000000000
-          Size.Height = 32.000000000000000000
+          Size.Height = 26.000000000000000000
           Size.PlatformDefault = False
           TextSettings.FontColor = xFFB0B0B0
           TextSettings.HorzAlign = Center
@@ -490,7 +506,7 @@ object FrameEditor: TFrameEditor
     object edVideoDelay: TEdit
       Touch.InteractiveGestures = [LongTap, DoubleTap]
       Align = Top
-      TabOrder = 12
+      TabOrder = 11
       Position.X = 16.000000000000000000
       Position.Y = 691.000000000000000000
       Margins.Left = 16.000000000000000000
@@ -507,26 +523,35 @@ object FrameEditor: TFrameEditor
       Margins.Left = 16.000000000000000000
       Margins.Top = 16.000000000000000000
       Position.X = 16.000000000000000000
-      Position.Y = 731.000000000000000000
+      Position.Y = 739.000000000000000000
       Size.Width = 328.000000000000000000
       Size.Height = 20.000000000000000000
       Size.PlatformDefault = False
       TextSettings.Font.Size = 13.000000000000000000
       TextSettings.FontColor = xFFB0B0B0
       Text = 'C'#226'mera na rede Tailscale (sobe a VPN antes de conectar)'
-      TabOrder = 13
+      TabOrder = 12
     end
-    object swTailscale: TSwitch
+    object layTailscale: TLayout
       Align = Top
-      IsChecked = False
       Margins.Left = 16.000000000000000000
       Margins.Top = 8.000000000000000000
+      Margins.Right = 16.000000000000000000
       Position.X = 16.000000000000000000
-      Position.Y = 759.000000000000000000
-      Size.Width = 60.000000000000000000
+      Position.Y = 767.000000000000000000
+      Size.Width = 312.000000000000000000
       Size.Height = 30.000000000000000000
       Size.PlatformDefault = False
-      TabOrder = 14
+      TabOrder = 32
+      object swTailscale: TSwitch
+        Align = Left
+        IsChecked = False
+        Position.X = 0.000000000000000000
+        Size.Width = 60.000000000000000000
+        Size.Height = 30.000000000000000000
+        Size.PlatformDefault = False
+        TabOrder = 14
+      end
     end
     object Layout1: TLayout
       Align = Top
