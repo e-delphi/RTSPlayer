@@ -17,6 +17,14 @@ type
   TIndyTcpStream = class(TInterfacedObject, ITcpStream)
   strict private
     FClient: TIdTCPClient;
+    // Buffer de recepção reaproveitado entre chamadas. O Indy escreve nele com
+    // ExtractToBytes(..., AAppend=False), que SÓ CRESCE ("if Length(VBytes) <
+    // AByteCount"), então depois das primeiras leituras não há mais alocação
+    // nenhuma aqui. Um TIdBytes local com SetLength por chamada — que era como
+    // estava — jogava fora exatamente esse reaproveitamento, uma alocação por
+    // pacote recebido. Cada stream é lido por uma thread só (o laço da sessão),
+    // então o campo não precisa de trava.
+    FRecvIdb: TIdBytes;
     procedure EnsureConnected;
   public
     constructor Create;
@@ -128,7 +136,6 @@ end;
 
 function TIndyTcpStream.Recv(var Buffer: TBytes; MaxSize: Integer; TimeoutMs: Cardinal): Integer;
 var
-  Idb: TIdBytes;
   Available, ToRead: Integer;
 begin
   EnsureConnected;
@@ -161,15 +168,16 @@ begin
   ToRead := Available;
   if ToRead > MaxSize then ToRead := MaxSize;
 
-  SetLength(Idb, ToRead);
   try
-    FClient.IOHandler.ReadBytes(Idb, ToRead, False);
+    // Sem SetLength: o próprio Indy cresce FRecvIdb quando precisa, e o que
+    // vale é ToRead, não Length(FRecvIdb) — que pode ser maior.
+    FClient.IOHandler.ReadBytes(FRecvIdb, ToRead, False);
   except
     on E: Exception do
       raise EVmsIoError.Create('TCP read bytes failed: ' + E.Message);
   end;
   if ToRead > 0 then
-    Move(Idb[0], Buffer[0], ToRead);
+    Move(FRecvIdb[0], Buffer[0], ToRead);
   Result := ToRead;
 end;
 
@@ -190,17 +198,14 @@ begin
 end;
 
 function TIndyTcpStream.RecvExact(var Buffer: TBytes; Size: Integer; TimeoutMs: Cardinal): Boolean;
-var
-  Idb: TIdBytes;
 begin
   EnsureConnected;
   if Size <= 0 then Exit(True);
   if Length(Buffer) < Size then
     SetLength(Buffer, Size);
-  SetLength(Idb, Size);
   FClient.IOHandler.ReadTimeout := Integer(TimeoutMs);
   try
-    FClient.IOHandler.ReadBytes(Idb, Size, False);
+    FClient.IOHandler.ReadBytes(FRecvIdb, Size, False);
   except
     on E: EIdReadTimeout do
       raise EVmsTimeoutError.Create('TCP read exact timeout');
@@ -210,7 +215,7 @@ begin
       raise EVmsIoError.Create('TCP read exact failed: ' + E.Message);
   end;
   if Size > 0 then
-    Move(Idb[0], Buffer[0], Size);
+    Move(FRecvIdb[0], Buffer[0], Size);
   Result := True;
 end;
 

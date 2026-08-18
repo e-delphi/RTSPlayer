@@ -21,11 +21,18 @@ const
 type
   TH264Depacketizer = class(TBaseDepacketizer)
   strict private
+    // Remontagem de FU-A: CAPACIDADE no array, tamanho à parte. Um quadro-chave
+    // de 1080p chega em mais de cem fragmentos; crescer o array a cada um deles
+    // fazia o buffer inteiro ser copiado de novo a cada fragmento — custo que
+    // sobe com o quadrado do tamanho do quadro. Aqui ele cresce dobrando, no
+    // máximo umas poucas vezes na vida da sessão, e nunca encolhe.
     FFuBuffer: TBytes;
+    FFuLen: Integer;
     FFuStarted: Boolean;
     FFuNalHeader: Byte;
     FCurrentPts: Int64;
-    procedure EmitNal(const Nal: TBytes; Pts: Int64);
+    procedure EnsureFuCapacity(Need: Integer);
+    procedure EmitNal(const Nal: TBytes; Len: Integer; Pts: Int64);
     procedure HandleSingleNal(const Payload: TBytes; Pts: Int64);
     procedure HandleStapA(const Payload: TBytes; Pts: Int64);
     procedure HandleFuA(const Payload: TBytes; Marker: Boolean; Pts: Int64);
@@ -39,13 +46,19 @@ implementation
 
 const
   ANNEXB_PREFIX: array[0..3] of Byte = ($00, $00, $00, $01);
+  // Capacidade inicial do buffer de remontagem: cobre um quadro-chave típico
+  // sem nenhuma realocação.
+  FU_INITIAL_CAP = 64 * 1024;
 
-function AnnexBWrap(const Nal: TBytes): TBytes;
+// Só os Len primeiros bytes de Nal entram. O array de saída sai do tamanho
+// exato de propósito: ele muda de dono aqui (vai para o sink e daí para o
+// decodificador ou para a gravação).
+function AnnexBWrap(const Nal: TBytes; Len: Integer): TBytes;
 begin
-  if Length(Nal) = 0 then Exit(nil);
-  SetLength(Result, 4 + Length(Nal));
+  if Len <= 0 then Exit(nil);
+  SetLength(Result, 4 + Len);
   Move(ANNEXB_PREFIX[0], Result[0], 4);
-  Move(Nal[0], Result[4], Length(Nal));
+  Move(Nal[0], Result[4], Len);
 end;
 
 { TH264Depacketizer }
@@ -58,7 +71,9 @@ end;
 procedure TH264Depacketizer.Reset;
 begin
   inherited;
-  SetLength(FFuBuffer, 0);
+  // A capacidade fica: reconectar não é motivo para devolver e realocar o
+  // buffer de remontagem.
+  FFuLen := 0;
   FFuStarted := False;
   FFuNalHeader := 0;
   FCurrentPts := 0;
@@ -72,17 +87,17 @@ end;
 // (7 = SPS). Aí o quadro-chave está lá, completo, e o teste de tipo 5 nunca
 // casa: a gravação inteira fica sem um único ponto de entrada marcado. Por
 // isso, quando a unidade começa com parâmetros, olhamos o que vem dentro dela.
-function UnitIsKeyframe(const Nal: TBytes): Boolean;
+function UnitIsKeyframe(const Nal: TBytes; Len: Integer): Boolean;
 var
   I, T: Integer;
 begin
-  if Length(Nal) = 0 then Exit(False);
+  if Len <= 0 then Exit(False);
   T := Nal[0] and H264_NAL_TYPE_MASK;
   if T = H264_NAL_TYPE_IDR then Exit(True);
   // só vale a varredura se a unidade abre com SPS/PPS
   if (T <> H264_NAL_TYPE_SPS) and (T <> H264_NAL_TYPE_PPS) then Exit(False);
   I := 0;
-  while I <= Length(Nal) - 5 do
+  while I <= Len - 5 do
   begin
     if (Nal[I] = 0) and (Nal[I + 1] = 0) then
     begin
@@ -101,22 +116,33 @@ begin
   Result := False;
 end;
 
-procedure TH264Depacketizer.EmitNal(const Nal: TBytes; Pts: Int64);
+procedure TH264Depacketizer.EnsureFuCapacity(Need: Integer);
+var
+  NewCap: Integer;
+begin
+  if Need <= Length(FFuBuffer) then Exit;
+  NewCap := Length(FFuBuffer);
+  if NewCap < FU_INITIAL_CAP then NewCap := FU_INITIAL_CAP;
+  while NewCap < Need do NewCap := NewCap * 2;
+  SetLength(FFuBuffer, NewCap);
+end;
+
+procedure TH264Depacketizer.EmitNal(const Nal: TBytes; Len: Integer; Pts: Int64);
 var
   Flags: TSampleFlags;
   Data: TBytes;
 begin
-  if Length(Nal) = 0 then Exit;
+  if Len <= 0 then Exit;
   Flags := [];
-  if UnitIsKeyframe(Nal) then
+  if UnitIsKeyframe(Nal, Len) then
     Include(Flags, sfKeyframe);
-  Data := AnnexBWrap(Nal);
+  Data := AnnexBWrap(Nal, Len);
   Emit(tkVideo, Pts, Flags, Data);
 end;
 
 procedure TH264Depacketizer.HandleSingleNal(const Payload: TBytes; Pts: Int64);
 begin
-  EmitNal(Payload, Pts);
+  EmitNal(Payload, Length(Payload), Pts);
 end;
 
 procedure TH264Depacketizer.HandleStapA(const Payload: TBytes; Pts: Int64);
@@ -135,7 +161,7 @@ begin
     SetLength(Nal, NalLen);
     Move(Payload[Offset], Nal[0], NalLen);
     Inc(Offset, NalLen);
-    EmitNal(Nal, Pts);
+    EmitNal(Nal, NalLen, Pts);
   end;
 end;
 
@@ -143,7 +169,7 @@ procedure TH264Depacketizer.HandleFuA(const Payload: TBytes; Marker: Boolean; Pt
 var
   FuIndicator, FuHeader: Byte;
   IsStart, IsEnd: Boolean;
-  StartIdx: Integer;
+  StartIdx, Frag: Integer;
 begin
   if Length(Payload) < 2 then Exit;
   FuIndicator := Payload[0];
@@ -154,20 +180,25 @@ begin
   begin
     FFuStarted := True;
     FFuNalHeader := (FuIndicator and $E0) or (FuHeader and $1F);
-    SetLength(FFuBuffer, 1);
+    EnsureFuCapacity(1);
     FFuBuffer[0] := FFuNalHeader;
+    FFuLen := 1;
     FCurrentPts := Pts;
   end;
   if not FFuStarted then Exit;
-  StartIdx := Length(FFuBuffer);
-  SetLength(FFuBuffer, StartIdx + Length(Payload) - 2);
-  if Length(Payload) - 2 > 0 then
-    Move(Payload[2], FFuBuffer[StartIdx], Length(Payload) - 2);
+  StartIdx := FFuLen;
+  Frag := Length(Payload) - 2;
+  if Frag > 0 then
+  begin
+    EnsureFuCapacity(StartIdx + Frag);
+    Move(Payload[2], FFuBuffer[StartIdx], Frag);
+    Inc(FFuLen, Frag);
+  end;
   if IsEnd or Marker then
   begin
-    if Length(FFuBuffer) > 0 then
-      EmitNal(FFuBuffer, FCurrentPts);
-    SetLength(FFuBuffer, 0);
+    if FFuLen > 0 then
+      EmitNal(FFuBuffer, FFuLen, FCurrentPts);
+    FFuLen := 0;
     FFuStarted := False;
   end;
 end;

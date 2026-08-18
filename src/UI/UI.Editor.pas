@@ -30,7 +30,7 @@ type
     lblSave: TLabel;
     lblEditTitle: TLabel;
     btnDelete: TRectangle;
-    lblDelete: TLabel;
+    pathDelete: TPath;
     sbEditor: TVertScrollBox;
     edName: TEdit;
     lblProto: TLabel;
@@ -110,7 +110,10 @@ type
     procedure LoadEndpoint(Index: Integer);
     procedure EndpointTabClick(Sender: TObject; Index: Integer);
     procedure EndpointAddClick(Sender: TObject);
-    procedure EndpointRemoveClick(Sender: TObject);
+    procedure EndpointRemoveClick(Sender: TObject; Index: Integer);
+    procedure EndpointMoveUp(Sender: TObject; Index: Integer);
+    procedure EndpointMoveDown(Sender: TObject; Index: Integer);
+    procedure SwapEndpoints(A, B: Integer);
     procedure EndpointNameChange(Sender: TObject);
     function SuggestEndpointName(const Host: string): string;
     procedure AdjustForFocused(Ctrl: TControl);
@@ -136,8 +139,8 @@ begin
 
   // Envolve o scrollbox num container próprio (FLayBody). Assim eu subo só os
   // campos animando o Padding.Top DESSE container, mantendo a barEdit (topo) fixa.
-  // FLayBody vai pra trás pra barEdit/btnDelete ficarem por cima (a barEdit é
-  // opaca e cobre os campos que passam por baixo dela).
+  // FLayBody vai pra trás pra barEdit ficar por cima (ela é opaca e cobre os
+  // campos que passam por baixo dela).
   FLayBody := TLayout.Create(Self);
   FLayBody.Parent := Self;
   FLayBody.Align := TAlignLayout.Client;
@@ -169,6 +172,8 @@ begin
   btnCancel.OnClick := btnCancelClick;
   btnSave.OnClick := btnSaveClick;
   btnDelete.OnClick := btnDeleteClick;
+  // Ícone vetorial: emoji de lixeira não existe em toda fonte de sistema.
+  pathDelete.Data.Data := ICON_TRASH;
   btnShowPass.OnClick := btnShowPassClick;
   btnTestConn.OnClick := btnTestConnClick;
 
@@ -379,13 +384,14 @@ begin
   FPaths := TFrameCameraPaths.Create(Self);
   FPaths.Parent := layPaths;
   FPaths.Align := TAlignLayout.Client;
-  layPaths.Height := PATHS_BAR_HEIGHT;
   // O campo de nome do caminho é do frame, mas o fundo escuro e o
   // reposicionamento com o teclado aberto são regra desta tela.
   SetupEdit(FPaths.NameEdit);
   FPaths.OnSelect := EndpointTabClick;
   FPaths.OnAdd := EndpointAddClick;
   FPaths.OnRemove := EndpointRemoveClick;
+  FPaths.OnMoveUp := EndpointMoveUp;
+  FPaths.OnMoveDown := EndpointMoveDown;
   FPaths.OnRename := EndpointNameChange;
 end;
 
@@ -393,14 +399,21 @@ end;
 // trocar de aba parece não ter feito nada.
 procedure TFrameEditor.RefreshPaths;
 var
-  Names: TArray<string>;
+  Names, Addrs: TArray<string>;
   I: Integer;
 begin
   if FPaths = nil then Exit;
   SetLength(Names, Length(FEndpoints));
+  SetLength(Addrs, Length(FEndpoints));
   for I := 0 to High(FEndpoints) do
+  begin
     Names[I] := FEndpoints[I].Name;
-  FPaths.ShowPaths(Names, FEpIndex);
+    Addrs[I] := FEndpoints[I].Url;
+  end;
+  FPaths.ShowPaths(Names, Addrs, FEpIndex);
+  // A lista é vertical: a altura depende de quantos caminhos existem, e é o
+  // hospedeiro no scroll que precisa acompanhar.
+  layPaths.Height := FPaths.ContentHeight;
 
   if lblProto <> nil then
     if Length(FEndpoints) > 1 then
@@ -476,17 +489,53 @@ begin
   LoadEndpoint(High(FEndpoints));
 end;
 
-procedure TFrameEditor.EndpointRemoveClick(Sender: TObject);
+procedure TFrameEditor.EndpointRemoveClick(Sender: TObject; Index: Integer);
 var
   I: Integer;
 begin
   // Uma câmera sem caminho nenhum não existe: o último não se apaga.
   if Length(FEndpoints) <= 1 then Exit;
-  for I := FEpIndex to High(FEndpoints) - 1 do
+  if (Index < 0) or (Index > High(FEndpoints)) then Exit;
+  // O que está na tela é o caminho selecionado; se ele não é o que vai sumir,
+  // o que está nos campos precisa ser guardado antes.
+  if Index <> FEpIndex then
+    CommitEndpoint;
+  for I := Index to High(FEndpoints) - 1 do
     FEndpoints[I] := FEndpoints[I + 1];
   SetLength(FEndpoints, Length(FEndpoints) - 1);
+  if FEpIndex > Index then
+    Dec(FEpIndex);
   if FEpIndex > High(FEndpoints) then FEpIndex := High(FEndpoints);
+  if FEpIndex < 0 then FEpIndex := 0;
   LoadEndpoint(FEpIndex);
+end;
+
+// Subir/descer mudam a ORDEM DE TENTATIVA da conexão (ver VMS.Net.Probe): o
+// caminho 1 é o preferido, e o app só passa para o seguinte quando ele não
+// responde. A seleção acompanha o caminho que se moveu, para o usuário não
+// perder de vista o que estava editando.
+procedure TFrameEditor.SwapEndpoints(A, B: Integer);
+var
+  Tmp: TCameraEndpoint;
+begin
+  if (A < 0) or (B < 0) or (A > High(FEndpoints)) or (B > High(FEndpoints)) then Exit;
+  CommitEndpoint;
+  Tmp := FEndpoints[A];
+  FEndpoints[A] := FEndpoints[B];
+  FEndpoints[B] := Tmp;
+  if FEpIndex = A then FEpIndex := B
+  else if FEpIndex = B then FEpIndex := A;
+  LoadEndpoint(FEpIndex);
+end;
+
+procedure TFrameEditor.EndpointMoveUp(Sender: TObject; Index: Integer);
+begin
+  if Index > 0 then SwapEndpoints(Index, Index - 1);
+end;
+
+procedure TFrameEditor.EndpointMoveDown(Sender: TObject; Index: Integer);
+begin
+  if Index < High(FEndpoints) then SwapEndpoints(Index, Index + 1);
 end;
 
 procedure TFrameEditor.EndpointNameChange(Sender: TObject);
@@ -494,7 +543,8 @@ begin
   if (FEpIndex < 0) or (FEpIndex > High(FEndpoints)) then Exit;
   if FPaths.CurrentName = '' then Exit;
   FEndpoints[FEpIndex].Name := FPaths.CurrentName;
-  RefreshPaths;
+  // Só o rótulo da linha selecionada: isto roda a cada tecla digitada.
+  FPaths.RenameSelected(FPaths.CurrentName);
 end;
 
 procedure TFrameEditor.btnSaveClick(Sender: TObject);
@@ -529,8 +579,12 @@ begin
   if Assigned(FOnCancel) then FOnCancel(Self);
 end;
 
+// Só reporta a intenção. Quem pergunta "tem certeza?" é o shell, no único ponto
+// que remove de verdade (ConfirmRemoveCamera em Inicio) — a lixeira da lista de
+// câmeras chega lá pelo mesmo caminho.
 procedure TFrameEditor.btnDeleteClick(Sender: TObject);
 begin
+  if FEditIndex < 0 then Exit;
   if Assigned(FOnDelete) then FOnDelete(Self, FEditIndex);
 end;
 

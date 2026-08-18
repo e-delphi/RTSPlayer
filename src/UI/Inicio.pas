@@ -25,7 +25,7 @@ uses
   System.SysUtils, System.Types, System.UITypes, System.Classes, System.IOUtils,
   System.JSON, System.DateUtils, System.Generics.Collections,
   FMX.Types, FMX.Controls, FMX.Forms, FMX.Graphics, FMX.Objects, FMX.Layouts,
-  FMX.Platform, FMX.VirtualKeyboard,
+  FMX.Platform, FMX.VirtualKeyboard, FMX.DialogService,
   VMS.Domain.Types,
   VMS.Domain.Logging,
   VMS.Domain.Clock,
@@ -120,6 +120,7 @@ type
     procedure ListAdd(Sender: TObject);
     procedure ListPlay(Sender: TObject; Index: Integer);
     procedure ListEdit(Sender: TObject; Index: Integer);
+    procedure ConfirmRemoveCamera(Index: Integer; AfterRemove: TProc);
     procedure ListDelete(Sender: TObject; Index: Integer);
     procedure EditorSave(Sender: TObject; const Entry: TCameraConfigEntry; EditIndex: Integer);
     procedure EditorCancel(Sender: TObject);
@@ -505,16 +506,28 @@ begin
   LoadDaysAsync(Index);
 end;
 
-// Primeiro caminho da câmera que tenha um vmsserver atrás E responda. Função
-// pura de propósito: roda na thread de rede, sem tocar em nada da tela.
-function PickApiEndpoint(const Cam: TCameraConfigEntry;
-  out Base, ServerCam: string): Boolean;
+type
+  // Um caminho da câmera que pode ter gravação atrás dele.
+  TApiCandidate = record
+    Url: string;     // endereço RTSP de onde saiu (para o teste rápido de porta)
+    Base: string;    // http://host:porta da API
+    Cam: string;     // nome da câmera na rota /live/<nome>
+    Quick: Boolean;  // respondeu ao teste rápido
+  end;
+
+// Quais caminhos desta câmera podem ter gravação, na ordem do cadastro.
+//
+// O histórico não vem da câmera: vem do vmsserver que a grava. Então, mesmo
+// conectado DIRETO na câmera, é nos outros caminhos que se procura — o que
+// denuncia um servidor é a rota /live/<nome>. Ligação direta (dvrip://, ou
+// rtsp://ip:554/onvif1) não vira candidato.
+function CollectApiCandidates(const Cam: TCameraConfigEntry): TArray<TApiCandidate>;
 var
   Eps: TCameraEndpoints;
-  I: Integer;
+  I, N: Integer;
+  C: TApiCandidate;
 begin
-  Base := '';
-  ServerCam := '';
+  Result := nil;
   Eps := Cam.Endpoints;
   if Length(Eps) = 0 then
   begin
@@ -522,17 +535,19 @@ begin
     SetLength(Eps, 1);
     Eps[0].Url := Cam.Url;
   end;
+  SetLength(Result, Length(Eps));
+  N := 0;
   for I := 0 to High(Eps) do
   begin
-    Base := ApiBaseFromCameraUrl(Eps[I].Url);
-    ServerCam := CameraNameFromCameraUrl(Eps[I].Url);
-    // rota /live/ é o que denuncia um vmsserver; ligação direta na câmera não tem
-    if (Base = '') or (ServerCam = '') then Continue;
-    if UrlReachable(Eps[I].Url) then Exit(True);
+    C.Url := Eps[I].Url;
+    C.Base := ApiBaseFromCameraUrl(C.Url);
+    C.Cam := CameraNameFromCameraUrl(C.Url);
+    C.Quick := False;
+    if (C.Base = '') or (C.Cam = '') then Continue;
+    Result[N] := C;
+    Inc(N);
   end;
-  Base := '';
-  ServerCam := '';
-  Result := False;
+  SetLength(Result, N);
 end;
 
 // A API bloqueia: consultar na thread da UI congelaria a tela por segundos numa
@@ -556,17 +571,44 @@ begin
     var
       Days: TArray<TApiDay>;
       Base, ServerCam, Err: string;
-      Ok: Boolean;
+      Cands: TArray<TApiCandidate>;
+      I, Pass: Integer;
+      Ok, NoServerPath: Boolean;
     begin
-      Ok := PickApiEndpoint(Cam, Base, ServerCam);
-      if Ok then
+      Base := '';
+      ServerCam := '';
+      Err := '';
+      Ok := False;
+      Cands := CollectApiCandidates(Cam);
+      NoServerPath := Length(Cands) = 0;
+      // Teste rápido de porta só para ORDENAR: quem responde na hora vai antes.
+      // Ele não elimina ninguém — no 4G, com a tailnet acordando, 700 ms recusam
+      // um servidor que está de pé, e aí a resposta seria "não há gravação"
+      // quando há.
+      for I := 0 to High(Cands) do
+        Cands[I].Quick := UrlReachable(Cands[I].Url);
+      for Pass := 0 to 1 do
       begin
-        Api.BaseUrl := Base;
-        Ok := Api.GetDays(ServerCam, Days);
-        Err := Api.LastError;
-      end
-      else
-        Err := '';
+        if Ok then Break;
+        for I := 0 to High(Cands) do
+        begin
+          if Cands[I].Quick <> (Pass = 0) then Continue;
+          Api.BaseUrl := Cands[I].Base;
+          if Api.GetDays(Cands[I].Cam, Days) then
+          begin
+            Base := Cands[I].Base;
+            ServerCam := Cands[I].Cam;
+            Ok := True;
+            Break;
+          end;
+          // Um relato por candidato. Guardar só o último enganava: com o
+          // servidor em primeiro e a tailnet em terceiro, a tela mostrava o
+          // timeout da tailnet e escondia o que houve com o servidor, que é o
+          // caminho que interessa.
+          if Err <> '' then Err := Err + #13#10;
+          Err := Err + Format('%s: %s', [Cands[I].Base, Api.LastError]);
+        end;
+      end;
       TThread.Queue(nil,
         procedure
         begin
@@ -577,9 +619,11 @@ begin
             FPlaybackBase := Base;
             FFrameDays.SetDays(Days);
           end
-          else if Base = '' then
-            FFrameDays.SetError('Nenhum caminho desta c'#$E2'mera passa por um'#13#10 +
-              'vmsserver que esteja respondendo agora.')
+          else if NoServerPath then
+            // Nada a tentar de novo: nenhum caminho cadastrado aponta para um
+            // servidor. Conexão direta na câmera não guarda histórico.
+            FFrameDays.SetError('Esta c'#$E2'mera n'#$E3'o passa por um vmsserver.'#13#10 +
+              'Nenhum caminho dela aponta para uma rota /live/.')
           else
             FFrameDays.SetError('N'#$E3'o consegui falar com o servidor.'#13#10 + Err);
         end);
@@ -677,6 +721,7 @@ end;
 procedure TForm1.StartPlayback(Index: Integer; FromMs: Int64);
 var
   Base, ServerCam: string;
+  Cands: TArray<TApiCandidate>;
 begin
   if (Index < 0) or (Index > High(FCameras)) then Exit;
   // O caminho já foi escolhido (e testado) pela tela de dias; só se veio de
@@ -687,8 +732,14 @@ begin
   ServerCam := FPlaybackCam;
   if (Base = '') or (ServerCam = '') then
   begin
-    Base := ApiBaseFromCameraUrl(FCameras[Index].Url);
-    ServerCam := CameraNameFromCameraUrl(FCameras[Index].Url);
+    // Primeiro caminho que pareça servidor — e não o espelho do caminho 1, que
+    // muda de dono quando o usuário reordena os caminhos.
+    Cands := CollectApiCandidates(FCameras[Index]);
+    if Length(Cands) > 0 then
+    begin
+      Base := Cands[0].Base;
+      ServerCam := Cands[0].Cam;
+    end;
   end;
   if (Base = '') or (ServerCam = '') then
   begin
@@ -881,12 +932,42 @@ begin
   ShowEditor(Index);
 end;
 
+// Apagar câmera é a única ação sem volta do app, e chega por dois caminhos (a
+// lixeira da lista e o botão da tela de cadastro). A pergunta mora aqui, no
+// único ponto que de fato remove: uma confirmação por caminho acabaria virando
+// duas em cima da outra, ou nenhuma no caminho que alguém esquecesse.
+//
+// O MessageDialog assíncrono é o que funciona no Android — lá o diálogo não
+// bloqueia, e a resposta chega pelo callback, na thread da UI.
+procedure TForm1.ConfirmRemoveCamera(Index: Integer; AfterRemove: TProc);
+var
+  Nome, Msg: string;
+begin
+  if (Index < 0) or (Index > High(FCameras)) then Exit;
+  Nome := Trim(FCameras[Index].Name);
+  if Nome = '' then Nome := 'esta c'#$E2'mera';
+  Msg := Format('Excluir "%s"?' + sLineBreak + sLineBreak +
+    'Sai da lista deste aparelho, com todos os caminhos cadastrados.' +
+    ' As grava'#$E7#$F5'es no servidor n'#$E3'o s'#$E3'o apagadas.', [Nome]);
+  TDialogService.MessageDialog(Msg, TMsgDlgType.mtConfirmation,
+    [TMsgDlgBtn.mbYes, TMsgDlgBtn.mbNo], TMsgDlgBtn.mbNo, 0,
+    procedure(const AResult: TModalResult)
+    begin
+      if AResult <> mrYes then Exit;
+      if FCurrentIndex = Index then
+        StopPlay;
+      RemoveCamera(Index);
+      if Assigned(AfterRemove) then AfterRemove();
+    end);
+end;
+
 procedure TForm1.ListDelete(Sender: TObject; Index: Integer);
 begin
-  if FCurrentIndex = Index then
-    StopPlay;
-  RemoveCamera(Index);
-  FFrameList.SetCameras(FCameras);
+  ConfirmRemoveCamera(Index,
+    procedure
+    begin
+      FFrameList.SetCameras(FCameras);
+    end);
 end;
 
 procedure TForm1.EditorSave(Sender: TObject; const Entry: TCameraConfigEntry; EditIndex: Integer);
@@ -926,11 +1007,11 @@ end;
 
 procedure TForm1.EditorDelete(Sender: TObject; Index: Integer);
 begin
-  if (Index < 0) or (Index > High(FCameras)) then Exit;
-  if FCurrentIndex = Index then
-    StopPlay;
-  RemoveCamera(Index);
-  ShowList;
+  ConfirmRemoveCamera(Index,
+    procedure
+    begin
+      ShowList;
+    end);
 end;
 
 procedure TForm1.PlayerBack(Sender: TObject);
@@ -1029,18 +1110,26 @@ begin
     TApplicationEvent.EnteredBackground,
     TApplicationEvent.WillBecomeInactive:
       begin
+        // OS DOIS eventos chegam ao sair do app, nesta ordem: WillBecomeInactive
+        // e depois EnteredBackground. Por isso nada aqui pode ZERAR o que o
+        // evento anterior guardou — a primeira passagem para o que estava
+        // tocando, e a segunda encontraria tudo parado e apagaria a intenção de
+        // retomar. Era o que fazia a câmera não voltar sozinha depois de passar
+        // pelo app do Tailscale: o app parava e, na volta, não tentava de novo.
+        //
         // Gravação também solta o decodificador ao sair: sem isto ela continuava
         // decodificando em segundo plano e, na volta, o ao vivo entrava POR CIMA
         // dela — duas fontes no mesmo decodificador.
-        FResumePlaybackMs := 0;
         if FPlaybackOn and (FPlayback <> nil) then
         begin
           FResumePlaybackMs := FPlayback.PositionMs;
           StopPlayback;
         end;
-        FWasPlaying := FPlaying;
         if FPlaying then
+        begin
+          FWasPlaying := True;
           StopPlay;
+        end;
       end;
     TApplicationEvent.BecameActive:
       begin

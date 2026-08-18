@@ -248,7 +248,9 @@ begin
       on E: Exception do
       begin
         FLastError := E.Message;
-        Log(llWarn, Format('%s: %s', [PathAndQuery, E.Message]));
+        // URL inteira, não só o caminho: uma câmera tem vários caminhos até o
+        // servidor, e "/api/days: timeout" não diz QUAL deles falhou.
+        Log(llWarn, Format('%s: %s', [Url, E.Message]));
         Exit;
       end;
     end;
@@ -259,7 +261,7 @@ begin
       // o número, e "404" não conta qual câmera o servidor não conhece.
       FLastError := Format('HTTP %d %s', [Resp.StatusCode,
         TEncoding.UTF8.GetString(Copy(Stream.Bytes, 0, Integer(Stream.Size)))]);
-      Log(llWarn, Format('%s: %s', [PathAndQuery, FLastError]));
+      Log(llWarn, Format('%s: %s', [Url, FLastError]));
       Exit;
     end;
     // Stream.Bytes pode ter capacidade a mais que o conteúdo: corta no tamanho.

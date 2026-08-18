@@ -29,6 +29,11 @@ type
     FBuffer: TBytes;
     FBufStart: Integer;
     FBufEnd: Integer;
+    // Área de recepção reaproveitada. O Recv só exige que ela caiba o pedido
+    // (ele mesmo cresce se faltar), então declarar isto como local — como
+    // estava — era uma alocação de dezenas de KB por leitura de socket, no laço
+    // mais quente do cliente.
+    FRecv: TBytes;
     procedure Compact;
     function EnsureBytes(N: Integer; TimeoutMs: Cardinal): Boolean;
     function ReadOne(TimeoutMs: Cardinal): Boolean;
@@ -72,7 +77,6 @@ end;
 
 function TRtspWireReader.ReadOne(TimeoutMs: Cardinal): Boolean;
 var
-  Tmp: TBytes;
   N, Free: Integer;
 begin
   if FBufEnd >= Length(FBuffer) then
@@ -82,10 +86,11 @@ begin
       SetLength(FBuffer, Length(FBuffer) * 2);
   end;
   Free := Length(FBuffer) - FBufEnd;
-  SetLength(Tmp, Free);
-  N := FStream.Recv(Tmp, Free, TimeoutMs);
+  if Length(FRecv) < Free then
+    SetLength(FRecv, Free);   // cresce no máximo junto com FBuffer, e não encolhe
+  N := FStream.Recv(FRecv, Free, TimeoutMs);
   if N <= 0 then Exit(False);
-  Move(Tmp[0], FBuffer[FBufEnd], N);
+  Move(FRecv[0], FBuffer[FBufEnd], N);
   Inc(FBufEnd, N);
   Result := True;
 end;

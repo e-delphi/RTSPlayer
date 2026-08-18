@@ -22,12 +22,17 @@ const
 type
   TH265Depacketizer = class(TBaseDepacketizer)
   strict private
+    // Remontagem de FU: CAPACIDADE no array, tamanho à parte — ver o comentário
+    // gêmeo em VMS.Depk.H264. Crescer o array a cada fragmento copiava o buffer
+    // inteiro de novo a cada fragmento do quadro-chave.
     FFuBuffer: TBytes;
+    FFuLen: Integer;
     FFuStarted: Boolean;
     FFuOriginalHeader0: Byte;
     FFuOriginalHeader1: Byte;
     FCurrentPts: Int64;
-    procedure EmitNal(const Nal: TBytes; Pts: Int64);
+    procedure EnsureFuCapacity(Need: Integer);
+    procedure EmitNal(const Nal: TBytes; Len: Integer; Pts: Int64);
     procedure HandleSingleNal(const Payload: TBytes; Pts: Int64);
     procedure HandleAp(const Payload: TBytes; Pts: Int64);
     procedure HandleFu(const Payload: TBytes; Marker: Boolean; Pts: Int64);
@@ -42,13 +47,16 @@ implementation
 
 const
   ANNEXB_PREFIX: array[0..3] of Byte = ($00, $00, $00, $01);
+  FU_INITIAL_CAP = 64 * 1024;
 
-function AnnexBWrap(const Nal: TBytes): TBytes;
+// Só os Len primeiros bytes entram. A saída sai do tamanho exato: ela muda de
+// dono aqui (vai para o sink, e daí para o decodificador ou a gravação).
+function AnnexBWrap(const Nal: TBytes; Len: Integer): TBytes;
 begin
-  if Length(Nal) = 0 then Exit(nil);
-  SetLength(Result, 4 + Length(Nal));
+  if Len <= 0 then Exit(nil);
+  SetLength(Result, 4 + Len);
   Move(ANNEXB_PREFIX[0], Result[0], 4);
-  Move(Nal[0], Result[4], Length(Nal));
+  Move(Nal[0], Result[4], Len);
 end;
 
 { TH265Depacketizer }
@@ -61,7 +69,8 @@ end;
 procedure TH265Depacketizer.Reset;
 begin
   inherited;
-  SetLength(FFuBuffer, 0);
+  // A capacidade fica; reconectar não devolve o buffer.
+  FFuLen := 0;
   FFuStarted := False;
   FFuOriginalHeader0 := 0;
   FFuOriginalHeader1 := 0;
@@ -73,24 +82,35 @@ begin
   Result := (NalType >= H265_NAL_TYPE_BLA_W_LP) and (NalType <= H265_NAL_TYPE_CRA_NUT);
 end;
 
-procedure TH265Depacketizer.EmitNal(const Nal: TBytes; Pts: Int64);
+procedure TH265Depacketizer.EnsureFuCapacity(Need: Integer);
+var
+  NewCap: Integer;
+begin
+  if Need <= Length(FFuBuffer) then Exit;
+  NewCap := Length(FFuBuffer);
+  if NewCap < FU_INITIAL_CAP then NewCap := FU_INITIAL_CAP;
+  while NewCap < Need do NewCap := NewCap * 2;
+  SetLength(FFuBuffer, NewCap);
+end;
+
+procedure TH265Depacketizer.EmitNal(const Nal: TBytes; Len: Integer; Pts: Int64);
 var
   NalType: Byte;
   Flags: TSampleFlags;
   Data: TBytes;
 begin
-  if Length(Nal) < 2 then Exit;
+  if Len < 2 then Exit;
   NalType := (Nal[0] shr 1) and $3F;
   Flags := [];
   if NalIsKeyframe(NalType) then
     Include(Flags, sfKeyframe);
-  Data := AnnexBWrap(Nal);
+  Data := AnnexBWrap(Nal, Len);
   Emit(tkVideo, Pts, Flags, Data);
 end;
 
 procedure TH265Depacketizer.HandleSingleNal(const Payload: TBytes; Pts: Int64);
 begin
-  EmitNal(Payload, Pts);
+  EmitNal(Payload, Length(Payload), Pts);
 end;
 
 procedure TH265Depacketizer.HandleAp(const Payload: TBytes; Pts: Int64);
@@ -109,7 +129,7 @@ begin
     SetLength(Nal, NalLen);
     Move(Payload[Offset], Nal[0], NalLen);
     Inc(Offset, NalLen);
-    EmitNal(Nal, Pts);
+    EmitNal(Nal, NalLen, Pts);
   end;
 end;
 
@@ -118,7 +138,7 @@ var
   PayloadHdr0, PayloadHdr1, FuHeader: Byte;
   IsStart, IsEnd: Boolean;
   FuType: Byte;
-  StartIdx: Integer;
+  StartIdx, Frag: Integer;
 begin
   if Length(Payload) < 3 then Exit;
   PayloadHdr0 := Payload[0];
@@ -132,21 +152,26 @@ begin
     FFuStarted := True;
     FFuOriginalHeader0 := (PayloadHdr0 and $81) or (FuType shl 1);
     FFuOriginalHeader1 := PayloadHdr1;
-    SetLength(FFuBuffer, 2);
+    EnsureFuCapacity(2);
     FFuBuffer[0] := FFuOriginalHeader0;
     FFuBuffer[1] := FFuOriginalHeader1;
+    FFuLen := 2;
     FCurrentPts := Pts;
   end;
   if not FFuStarted then Exit;
-  StartIdx := Length(FFuBuffer);
-  SetLength(FFuBuffer, StartIdx + Length(Payload) - 3);
-  if Length(Payload) - 3 > 0 then
-    Move(Payload[3], FFuBuffer[StartIdx], Length(Payload) - 3);
+  StartIdx := FFuLen;
+  Frag := Length(Payload) - 3;
+  if Frag > 0 then
+  begin
+    EnsureFuCapacity(StartIdx + Frag);
+    Move(Payload[3], FFuBuffer[StartIdx], Frag);
+    Inc(FFuLen, Frag);
+  end;
   if IsEnd or Marker then
   begin
-    if Length(FFuBuffer) > 0 then
-      EmitNal(FFuBuffer, FCurrentPts);
-    SetLength(FFuBuffer, 0);
+    if FFuLen > 0 then
+      EmitNal(FFuBuffer, FFuLen, FCurrentPts);
+    FFuLen := 0;
     FFuStarted := False;
   end;
 end;

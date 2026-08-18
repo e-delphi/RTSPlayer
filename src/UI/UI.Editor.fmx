@@ -52,6 +52,31 @@ object FrameEditor: TFrameEditor
         Text = 'Salvar'
       end
     end
+    object btnDelete: TRectangle
+      Align = Right
+      Fill.Kind = None
+      Margins.Top = 12.000000000000000000
+      Margins.Right = 4.000000000000000000
+      Margins.Bottom = 12.000000000000000000
+      Position.X = 216.000000000000000000
+      Position.Y = 12.000000000000000000
+      Size.Width = 40.000000000000000000
+      Size.Height = 32.000000000000000000
+      Size.PlatformDefault = False
+      Stroke.Kind = None
+      XRadius = 8.000000000000000000
+      YRadius = 8.000000000000000000
+      object pathDelete: TPath
+        Align = Center
+        Fill.Color = xFFE74C3C
+        HitTest = False
+        Size.Width = 22.000000000000000000
+        Size.Height = 22.000000000000000000
+        Size.PlatformDefault = False
+        Stroke.Kind = None
+        WrapMode = Fit
+      end
+    end
     object lblEditTitle: TLabel
       Align = Client
       StyledSettings = [Family, Style]
@@ -61,31 +86,6 @@ object FrameEditor: TFrameEditor
       TextSettings.FontColor = claWhite
       TextSettings.HorzAlign = Center
       Text = 'C'#226'mera'
-    end
-  end
-  object btnDelete: TRectangle
-    Align = Bottom
-    Fill.Color = xFFE74C3C
-    Margins.Left = 16.000000000000000000
-    Margins.Right = 16.000000000000000000
-    Margins.Bottom = 10.000000000000000000
-    Position.X = 16.000000000000000000
-    Position.Y = 582.000000000000000000
-    Size.Width = 328.000000000000000000
-    Size.Height = 48.000000000000000000
-    Size.PlatformDefault = False
-    Stroke.Kind = None
-    XRadius = 8.000000000000000000
-    YRadius = 8.000000000000000000
-    object lblDelete: TLabel
-      Align = Client
-      StyledSettings = [Family, Style]
-      Size.Width = 328.000000000000000000
-      Size.Height = 48.000000000000000000
-      Size.PlatformDefault = False
-      TextSettings.FontColor = claWhite
-      TextSettings.HorzAlign = Center
-      Text = 'Excluir c'#226'mera'
     end
   end
   object sbEditor: TVertScrollBox
@@ -119,7 +119,7 @@ object FrameEditor: TFrameEditor
       Position.X = 16.000000000000000000
       Position.Y = 56.000000000000000000
       Size.Width = 312.000000000000000000
-      Size.Height = 152.000000000000000000
+      Size.Height = 218.000000000000000000
       Size.PlatformDefault = False
       TabOrder = 31
     end

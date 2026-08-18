@@ -90,6 +90,7 @@ uses
 const
   TAG = 'tailscale';
   TAILSCALE_PACKAGE = 'com.tailscale.ipn';
+  VPN_STATE_NAME: array[TVpnState] of string = ('desconhecida', 'de pe', 'caida');
 
 var
   // Última abertura do app, para respeitar o cooldown. Compartilhado entre
@@ -376,8 +377,14 @@ begin
   end;
 
   // 3) Não alcança e a VPN não está de pé (ou não dá para saber): pede o túnel.
+  //
+  // O estado vai no log de propósito: "desconhecido" aqui quer dizer que o
+  // ConnectivityManager não respondeu — o caso clássico é faltar a permissão
+  // ACCESS_NETWORK_STATE no manifesto, e o sintoma é o app do Tailscale abrir
+  // com o túnel já de pé.
   if Logger <> nil then
-    Logger.Info(TAG, Format('%s:%d nao responde; pedindo o tunel do Tailscale', [Host, Port]));
+    Logger.Info(TAG, Format('%s:%d nao responde (VPN: %s); pedindo o tunel do Tailscale',
+      [Host, Port, VPN_STATE_NAME[VpnState]]));
   Launched := TryLaunchOnce(Logger);
   if Logger <> nil then
     if Launched then

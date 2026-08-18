@@ -5,11 +5,10 @@
         <FrameworkType>FMX</FrameworkType>
         <Base>True</Base>
         <Config Condition="'$(Config)'==''">Release</Config>
-        <Platform Condition="'$(Platform)'==''">Win64</Platform>
+        <Platform Condition="'$(Platform)'==''">Android</Platform>
         <TargetedPlatforms>32786</TargetedPlatforms>
         <AppType>Application</AppType>
         <MainSource>rtsplayer.dpr</MainSource>
-        <ProjectName Condition="'$(ProjectName)'==''">rtsplayer</ProjectName>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
         <Base>true</Base>
@@ -105,6 +104,7 @@
         <AUP_ACCESS_FINE_LOCATION>true</AUP_ACCESS_FINE_LOCATION>
         <AUP_CALL_PHONE>true</AUP_CALL_PHONE>
         <AUP_CAMERA>true</AUP_CAMERA>
+        <AUP_ACCESS_NETWORK_STATE>true</AUP_ACCESS_NETWORK_STATE>
         <AUP_INTERNET>true</AUP_INTERNET>
         <AUP_READ_EXTERNAL_STORAGE>true</AUP_READ_EXTERNAL_STORAGE>
         <AUP_WRITE_EXTERNAL_STORAGE>true</AUP_WRITE_EXTERNAL_STORAGE>
@@ -302,10 +302,10 @@
             <FormType>fmx</FormType>
         </DCCReference>
         <DCCReference Include="src\Android\VMS.Android.JNIUtil.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.VideoDecoder.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.AudioDecoder.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.MediaRenderer.pas"/>
         <DCCReference Include="src\Win\FFmpegLib.pas"/>
-        <DCCReference Include="src\Win\VMS.Win.VideoDecoder.pas"/>
-        <DCCReference Include="src\Win\VMS.Win.AudioDecoder.pas"/>
-        <DCCReference Include="src\Win\VMS.Win.MediaRenderer.pas"/>
         <DCCReference Include="src\Media\VMS.Media.Renderer.pas"/>
         <DCCReference Include="src\Android\VMS.Android.MemoLogger.pas"/>
         <DCCReference Include="src\Dvrip\VMS.Dvrip.Protocol.pas"/>
@@ -1091,6 +1091,12 @@
                 </DeployFile>
                 <DeployFile LocalName="bin\Android\Release\styles.xml" Configuration="Release" Class="AndroidSplashStyles">
                     <Platform Name="Android">
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="bin\Win64\Release\rtsplayer.exe" Configuration="Release" Class="ProjectOutput">
+                    <Platform Name="Win64">
+                        <RemoteName>rtsplayer.exe</RemoteName>
                         <Overwrite>true</Overwrite>
                     </Platform>
                 </DeployFile>

@@ -214,6 +214,12 @@ begin
   FTrack.Fill.Color := COLOR_SURFACE2;
   FTrack.Stroke.Kind := TBrushKind.None;
   FTrack.HitTest := True;
+  // Sem isto o arrasto trava "segurando": o FMX só entrega MouseMove/MouseUp
+  // enquanto o ponteiro está SOBRE o controle, então soltar o dedo (ou o mouse)
+  // fora da barra nunca chegava aqui e o FPanActive ficava ligado para sempre.
+  // Com AutoCapture o controle captura no MouseDown e recebe o resto do gesto
+  // onde quer que ele termine — inclusive fora da janela.
+  FTrack.AutoCapture := True;
   FTrack.OnMouseDown := TrackMouseDown;
   FTrack.OnMouseMove := TrackMouseMove;
   FTrack.OnMouseUp := TrackMouseUp;

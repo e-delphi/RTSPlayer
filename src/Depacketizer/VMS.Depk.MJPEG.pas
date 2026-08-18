@@ -11,7 +11,11 @@ uses
 type
   TMjpegDepacketizer = class(TBaseDepacketizer)
   strict private
+    // Acúmulo do quadro: CAPACIDADE no array, tamanho à parte — ver o
+    // comentário gêmeo em VMS.Depk.H264. Um JPEG de 100 KB chega em dezenas de
+    // pacotes, e crescer o array a cada um copiava tudo de novo a cada pacote.
     FBuffer: TBytes;
+    FBufLen: Integer;
     FStarted: Boolean;
     FExpectedOffset: Cardinal;
     FCurrentPts: Int64;
@@ -22,6 +26,7 @@ type
     FQTables: TBytes;
     FRestartInterval: Word;
     procedure ResetAccum;
+    procedure EnsureCapacity(Need: Integer);
     procedure AppendBytes(const Src: TBytes; Offset, Count: Integer);
     function BuildJpegHeader: TBytes;
   public
@@ -33,6 +38,9 @@ type
 implementation
 
 const
+  // Capacidade inicial do acúmulo: cobre um quadro MJPEG típico sem realocar.
+  ACCUM_INITIAL_CAP = 128 * 1024;
+
   STD_LUM_QUANT: array[0..63] of Byte = (
     16,  11,  10,  16,  24,  40,  51,  61,
     12,  12,  14,  19,  26,  58,  60,  55,
@@ -259,7 +267,8 @@ end;
 
 procedure TMjpegDepacketizer.ResetAccum;
 begin
-  SetLength(FBuffer, 0);
+  // A capacidade fica: o próximo quadro tem o mesmo tamanho do anterior.
+  FBufLen := 0;
   FStarted := False;
   FExpectedOffset := 0;
   FCurrentPts := 0;
@@ -271,14 +280,23 @@ begin
   FRestartInterval := 0;
 end;
 
-procedure TMjpegDepacketizer.AppendBytes(const Src: TBytes; Offset, Count: Integer);
+procedure TMjpegDepacketizer.EnsureCapacity(Need: Integer);
 var
-  Start: Integer;
+  NewCap: Integer;
+begin
+  if Need <= Length(FBuffer) then Exit;
+  NewCap := Length(FBuffer);
+  if NewCap < ACCUM_INITIAL_CAP then NewCap := ACCUM_INITIAL_CAP;
+  while NewCap < Need do NewCap := NewCap * 2;
+  SetLength(FBuffer, NewCap);
+end;
+
+procedure TMjpegDepacketizer.AppendBytes(const Src: TBytes; Offset, Count: Integer);
 begin
   if Count <= 0 then Exit;
-  Start := Length(FBuffer);
-  SetLength(FBuffer, Start + Count);
-  Move(Src[Offset], FBuffer[Start], Count);
+  EnsureCapacity(FBufLen + Count);
+  Move(Src[Offset], FBuffer[FBufLen], Count);
+  Inc(FBufLen, Count);
 end;
 
 function TMjpegDepacketizer.BuildJpegHeader: TBytes;
@@ -357,7 +375,7 @@ begin
     FHeight8 := H8;
     FCurrentPts := Packet.Timestamp;
     Header := BuildJpegHeader;
-    AppendDynBytes(FBuffer, Header);
+    AppendBytes(Header, 0, Length(Header));
     FExpectedOffset := 0;
   end
   else
@@ -370,9 +388,15 @@ begin
 
   if Packet.Marker then
   begin
-    AppendBytesTo(FBuffer, [$FF, $D9]);
+    EnsureCapacity(FBufLen + 2);
+    FBuffer[FBufLen] := $FF;
+    FBuffer[FBufLen + 1] := $D9;
+    Inc(FBufLen, 2);
     Flags := [sfKeyframe];
-    FullJpeg := FBuffer;
+    // Cópia do tamanho exato: o quadro muda de dono aqui, e o buffer continua
+    // sendo nosso para o próximo.
+    SetLength(FullJpeg, FBufLen);
+    Move(FBuffer[0], FullJpeg[0], FBufLen);
     Emit(tkVideo, FCurrentPts, Flags, FullJpeg);
     ResetAccum;
   end;

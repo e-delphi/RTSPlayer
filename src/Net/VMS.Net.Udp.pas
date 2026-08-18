@@ -31,6 +31,8 @@ type
     FRtcpSock: TIdUDPClient;
     FRtpPort: Word;
     FRtcpPort: Word;
+    // Buffer de recepção, alocado uma vez e reaproveitado (ver ReceiveFrom).
+    FRecvIdb: TIdBytes;
     function TryBindPair(const Host: string; StartPort: Word): Boolean;
     function ReceiveFrom(Sock: TIdUDPClient; out Packet: TUdpPacket; TimeoutMs: Cardinal): Boolean;
   public
@@ -154,19 +156,24 @@ end;
 
 function TIndyUdpPair.ReceiveFrom(Sock: TIdUDPClient; out Packet: TUdpPacket; TimeoutMs: Cardinal): Boolean;
 var
-  Idb: TIdBytes;
   PeerIP: string;
   PeerPort: TIdPort;
   PeerIPVer: TIdIPVersion;
   Size: Integer;
 begin
-  SetLength(Idb, UDP_MAX_PACKET);
+  // FRecvIdb é alocado uma vez (ver Create): o Indy preenche no lugar e devolve
+  // quantos bytes vieram, sem redimensionar nada. Alocar UDP_MAX_PACKET por
+  // pacote, como estava, era jogar fora esse buffer a cada quadro RTP.
+  if Length(FRecvIdb) < UDP_MAX_PACKET then
+    SetLength(FRecvIdb, UDP_MAX_PACKET);
   Sock.ReceiveTimeout := Integer(TimeoutMs);
   try
-    Size := Sock.ReceiveBuffer(Idb, PeerIP, PeerPort, PeerIPVer, Integer(TimeoutMs));
+    Size := Sock.ReceiveBuffer(FRecvIdb, PeerIP, PeerPort, PeerIPVer, Integer(TimeoutMs));
     if Size <= 0 then Exit(False);
+    // O payload muda de dono aqui (vai para o demux e para o depacketizer),
+    // então esta cópia do tamanho exato é a que continua valendo a pena.
     SetLength(Packet.Data, Size);
-    Move(Idb[0], Packet.Data[0], Size);
+    Move(FRecvIdb[0], Packet.Data[0], Size);
     Packet.Size := Size;
     Packet.SrcHost := PeerIP;
     Packet.SrcPort := PeerPort;

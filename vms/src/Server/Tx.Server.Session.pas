@@ -81,6 +81,12 @@ type
     FSessionId: string;
     FState: TTxSessionState;
     FWriteLock: TCriticalSection;
+    // Buffers de envio, reaproveitados entre pacotes. Um TIdBytes local com
+    // SetLength por pacote — que era como estava — dava uma alocação por quadro
+    // RTP POR CLIENTE, mais outra do frame interleaved montado à parte.
+    // FTxIdb só é tocado dentro do FWriteLock; FUdpIdb só pela thread do pacer.
+    FTxIdb: TIdBytes;
+    FUdpIdb: TIdBytes;
     FVmsFile: string;
     FReader: TVmsReader;
     // Formatos que o SDP desta sessão descreve. Vêm do header do arquivo ou dos
@@ -380,16 +386,26 @@ end;
 
 procedure TTxSession.SendInterleaved(Channel: Byte; const RtpBytes: TBytes);
 var
-  Frame: TBytes;
-  Idb: TIdBytes;
+  Len, Total: Integer;
 begin
-  Frame := BuildInterleavedFrame(Channel, RtpBytes);
-  SetLength(Idb, Length(Frame));
-  Move(Frame[0], Idb[0], Length(Frame));
+  Len := Length(RtpBytes);
+  if Len > $FFFF then Exit;   // não cabe no tamanho de 16 bits do enquadramento
+  Total := 4 + Len;
   FWriteLock.Enter;
   try
+    // Montado direto no buffer da sessão, dentro do lock: some o TBytes
+    // intermediário do BuildInterleavedFrame e a cópia para o TIdBytes. O Write
+    // leva o tamanho explícito, então o buffer pode ser maior que o pacote.
+    if Length(FTxIdb) < Total then
+      SetLength(FTxIdb, Total);
+    FTxIdb[0] := $24;
+    FTxIdb[1] := Channel;
+    FTxIdb[2] := Byte((Len shr 8) and $FF);
+    FTxIdb[3] := Byte(Len and $FF);
+    if Len > 0 then
+      Move(RtpBytes[0], FTxIdb[4], Len);
     try
-      FContext.Connection.IOHandler.Write(Idb);
+      FContext.Connection.IOHandler.Write(FTxIdb, Total);
     except
       on E: Exception do
       begin
@@ -402,14 +418,17 @@ begin
 end;
 
 procedure TTxSession.SendUdp(Sock: TIdUDPClient; const PeerHost: string; PeerPort: Word; const RtpBytes: TBytes);
-var
-  Idb: TIdBytes;
 begin
   if (Sock = nil) or (Length(RtpBytes) = 0) then Exit;
-  SetLength(Idb, Length(RtpBytes));
-  Move(RtpBytes[0], Idb[0], Length(RtpBytes));
+  // Aqui o array TEM que ter o tamanho exato: o SendBuffer do Indy manda
+  // Length(ABuffer) bytes, não aceita tamanho separado. Então o truque de
+  // capacidade não serve — o que dá para fazer é reaproveitar o mesmo campo, e
+  // o SetLength só custa quando o tamanho muda de um pacote para o outro.
+  if Length(FUdpIdb) <> Length(RtpBytes) then
+    SetLength(FUdpIdb, Length(RtpBytes));
+  Move(RtpBytes[0], FUdpIdb[0], Length(RtpBytes));
   try
-    Sock.SendBuffer(PeerHost, PeerPort, Idb);
+    Sock.SendBuffer(PeerHost, PeerPort, FUdpIdb);
   except
     on E: Exception do ;
   end;
