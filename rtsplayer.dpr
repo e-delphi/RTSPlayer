@@ -24,6 +24,7 @@ uses
   VMS.App.Clock in 'src\App\VMS.App.Clock.pas',
   VMS.App.Composition in 'src\App\VMS.App.Composition.pas',
   VMS.App.Config in 'src\App\VMS.App.Config.pas',
+  VMS.App.Share in 'src\App\VMS.App.Share.pas',
   VMS.App.Logger in 'src\App\VMS.App.Logger.pas',
   VMS.App.ScreenAwake in 'src\App\VMS.App.ScreenAwake.pas',
   VMS.Depk.AAC in 'src\Depacketizer\VMS.Depk.AAC.pas',
@@ -71,6 +72,7 @@ uses
   UI.Player in 'src\UI\UI.Player.pas' {FramePlayer: TFrame},
   UI.Editor in 'src\UI\UI.Editor.pas' {FrameEditor: TFrame},
   UI.Editor.Paths in 'src\UI\UI.Editor.Paths.pas',
+  UI.Import in 'src\UI\UI.Import.pas',
   UI.Days in 'src\UI\UI.Days.pas',
   UI.Timeline in 'src\UI\UI.Timeline.pas';
 

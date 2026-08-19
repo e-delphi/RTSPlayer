@@ -20,6 +20,44 @@ object FrameList: TFrameList
       TextSettings.FontColor = claWhite
       Text = 'C'#226'meras'
     end
+    object btnExport: TRectangle
+      Align = Right
+      Fill.Kind = None
+      Position.X = 156.000000000000000000
+      Size.Width = 36.000000000000000000
+      Size.Height = 56.000000000000000000
+      Size.PlatformDefault = False
+      Stroke.Kind = None
+      object pathExport: TPath
+        Align = Center
+        Fill.Color = xFFB0B0B0
+        HitTest = False
+        Size.Width = 20.000000000000000000
+        Size.Height = 20.000000000000000000
+        Size.PlatformDefault = False
+        Stroke.Kind = None
+        WrapMode = Fit
+      end
+    end
+    object btnImport: TRectangle
+      Align = Right
+      Fill.Kind = None
+      Position.X = 192.000000000000000000
+      Size.Width = 36.000000000000000000
+      Size.Height = 56.000000000000000000
+      Size.PlatformDefault = False
+      Stroke.Kind = None
+      object pathImport: TPath
+        Align = Center
+        Fill.Color = xFFB0B0B0
+        HitTest = False
+        Size.Width = 20.000000000000000000
+        Size.Height = 20.000000000000000000
+        Size.PlatformDefault = False
+        Stroke.Kind = None
+        WrapMode = Fit
+      end
+    end
     object btnAdd: TRectangle
       Align = Right
       Fill.Color = xFF2D9CDB

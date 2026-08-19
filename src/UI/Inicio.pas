@@ -40,8 +40,10 @@ uses
   VMS.Api.Client,
   VMS.Play.Engine,
   VMS.Android.MemoLogger,
+  VMS.App.Share,
   UI.Common,
   UI.List,
+  UI.Import,
   UI.Player,
   UI.Editor,
   UI.Days,
@@ -64,6 +66,7 @@ type
     FFrameEditor: TFrameEditor;
     // Estas duas não são TFrame: montadas em código, sem .fmx (ver as units).
     FFrameDays: TFrameDays;
+    FFrameImport: TFrameImport;
     FTimeline: TFrameTimeline;
     FActive: TControl;
     FTmrStatus: TTimer;
@@ -121,6 +124,13 @@ type
     procedure ListPlay(Sender: TObject; Index: Integer);
     procedure ListEdit(Sender: TObject; Index: Integer);
     procedure ConfirmRemoveCamera(Index: Integer; AfterRemove: TProc);
+    procedure ListExport(Sender: TObject);
+    procedure ListImport(Sender: TObject);
+    procedure ImportBack(Sender: TObject);
+    procedure ImportPaste(Sender: TObject);
+    procedure ImportDo(Sender: TObject; const Text: string);
+    function MergeCameras(const Novas: TArray<TCameraConfigEntry>;
+      out Add, Upd: Integer): Boolean;
     procedure ListDelete(Sender: TObject; Index: Integer);
     procedure EditorSave(Sender: TObject; const Entry: TCameraConfigEntry; EditIndex: Integer);
     procedure EditorCancel(Sender: TObject);
@@ -181,6 +191,8 @@ begin
   FFrameList.OnPlayCamera := ListPlay;
   FFrameList.OnEditCamera := ListEdit;
   FFrameList.OnDeleteCamera := ListDelete;
+  FFrameList.OnExport := ListExport;
+  FFrameList.OnImport := ListImport;
 
   FFramePlayer := TFramePlayer.Create(Self);
   FFramePlayer.Parent := Self;
@@ -197,6 +209,14 @@ begin
   FFrameDays.Visible := False;
   FFrameDays.OnBack := DaysBack;
   FFrameDays.OnPickDay := DaysPickDay;
+
+  FFrameImport := TFrameImport.Create(Self);
+  FFrameImport.Parent := Self;
+  FFrameImport.Align := TAlignLayout.Contents;
+  FFrameImport.Visible := False;
+  FFrameImport.OnBack := ImportBack;
+  FFrameImport.OnPaste := ImportPaste;
+  FFrameImport.OnImport := ImportDo;
 
   FTimeline := TFrameTimeline.Create(Self);
   FTimeline.Parent := FFramePlayer;
@@ -277,126 +297,26 @@ end;
 procedure TForm1.LoadCameras;
 var
   S: string;
-  V, EpValue: TJSONValue;
-  Arr, Eps: TJSONArray;
-  I, J, Count: Integer;
-  O: TJSONObject;
-  Cam: TCameraConfigEntry;
-  List: TList<TCameraConfigEntry>;
 begin
   SetLength(FCameras, 0);
   if not TFile.Exists(CamerasFilePath) then
     Exit; // começa vazio; o arquivo é criado ao adicionar a primeira câmera
   try
     S := TFile.ReadAllText(CamerasFilePath, TEncoding.UTF8);
-    V := TJSONObject.ParseJSONValue(S);
   except
     Exit;
   end;
-  if not (V is TJSONArray) then
-  begin
-    if V <> nil then V.Free;
-    Exit;
-  end;
-  Arr := TJSONArray(V);
-  List := TList<TCameraConfigEntry>.Create;
-  try
-    for I := 0 to Arr.Count - 1 do
-      if Arr.Items[I] is TJSONObject then
-      begin
-        O := TJSONObject(Arr.Items[I]);
-        Cam := MakeCamera(JsonStr(O, 'name'), JsonStr(O, 'url'),
-                          JsonStr(O, 'user'), JsonStr(O, 'password'),
-                          ParseTransports(JsonStr(O, 'transport')),
-                          JsonInt(O, 'maxRetries', 0),
-                          JsonInt(O, 'audioDelayMs', 200),
-                          JsonInt(O, 'videoDelayMs', 200),
-                          JsonBool(O, 'tailscale', False));
-
-        // Os caminhos alternativos. O SaveCameras sempre gravou este array, mas
-        // ninguém o lia de volta: toda partida colapsava a câmera no espelho do
-        // caminho principal, e os outros sumiam da tela.
-        EpValue := O.GetValue('endpoints');
-        if EpValue is TJSONArray then
-        begin
-          Eps := TJSONArray(EpValue);
-          SetLength(Cam.Endpoints, Eps.Count);
-          Count := 0;
-          for J := 0 to Eps.Count - 1 do
-            if Eps.Items[J] is TJSONObject then
-            begin
-              Cam.Endpoints[Count] := ParseEndpoint(TJSONObject(Eps.Items[J]), Count);
-              if Trim(Cam.Endpoints[Count].Url) <> '' then
-                Inc(Count);
-            end;
-          SetLength(Cam.Endpoints, Count);
-        end;
-
-        // Espelho do primeiro caminho: é o que a lista mostra e o que vale de
-        // padrão. Cadastro antigo (uma url só) não tem endpoints e segue igual.
-        if Length(Cam.Endpoints) > 0 then
-        begin
-          Cam.Url := Cam.Endpoints[0].Url;
-          Cam.User := Cam.Endpoints[0].User;
-          Cam.Password := Cam.Endpoints[0].Password;
-          Cam.Transports := Cam.Endpoints[0].Transports;
-          Cam.UsesTailscale := Cam.Endpoints[0].UsesTailscale;
-        end;
-        List.Add(Cam);
-      end;
-    FCameras := List.ToArray;
-  finally
-    List.Free;
-    V.Free;
-  end;
+  // Mesmo leitor da importação: o que o outro aparelho exporta pode ser colado
+  // direto neste arquivo, e vice-versa.
+  if not CamerasFromJson(S, FCameras) then
+    SetLength(FCameras, 0);
 end;
 
 procedure TForm1.SaveCameras;
-var
-  Arr, Eps: TJSONArray;
-  O, Ep: TJSONObject;
-  I, J: Integer;
 begin
-  Arr := TJSONArray.Create;
-  try
-    for I := 0 to High(FCameras) do
-    begin
-      O := TJSONObject.Create;
-      O.AddPair('name', FCameras[I].Name);
-      // Os caminhos alternativos são gravados como estão; o editor mexe no
-      // primeiro deles, e os outros passam por aqui intactos.
-      if Length(FCameras[I].Endpoints) > 0 then
-      begin
-        Eps := TJSONArray.Create;
-        for J := 0 to High(FCameras[I].Endpoints) do
-        begin
-          Ep := TJSONObject.Create;
-          Ep.AddPair('name', FCameras[I].Endpoints[J].Name);
-          Ep.AddPair('url', FCameras[I].Endpoints[J].Url);
-          Ep.AddPair('user', FCameras[I].Endpoints[J].User);
-          Ep.AddPair('password', FCameras[I].Endpoints[J].Password);
-          Ep.AddPair('transport', TransportsToStr(FCameras[I].Endpoints[J].Transports));
-          Ep.AddPair('tailscale', TJSONBool.Create(FCameras[I].Endpoints[J].UsesTailscale));
-          Eps.AddElement(Ep);
-        end;
-        O.AddPair('endpoints', Eps);
-      end;
-      // Espelho do caminho principal: mantém o arquivo legível por quem só
-      // entende o formato antigo (e é o que vale se 'endpoints' não existir).
-      O.AddPair('url', FCameras[I].Url);
-      O.AddPair('user', FCameras[I].User);
-      O.AddPair('password', FCameras[I].Password);
-      O.AddPair('transport', TransportsToStr(FCameras[I].Transports));
-      O.AddPair('maxRetries', TJSONNumber.Create(FCameras[I].MaxReconnectAttempts));
-      O.AddPair('audioDelayMs', TJSONNumber.Create(FCameras[I].AudioDelayMs));
-      O.AddPair('videoDelayMs', TJSONNumber.Create(FCameras[I].VideoDelayMs));
-      O.AddPair('tailscale', TJSONBool.Create(FCameras[I].UsesTailscale));
-      Arr.AddElement(O);
-    end;
-    TFile.WriteAllText(CamerasFilePath, Arr.ToJSON, TEncoding.UTF8);
-  finally
-    Arr.Free;
-  end;
+  // O texto é o mesmo que a exportação manda para o outro aparelho: um
+  // serializador só (ver CamerasToJson em UI.Common).
+  TFile.WriteAllText(CamerasFilePath, CamerasToJson(FCameras), TEncoding.UTF8);
 end;
 
 procedure TForm1.RemoveCamera(Index: Integer);
@@ -420,6 +340,8 @@ begin
   FFrameEditor.Visible := F = FFrameEditor;
   if FFrameDays <> nil then
     FFrameDays.Visible := F = FFrameDays;
+  if FFrameImport <> nil then
+    FFrameImport.Visible := F = FFrameImport;
   FActive := F;
   if F <> nil then F.BringToFront;
 end;
@@ -970,6 +892,134 @@ begin
     end);
 end;
 
+// Exportar: o MESMO texto do cameras.json vai para a bandeja de compartilhar do
+// sistema, e o usuário escolhe o destino (WhatsApp, e-mail, arquivo). Não
+// gravamos arquivo nenhum — isso exigiria SAF e permissão de armazenamento para
+// resolver um problema que o compartilhamento já resolve.
+//
+// As senhas das câmeras vão no texto, em claro. É o mesmo que já está no
+// cameras.json do aparelho, mas aqui ele sai do aparelho: o aviso é o mínimo
+// devido.
+procedure TForm1.ListExport(Sender: TObject);
+var
+  Texto: string;
+begin
+  if Length(FCameras) = 0 then
+  begin
+    TDialogService.ShowMessage('Nenhuma c'#$E2'mera cadastrada para exportar.');
+    Exit;
+  end;
+  Texto := CamerasToJson(FCameras);
+  // Pergunta antes: aqui os dados SAEM do aparelho, e vão com as senhas em
+  // claro. Depois que o texto entra numa conversa, não volta.
+  TDialogService.MessageDialog(
+    Format('Exportar %d c'#$E2'mera(s)?' + sLineBreak + sLineBreak +
+      'O texto leva as SENHAS em claro. Mande s'#$F3' para voc'#$EA' mesmo, e apague' +
+      ' a mensagem depois de importar no outro aparelho.', [Length(FCameras)]),
+    TMsgDlgType.mtConfirmation, [TMsgDlgBtn.mbYes, TMsgDlgBtn.mbNo], TMsgDlgBtn.mbNo, 0,
+    procedure(const AResult: TModalResult)
+    begin
+      if AResult <> mrYes then Exit;
+      FLogger.Info('ui', Format('exportando %d camera(s), %d caracteres',
+        [Length(FCameras), Length(Texto)]));
+      if ShareText(Format('C'#$E2'meras do RTSPlayer (%d)', [Length(FCameras)]), Texto) then Exit;
+      // Sem bandeja (Windows): a área de transferência faz o mesmo papel.
+      if ClipboardSetText(Texto) then
+        TDialogService.ShowMessage(Format('%d c'#$E2'mera(s) copiadas para a '#$E1'rea de' +
+          ' transfer'#$EA'ncia.', [Length(FCameras)]))
+      else
+        TDialogService.ShowMessage('N'#$E3'o consegui exportar neste aparelho.');
+    end);
+end;
+
+procedure TForm1.ListImport(Sender: TObject);
+begin
+  FFrameImport.Reset;
+  ShowFrame(FFrameImport);
+end;
+
+procedure TForm1.ImportBack(Sender: TObject);
+begin
+  ShowList;
+end;
+
+procedure TForm1.ImportPaste(Sender: TObject);
+var
+  S: string;
+begin
+  if ClipboardGetText(S) and (Trim(S) <> '') then
+    FFrameImport.SetText(S)
+  else
+    FFrameImport.SetResult('N'#$E3'o h'#$E1' texto na '#$E1'rea de transfer'#$EA'ncia.', True);
+end;
+
+// Junta o que veio com o que já existe. Casa por NOME (sem diferenciar
+// maiúsculas): mesma câmera vira atualização, nome novo entra no fim. Substituir
+// a lista inteira seria mais simples e apagaria o que só existe neste aparelho.
+function TForm1.MergeCameras(const Novas: TArray<TCameraConfigEntry>;
+  out Add, Upd: Integer): Boolean;
+var
+  I, J, K: Integer;
+  Achou: Boolean;
+begin
+  Add := 0;
+  Upd := 0;
+  for I := 0 to High(Novas) do
+  begin
+    Achou := False;
+    for J := 0 to High(FCameras) do
+      if SameText(Trim(FCameras[J].Name), Trim(Novas[I].Name)) then
+      begin
+        // Mantém a câmera tocando se for a atual: só os dados mudam.
+        FCameras[J] := Novas[I];
+        Inc(Upd);
+        Achou := True;
+        Break;
+      end;
+    if not Achou then
+    begin
+      K := Length(FCameras);
+      SetLength(FCameras, K + 1);
+      FCameras[K] := Novas[I];
+      Inc(Add);
+    end;
+  end;
+  Result := (Add + Upd) > 0;
+end;
+
+procedure TForm1.ImportDo(Sender: TObject; const Text: string);
+var
+  Novas: TArray<TCameraConfigEntry>;
+  Add, Upd: Integer;
+begin
+  if Trim(Text) = '' then
+  begin
+    FFrameImport.SetResult('Cole o texto exportado antes de importar.', True);
+    Exit;
+  end;
+  if not CamerasFromJson(Text, Novas) then
+  begin
+    FFrameImport.SetResult('N'#$E3'o entendi esse texto: era para ser a lista JSON' +
+      ' que o outro aparelho exportou.', True);
+    Exit;
+  end;
+  if Length(Novas) = 0 then
+  begin
+    FFrameImport.SetResult('O texto '#$E9' uma lista v'#$E1'lida, mas sem nenhuma' +
+      ' c'#$E2'mera com endere'#$E7'o.', True);
+    Exit;
+  end;
+  if not MergeCameras(Novas, Add, Upd) then
+  begin
+    FFrameImport.SetResult('Nada a importar.', True);
+    Exit;
+  end;
+  SaveCameras;
+  FLogger.Info('ui', Format('importadas %d nova(s), %d atualizada(s)', [Add, Upd]));
+  FFrameImport.SetResult(Format('%d c'#$E2'mera(s) nova(s) e %d atualizada(s).', [Add, Upd]), False);
+  ShowList;
+end;
+
 procedure TForm1.EditorSave(Sender: TObject; const Entry: TCameraConfigEntry; EditIndex: Integer);
 var
   Merged: TCameraConfigEntry;
@@ -1066,6 +1116,11 @@ begin
   else if FActive = FFrameEditor then
   begin
     ShowList; // cancela a edição
+    Key := 0;
+  end
+  else if FActive = FFrameImport then
+  begin
+    ShowList; // desiste da importação
     Key := 0;
   end;
   // na lista: deixa o Key passar -> comportamento padrão (minimiza o app)

@@ -162,6 +162,23 @@ Cadastro no formato antigo (uma `url` por câmera) continua valendo: vira uma
 câmera de um caminho só. Os campos `url`/`user`/`password`/`transport` fora da
 lista são o espelho do primeiro caminho.
 
+### Levar o cadastro para outro aparelho
+
+Na lista de câmeras, os dois ícones à esquerda do **+**:
+
+- **Exportar** (seta saindo) manda o cadastro inteiro — o mesmo texto do
+  `cameras.json` — para a **bandeja de compartilhar do Android**. Dali vai para
+  WhatsApp, e-mail, arquivo, o que você escolher. No Windows, vai para a área de
+  transferência.
+- **Importar** (seta entrando) abre uma caixa onde se cola esse texto. O botão
+  **Colar** puxa da área de transferência num toque. Câmera de mesmo nome é
+  atualizada; as demais entram no fim da lista — o que só existe no aparelho de
+  destino não é apagado.
+
+O texto **leva as senhas em claro** (é o mesmo conteúdo do arquivo), e o app
+avisa isso antes de exportar. Mande só para você mesmo e apague a mensagem
+depois de importar.
+
 > ⚠️ As senhas ficam em texto puro nesse arquivo, como acontece na maioria dos
 > clientes RTSP (o protocolo precisa da senha em claro para calcular o Digest).
 > Ele vive na área privada do app, mas não é um cofre — trate o dispositivo como

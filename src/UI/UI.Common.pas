@@ -29,6 +29,12 @@ const
   // ícones (path SVG só com M/L/Z para máxima compatibilidade do parser)
   ICON_ADD    = 'M11 5 L13 5 L13 11 L19 11 L19 13 L13 13 L13 19 L11 19 L11 13 L5 13 L5 11 L11 11 Z';
   ICON_BACK   = 'M13 5 L6 12 L13 19 L14.4 17.6 L9.8 13 L20 13 L20 11 L9.8 11 L14.4 6.4 Z';
+  // exportar (seta saindo da bandeja) e importar (seta entrando). Mesmo par de
+  // formas, seta invertida: é a leitura mais rápida de "sai daqui" / "entra aqui".
+  ICON_EXPORT = 'M12 2 L17 8 L13 8 L13 14 L11 14 L11 8 L7 8 Z ' +
+                'M4 15 L6 15 L6 19 L18 19 L18 15 L20 15 L20 21 L4 21 Z';
+  ICON_IMPORT = 'M11 2 L13 2 L13 8 L17 8 L12 14 L7 8 L11 8 Z ' +
+                'M4 15 L6 15 L6 19 L18 19 L18 15 L20 15 L20 21 L4 21 Z';
   ICON_LOG    = 'M3 5 L21 5 L21 7 L3 7 Z M3 11 L21 11 L21 13 L3 13 Z M3 17 L15 17 L15 19 L3 19 Z';
   ICON_CAMERA = 'M3 7 L3 17 L15 17 L15 13 L21 16 L21 8 L15 11 L15 7 Z';
   // alto-falante + barras de volume / alto-falante + "X" (mudo). Os dois têm a
@@ -72,6 +78,13 @@ function MakeCamera(const Name, Url, User, Pass: string;
   const Transports: TArray<TTransportKind>; MaxRetries: Integer = 0;
   AudioDelay: Integer = 200; VideoDelay: Integer = 200;
   UsesTailscale: Boolean = False): TCameraConfigEntry;
+
+// Câmeras <-> texto JSON. É o MESMO formato do cameras.json: o que sai daqui
+// pode ser colado no arquivo, e o arquivo pode ser colado na importação. Ter um
+// serializador só evita o clássico "exportou num formato que a importação não
+// entende" — gravar em disco, exportar e importar passam todos por aqui.
+function CamerasToJson(const Cams: TArray<TCameraConfigEntry>): string;
+function CamerasFromJson(const S: string; out Cams: TArray<TCameraConfigEntry>): Boolean;
 
 implementation
 
@@ -262,6 +275,129 @@ begin
   Result.AudioDelayMs := AudioDelay;
   Result.VideoDelayMs := VideoDelay;
   Result.UsesTailscale := UsesTailscale;
+end;
+
+function CamerasToJson(const Cams: TArray<TCameraConfigEntry>): string;
+var
+  Arr, Eps: TJSONArray;
+  O, Ep: TJSONObject;
+  I, J: Integer;
+begin
+  Arr := TJSONArray.Create;
+  try
+    for I := 0 to High(Cams) do
+    begin
+      O := TJSONObject.Create;
+      O.AddPair('name', Cams[I].Name);
+      // Os caminhos alternativos vão como estão.
+      if Length(Cams[I].Endpoints) > 0 then
+      begin
+        Eps := TJSONArray.Create;
+        for J := 0 to High(Cams[I].Endpoints) do
+        begin
+          Ep := TJSONObject.Create;
+          Ep.AddPair('name', Cams[I].Endpoints[J].Name);
+          Ep.AddPair('url', Cams[I].Endpoints[J].Url);
+          Ep.AddPair('user', Cams[I].Endpoints[J].User);
+          Ep.AddPair('password', Cams[I].Endpoints[J].Password);
+          Ep.AddPair('transport', TransportsToStr(Cams[I].Endpoints[J].Transports));
+          Ep.AddPair('tailscale', TJSONBool.Create(Cams[I].Endpoints[J].UsesTailscale));
+          Eps.AddElement(Ep);
+        end;
+        O.AddPair('endpoints', Eps);
+      end;
+      // Espelho do caminho principal: mantém o arquivo legível por quem só
+      // entende o formato antigo (e é o que vale se 'endpoints' não existir).
+      O.AddPair('url', Cams[I].Url);
+      O.AddPair('user', Cams[I].User);
+      O.AddPair('password', Cams[I].Password);
+      O.AddPair('transport', TransportsToStr(Cams[I].Transports));
+      O.AddPair('maxRetries', TJSONNumber.Create(Cams[I].MaxReconnectAttempts));
+      O.AddPair('audioDelayMs', TJSONNumber.Create(Cams[I].AudioDelayMs));
+      O.AddPair('videoDelayMs', TJSONNumber.Create(Cams[I].VideoDelayMs));
+      O.AddPair('tailscale', TJSONBool.Create(Cams[I].UsesTailscale));
+      Arr.AddElement(O);
+    end;
+    Result := Arr.ToJSON;
+  finally
+    Arr.Free;
+  end;
+end;
+
+function CamerasFromJson(const S: string; out Cams: TArray<TCameraConfigEntry>): Boolean;
+var
+  V, EpValue: TJSONValue;
+  Arr, Eps: TJSONArray;
+  I, J, Count: Integer;
+  O: TJSONObject;
+  Cam: TCameraConfigEntry;
+  List: TList<TCameraConfigEntry>;
+begin
+  Result := False;
+  Cams := nil;
+  if Trim(S) = '' then Exit;
+  try
+    V := TJSONObject.ParseJSONValue(S);
+  except
+    Exit;
+  end;
+  if not (V is TJSONArray) then
+  begin
+    if V <> nil then V.Free;
+    Exit;
+  end;
+  Arr := TJSONArray(V);
+  List := TList<TCameraConfigEntry>.Create;
+  try
+    for I := 0 to Arr.Count - 1 do
+      if Arr.Items[I] is TJSONObject then
+      begin
+        O := TJSONObject(Arr.Items[I]);
+        Cam := MakeCamera(JsonStr(O, 'name'), JsonStr(O, 'url'),
+                          JsonStr(O, 'user'), JsonStr(O, 'password'),
+                          ParseTransports(JsonStr(O, 'transport')),
+                          JsonInt(O, 'maxRetries', 0),
+                          JsonInt(O, 'audioDelayMs', 200),
+                          JsonInt(O, 'videoDelayMs', 200),
+                          JsonBool(O, 'tailscale', False));
+
+        EpValue := O.GetValue('endpoints');
+        if EpValue is TJSONArray then
+        begin
+          Eps := TJSONArray(EpValue);
+          SetLength(Cam.Endpoints, Eps.Count);
+          Count := 0;
+          for J := 0 to Eps.Count - 1 do
+            if Eps.Items[J] is TJSONObject then
+            begin
+              Cam.Endpoints[Count] := ParseEndpoint(TJSONObject(Eps.Items[J]), Count);
+              if Trim(Cam.Endpoints[Count].Url) <> '' then
+                Inc(Count);
+            end;
+          SetLength(Cam.Endpoints, Count);
+        end;
+
+        // Espelho do primeiro caminho: é o que a lista mostra e o que vale de
+        // padrão. Cadastro antigo (uma url só) não tem endpoints e segue igual.
+        if Length(Cam.Endpoints) > 0 then
+        begin
+          Cam.Url := Cam.Endpoints[0].Url;
+          Cam.User := Cam.Endpoints[0].User;
+          Cam.Password := Cam.Endpoints[0].Password;
+          Cam.Transports := Cam.Endpoints[0].Transports;
+          Cam.UsesTailscale := Cam.Endpoints[0].UsesTailscale;
+        end;
+        // Câmera sem endereço nenhum não serve para nada e ainda quebraria a
+        // lista: descarta em silêncio.
+        if Trim(Cam.Url) <> '' then
+          List.Add(Cam);
+      end;
+    Cams := List.ToArray;
+    Result := True;
+  finally
+    List.Free;
+    V.Free;
+  end;
 end;
 
 end.

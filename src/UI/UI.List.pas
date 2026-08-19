@@ -21,6 +21,10 @@ type
     pathAdd: TPath;
     btnEdit: TRectangle;
     lblEditMode: TLabel;
+    btnExport: TRectangle;
+    pathExport: TPath;
+    btnImport: TRectangle;
+    pathImport: TPath;
     sbCameras: TVertScrollBox;
   private
     FCameras: TArray<TCameraConfigEntry>;
@@ -31,10 +35,14 @@ type
     FOnPlay: TCamIndexEvent;
     FOnEdit: TCamIndexEvent;
     FOnDelete: TCamIndexEvent;
+    FOnExport: TNotifyEvent;
+    FOnImport: TNotifyEvent;
     procedure ClearCards;
     procedure RefreshList;
     procedure btnAddClick(Sender: TObject);
     procedure btnEditClick(Sender: TObject);
+    procedure btnExportClick(Sender: TObject);
+    procedure btnImportClick(Sender: TObject);
     procedure CardClick(Sender: TObject);
     procedure CardDeleteClick(Sender: TObject);
   public
@@ -46,6 +54,10 @@ type
     property OnPlayCamera: TCamIndexEvent read FOnPlay write FOnPlay;
     property OnEditCamera: TCamIndexEvent read FOnEdit write FOnEdit;
     property OnDeleteCamera: TCamIndexEvent read FOnDelete write FOnDelete;
+    // Levar o cadastro para outro aparelho: exportar manda o texto pela bandeja
+    // do sistema, importar abre a tela de colar.
+    property OnExport: TNotifyEvent read FOnExport write FOnExport;
+    property OnImport: TNotifyEvent read FOnImport write FOnImport;
   end;
 
 implementation
@@ -57,7 +69,11 @@ begin
   inherited;
   FCards := TList<TRectangle>.Create;
   pathAdd.Data.Data := ICON_ADD;
+  pathExport.Data.Data := ICON_EXPORT;
+  pathImport.Data.Data := ICON_IMPORT;
   btnAdd.OnClick := btnAddClick;
+  btnExport.OnClick := btnExportClick;
+  btnImport.OnClick := btnImportClick;
   btnEdit.OnClick := btnEditClick;
 
   // Mensagem centralizada quando não há nenhuma câmera.
@@ -210,6 +226,16 @@ begin
   if not (Sender is TRectangle) then Exit;
   Idx := TRectangle(Sender).Tag;
   if Assigned(FOnDelete) then FOnDelete(Self, Idx);
+end;
+
+procedure TFrameList.btnExportClick(Sender: TObject);
+begin
+  if Assigned(FOnExport) then FOnExport(Self);
+end;
+
+procedure TFrameList.btnImportClick(Sender: TObject);
+begin
+  if Assigned(FOnImport) then FOnImport(Self);
 end;
 
 procedure TFrameList.btnAddClick(Sender: TObject);
