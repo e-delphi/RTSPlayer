@@ -41,6 +41,49 @@ const
   // magic(4) + âncora de vídeo(8) + âncora de áudio(8)
   VMS_ANCHOR_SIZE = 20;
 
+  // ------------------------------------------------------------------------
+  // Região de índice viva ('VLIX'), entre o header e o primeiro bloco.
+  //
+  // O VIDX do rodapé só existe depois que a gravação fecha; enquanto ela corre,
+  // achar um instante custa varrer bloco a bloco (ScanBlocksFrom). Esta região é
+  // reservada na criação do arquivo e atualizada NO LUGAR a cada punhado de
+  // blocos, então o arquivo em gravação — que é justamente o que se quer
+  // assistir — também tem índice.
+  //
+  // Fica FORA do header de propósito: o header é copiado byte a byte para dentro
+  // de cada fragmento servido pela API (TVmsReader.ReadHeaderBytes), e um índice
+  // ali dentro viajaria para o celular a cada pedaço de reprodução.
+  //
+  // Quando ela enche, quem grava RODA DE ARQUIVO (ver TRecordingSink). É por isso
+  // que não há encadeamento: o tamanho da região é o que define o tamanho do
+  // segmento, e estourar deixa de ser um caso a tratar. Se alguém gravar sem
+  // rodar assim mesmo, o arquivo continua válido — o índice vivo para de crescer
+  // e quem ler antes do fechamento varre a cauda.
+  VMS_MAGIC_REGION : array[0..3] of Byte = (Ord('V'), Ord('L'), Ord('I'), Ord('X'));
+
+  // magic(4) + tamanho(4) + capacidade(4) + slot A(12) + slot B(12) + reserva(4)
+  VMS_REGION_HEADER_SIZE  = 40;
+  VMS_REGION_COMMIT_A_OFS = 12;
+  VMS_REGION_COMMIT_B_OFS = 24;
+  // entradas(4) + geração(4) + crc(4) das `entradas` primeiras entradas
+  VMS_REGION_COMMIT_SIZE  = 12;
+
+  // Dois slots de commit alternados: a escrita de 12 bytes num setor não é
+  // atômica por contrato. Escrevendo sempre no slot que NÃO está valendo, uma
+  // queda no meio da atualização deixa o commit anterior intacto — perde-se o
+  // último punhado de blocos do índice, que a varredura de cauda recupera.
+  VMS_REGION_SLOTS = 2;
+
+  // 64 KB = 3852 blocos = ~2 h a 2 s por bloco, ~600 MB de arquivo a 650 kbps.
+  // Este número é o que decide de quanto em quanto tempo a gravação roda de
+  // arquivo, e portanto quantos arquivos ficam na pasta da câmera.
+  VMS_REGION_DEFAULT_BYTES = 64 * 1024;
+  VMS_REGION_MIN_BYTES     = 4 * 1024;
+  VMS_REGION_MAX_BYTES     = 8 * 1024 * 1024;
+  // Folga no fim da região para esperar um keyframe antes de rodar de arquivo:
+  // assim o arquivo novo começa por um ponto de entrada do decodificador.
+  VMS_REGION_KEYFRAME_SLACK = 64;
+
   // magic(4)+tamanho(4)+seq(4)+startMs(8)+samples(4)+tamanho do índice(4)
   VMS_BLOCK_HEADER_SIZE = 28;
   // trackId(1) + flags(1) + pts(8) + offset(4) + tamanho(4)
@@ -114,6 +157,11 @@ function IndexKeyframeAtOrBefore(const Index: TVmsIndex; From: Integer): Integer
 // TBlockBuilder fecha bloco por tempo/tamanho e não por keyframe, isso é uma
 // propriedade a descobrir olhando os samples, não um invariante do formato.
 function SamplesHaveKeyframe(const Samples: array of TVmsSampleEntry): Boolean;
+// Tamanho de região válido, com os extremos aparados. 0 (ou negativo) devolve o
+// padrão — é o que a config faz quando o campo não está lá.
+function NormalizeRegionBytes(Bytes: Integer): Integer;
+// Quantas entradas cabem numa região deste tamanho.
+function RegionCapacity(RegionBytes: Integer): Integer;
 
 implementation
 
@@ -131,6 +179,20 @@ begin
   if (B and $01) <> 0 then Include(Result, sfKeyframe);
   if (B and $02) <> 0 then Include(Result, sfStartOfFrame);
   if (B and $04) <> 0 then Include(Result, sfEndOfFrame);
+end;
+
+function NormalizeRegionBytes(Bytes: Integer): Integer;
+begin
+  if Bytes <= 0 then Exit(VMS_REGION_DEFAULT_BYTES);
+  Result := Bytes;
+  if Result < VMS_REGION_MIN_BYTES then Result := VMS_REGION_MIN_BYTES;
+  if Result > VMS_REGION_MAX_BYTES then Result := VMS_REGION_MAX_BYTES;
+end;
+
+function RegionCapacity(RegionBytes: Integer): Integer;
+begin
+  Result := (RegionBytes - VMS_REGION_HEADER_SIZE) div VMS_INDEX_ENTRY_SIZE;
+  if Result < 0 then Result := 0;
 end;
 
 function SamplesHaveKeyframe(const Samples: array of TVmsSampleEntry): Boolean;

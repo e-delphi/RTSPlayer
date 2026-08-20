@@ -11,7 +11,7 @@ saíram quatro bugs desta última leva antes de qualquer compilação:
 
 | script | modela |
 |---|---|
-| `genvms.py` | gera `.vms` sintético (com índice, sem índice, truncado) para usar de fixture |
+| `genvms.py` | gera `.vms` sintético (com índice, sem índice, truncado, com região de índice viva) para usar de fixture |
 | `apimodel.py` | o que `/api/days` e `/api/segments` devem responder para uma pasta de gravações |
 | `fragment.py` | o que `/api/media` devolve, incluindo cursor e travessia de arquivo |
 | `pacemodel.py` | o ritmo do playback (1×/2×/4×, borrão do seek) com relógio virtual |
@@ -90,6 +90,11 @@ bloco:  'BLK\x01' | block_size(4) | seq(4) | start_unix_ms(8)
 BANC:   'BANC' | video_anchor_ms(8) | audio_anchor_ms(8)               [20B]
         (no FIM da área de índice, contado dentro de index_size)
 
+VLIX:   'VLIX' | region_size(4) | capacity(4)
+        | slot A(count(4) gen(4) crc(4)) | slot B(idem) | reserva(4)  [40B]
+        | capacity × (offset(8) start_unix_ms(8) flags(1))            [17B]
+        (logo depois do header; os blocos começam DEPOIS dela)
+
 VIDX:   'VIDX' | chunk_size(4) | count(4)
         | count × (offset(8) start_unix_ms(8) flags(1))                 [17B]
         | crc32(4)
@@ -116,6 +121,20 @@ gravação fecha; nele `flags` bit 0 diz que aquele bloco contém keyframe de v�
 que é o que permite achar por onde começar a decodificar sem varrer o arquivo. É
 o que a timeline do app usa (ver [PLANO-TIMELINE.md](../docs/PLANO-TIMELINE.md)).
 Arquivo fechado sem índice continua válido: quem precisar varre.
+
+O `VLIX` é o **mesmo índice, do arquivo ainda em gravação**: uma região de tamanho
+fixo reservada na criação, entre o header e o primeiro bloco, e atualizada no
+lugar a cada 16 blocos. Vale o slot de commit de geração mais alta cujo CRC bate
+(o CRC cobre as `count` primeiras entradas); o outro slot é o seguro contra queda
+de energia no meio da atualização. O que ficou depois do último commit sai de uma
+varredura da cauda — dezenas de blocos, não o arquivo inteiro. Quando a região
+enche, o gravador **roda de arquivo**: é por isso que não existe encadeamento de
+índices, e é o tamanho da região que decide o tamanho do segmento.
+
+A região fica FORA do header (e não dentro) porque o header é copiado byte a byte
+para dentro de cada fragmento servido pela `/api/media`: um índice ali viajaria
+para o celular a cada pedaço de reprodução. Fragmento da API, portanto, não tem
+região — e os leitores tratam os dois casos.
 
 O formato está **em desenvolvimento e não lê layout antigo**: a versão do header é
 sempre 1, não há caminho de leitura para arquivo de layout anterior, e mudança de

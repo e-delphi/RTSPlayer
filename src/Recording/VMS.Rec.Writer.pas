@@ -19,6 +19,12 @@ type
     function BlocksWritten: Cardinal;
     function BytesWritten: Int64;
     function FilePath: string;
+    // A região de índice viva encheu: quem grava deve rodar de arquivo. Ver
+    // VMS.Rec.Format — é o tamanho da região que define o do segmento.
+    function IndexRegionFull: Boolean;
+    // Quase cheia: ainda cabe esperar o próximo keyframe antes de rodar, para o
+    // arquivo novo começar por onde o decodificador consegue entrar.
+    function IndexRegionNearlyFull: Boolean;
   end;
 
   TFileRecordingWriter = class(TInterfacedObject, IRecordingWriter)
@@ -36,11 +42,26 @@ type
     FIndex: TVmsIndex;
     FIndexCount: Integer;
     FIndexOverflow: Boolean;
+    // Região de índice viva: reservada no WriteHeader, atualizada no lugar a
+    // cada REGION_COMMIT_EVERY blocos.
+    FRegionOffset: Int64;
+    FRegionBytes: Integer;
+    FRegionCapacity: Integer;
+    FRegionOk: Boolean;       // False = não deu para escrever; grava sem índice vivo
+    FCommittedCount: Integer; // entradas já commitadas na região
+    FCommitCrc: Cardinal;     // crc corrente das entradas commitadas
+    FCommitGen: Cardinal;
+    FCommitSlot: Integer;     // próximo slot a escrever (alterna 0/1)
     procedure NoteBlockInIndex(const Block: TVmsBlock; Offset: UInt64);
+    procedure ReserveIndexRegion;
+    procedure CommitIndexRegion;
     function WriteIndexChunk: UInt64;
     procedure FlushDisk;
   public
-    constructor Create(const AFilePath: string);
+    // AIndexRegionBytes decide de quanto em quanto tempo a gravação roda de
+    // arquivo: cabe uma entrada por bloco, e região cheia é o gatilho.
+    constructor Create(const AFilePath: string;
+                       AIndexRegionBytes: Integer = VMS_REGION_DEFAULT_BYTES);
     destructor Destroy; override;
     procedure WriteHeader(const Header: TVmsHeader);
     procedure WriteBlock(const Block: TVmsBlock);
@@ -49,6 +70,8 @@ type
     function BlocksWritten: Cardinal;
     function BytesWritten: Int64;
     function FilePath: string;
+    function IndexRegionFull: Boolean;
+    function IndexRegionNearlyFull: Boolean;
   end;
 
 implementation
@@ -63,6 +86,11 @@ const
   // sem ele (quem precisar varre). São ~23 dias de gravação com blocos de 2 s —
   // se chegou lá, alguma coisa está errada e é melhor não segurar 17 MB de RAM.
   MAX_INDEX_ENTRIES = 1000000;
+
+  // De quantos em quantos blocos a região é atualizada. Cada commit são ~280
+  // bytes e dois seeks; 16 blocos são ~32 s, e o que ficar de fora do último
+  // commit o leitor recupera varrendo a cauda, em uma dúzia de leituras.
+  REGION_COMMIT_EVERY = 16;
 
 procedure WriteU16ToBytes(var Buf: TBytes; var Offset: Integer; V: Word);
 begin
@@ -110,12 +138,15 @@ end;
 
 { TFileRecordingWriter }
 
-constructor TFileRecordingWriter.Create(const AFilePath: string);
+constructor TFileRecordingWriter.Create(const AFilePath: string;
+  AIndexRegionBytes: Integer);
 var
   Dir: string;
 begin
   inherited Create;
   FFilePath := AFilePath;
+  FRegionBytes := NormalizeRegionBytes(AIndexRegionBytes);
+  FRegionCapacity := RegionCapacity(FRegionBytes);
   Dir := ExtractFilePath(AFilePath);
   if (Dir <> '') and (not DirectoryExists(Dir)) then
     ForceDirectories(Dir);
@@ -128,6 +159,12 @@ begin
   FLastBlockOffset := 0;
   FIndexCount := 0;
   FIndexOverflow := False;
+  FRegionOffset := 0;
+  FRegionOk := False;
+  FCommittedCount := 0;
+  FCommitCrc := 0;
+  FCommitGen := 0;
+  FCommitSlot := 0;
 end;
 
 destructor TFileRecordingWriter.Destroy;
@@ -220,6 +257,96 @@ begin
   Inc(FBytes, Length(Buf));
   FHeaderDone := True;
   FFirstUnixMs := Header.CreationUnixMs;
+  ReserveIndexRegion;
+end;
+
+// Reserva a região de índice viva logo depois do header. Escrita de verdade
+// (zeros), não buraco: o primeiro bloco tem que começar DEPOIS dela, e o leitor
+// acha a região exatamente em HeaderSize.
+procedure TFileRecordingWriter.ReserveIndexRegion;
+var
+  Buf: TBytes;
+  Offset: Integer;
+begin
+  FRegionOk := False;
+  if FRegionCapacity <= 0 then Exit;
+  try
+    SetLength(Buf, FRegionBytes);   // TBytes nasce zerado: os dois slots de
+    Offset := 0;                    // commit ficam em (0 entradas, geração 0)
+    Move(VMS_MAGIC_REGION[0], Buf[Offset], 4); Inc(Offset, 4);
+    WriteU32ToBytes(Buf, Offset, Cardinal(FRegionBytes));
+    WriteU32ToBytes(Buf, Offset, Cardinal(FRegionCapacity));
+    FRegionOffset := FBytes;
+    FStream.WriteBuffer(Buf[0], Length(Buf));
+    Inc(FBytes, FRegionBytes);
+    FRegionOk := True;
+  except
+    // Sem região o arquivo continua válido; só volta a custar varredura para
+    // quem quiser tocá-lo antes de ele fechar.
+    FRegionOk := False;
+  end;
+end;
+
+// Grava na região as entradas que ainda não estavam lá e commita.
+//
+// Ordem que dá a garantia: primeiro as ENTRADAS (numa área que nenhum commit
+// válido cobre ainda), depois o SLOT DE COMMIT. Queda no meio das entradas
+// deixa o commit anterior valendo e o lixo além dele é ignorado; queda no meio
+// do commit estraga um slot só, e o outro continua de pé.
+procedure TFileRecordingWriter.CommitIndexRegion;
+var
+  Buf: TBytes;
+  Offset, I, UpTo, Pending: Integer;
+  SlotOfs, SavedPos: Int64;
+begin
+  if (not FRegionOk) or (FStream = nil) then Exit;
+  UpTo := FIndexCount;
+  if UpTo > FRegionCapacity then UpTo := FRegionCapacity;
+  Pending := UpTo - FCommittedCount;
+  if Pending <= 0 then Exit;
+
+  SavedPos := FBytes;
+  try
+    SetLength(Buf, Pending * VMS_INDEX_ENTRY_SIZE);
+    Offset := 0;
+    for I := FCommittedCount to UpTo - 1 do
+    begin
+      WriteI64ToBytes(Buf, Offset, FIndex[I].Offset);
+      WriteI64ToBytes(Buf, Offset, FIndex[I].StartUnixMs);
+      Buf[Offset] := FIndex[I].Flags; Inc(Offset);
+    end;
+    FStream.Position := FRegionOffset + VMS_REGION_HEADER_SIZE +
+                        Int64(FCommittedCount) * VMS_INDEX_ENTRY_SIZE;
+    FStream.WriteBuffer(Buf[0], Length(Buf));
+    // CRC corrente: as entradas entram sempre no fim e nunca são reescritas,
+    // então continuar o crc de onde parou dá o mesmo que recalcular tudo.
+    FCommitCrc := Crc32Update(FCommitCrc, Buf, 0, Length(Buf));
+
+    Inc(FCommitGen);
+    SetLength(Buf, VMS_REGION_COMMIT_SIZE);
+    Offset := 0;
+    WriteU32ToBytes(Buf, Offset, Cardinal(UpTo));
+    WriteU32ToBytes(Buf, Offset, FCommitGen);
+    WriteU32ToBytes(Buf, Offset, FCommitCrc);
+    if FCommitSlot = 0 then
+      SlotOfs := VMS_REGION_COMMIT_A_OFS
+    else
+      SlotOfs := VMS_REGION_COMMIT_B_OFS;
+    FStream.Position := FRegionOffset + SlotOfs;
+    FStream.WriteBuffer(Buf[0], Length(Buf));
+
+    FCommittedCount := UpTo;
+    FCommitSlot := (FCommitSlot + 1) mod VMS_REGION_SLOTS;
+  except
+    // Falhou uma vez, para de tentar: gravar a mídia é o que não pode parar.
+    FRegionOk := False;
+  end;
+  // O corpo do arquivo continua sendo escrito no fim, sempre.
+  try
+    FStream.Position := SavedPos;
+  except
+    FRegionOk := False;
+  end;
 end;
 
 procedure TFileRecordingWriter.WriteBlock(const Block: TVmsBlock);
@@ -295,6 +422,8 @@ begin
   Inc(FBlocks);
   FLastUnixMs := Block.StartUnixMs;
   NoteBlockInIndex(Block, StartOffset);
+  if FRegionOk and (FIndexCount - FCommittedCount >= REGION_COMMIT_EVERY) then
+    CommitIndexRegion;
 end;
 
 procedure TFileRecordingWriter.NoteBlockInIndex(const Block: TVmsBlock; Offset: UInt64);
@@ -364,6 +493,12 @@ var
 begin
   if FStream = nil then Exit;
 
+  // Commit final: o arquivo fechado é lido pelo VIDX do rodapé, mas quem já
+  // estava com ele aberto (uma sessão ao vivo, o cache do servidor) pode ler a
+  // região — e ela tem que refletir o arquivo inteiro.
+  if FRegionOk then
+    CommitIndexRegion;
+
   if WriteFooter and FHeaderDone then
   begin
     // Índice primeiro, rodapé depois: é o rodapé que aponta para ele, e ele
@@ -423,5 +558,17 @@ function TFileRecordingWriter.HeaderWritten: Boolean; begin Result := FHeaderDon
 function TFileRecordingWriter.BlocksWritten: Cardinal; begin Result := FBlocks; end;
 function TFileRecordingWriter.BytesWritten: Int64; begin Result := FBytes; end;
 function TFileRecordingWriter.FilePath: string; begin Result := FFilePath; end;
+
+function TFileRecordingWriter.IndexRegionFull: Boolean;
+begin
+  // Sem região não há gatilho de rotação: o arquivo corre solto, como antes.
+  Result := FRegionOk and (FIndexCount >= FRegionCapacity);
+end;
+
+function TFileRecordingWriter.IndexRegionNearlyFull: Boolean;
+begin
+  Result := FRegionOk and
+            (FIndexCount >= FRegionCapacity - VMS_REGION_KEYFRAME_SLACK);
+end;
 
 end.

@@ -50,6 +50,9 @@ type
     MaxBlockSamples: Integer;
     MaxBlockDurationMs: Integer;
     MaxBlockSizeBytes: Integer;
+    // Tamanho da região de índice viva do .vms. É ela que decide de quanto em
+    // quanto tempo a gravação roda de arquivo (ver VMS.Rec.Format).
+    IndexRegionBytes: Integer;
     ConnectTimeoutMs: Cardinal;
     RtspTimeoutMs: Cardinal;
     RecordEnabled: Boolean;
@@ -91,6 +94,9 @@ type
     FDemux: TRtpDemux;
     FBlockBuilder: TBlockBuilder;
     FWriter: IRecordingWriter;
+    // O header do arquivo em gravação, guardado para a rotação poder reabrir
+    // outro igual sem voltar ao SDP.
+    FRecHeader: TVmsHeader;
     FMediaSink: IMediaSink;
     FFormatNotified: Boolean;  // o sink já soube do formato desta sessão
     FUsedTransport: TTransportKind;
@@ -116,6 +122,7 @@ type
     procedure CleanupTransportAttempt;
     procedure SetupDepacketizers;
     procedure WriteHeaderFromSdp;
+    procedure RotateWriter;
     procedure HandleSample(const Sample: TSample);
     procedure AccountRtp(IsVideo: Boolean; const Packet: TRtpPacket);
     procedure LogStatsIfDue;
@@ -813,8 +820,9 @@ begin
     Header.Audio.Extradata := FAudioInfo.Extradata;
   end;
 
-  FOutputPath := BuildOutputPath;
-  FWriter := TFileRecordingWriter.Create(FOutputPath);
+  FRecHeader := Header;
+  FOutputPath := UniqueRecordingPath(BuildOutputPath);
+  FWriter := TFileRecordingWriter.Create(FOutputPath, FConfig.IndexRegionBytes);
   FWriter.WriteHeader(Header);
 
   FBlockBuilder := TBlockBuilder.Create(FConfig.MaxBlockSamples,
@@ -823,6 +831,14 @@ begin
   FBlockBuilder.SetOnBlockClosed(
     procedure(const Block: TVmsBlock)
     begin
+      if FWriter = nil then Exit;
+      // Região de índice cheia: roda de arquivo antes de gravar este bloco.
+      // Com folga, espera um keyframe, para o arquivo novo começar por um ponto
+      // de entrada do decodificador.
+      if FWriter.IndexRegionFull or
+         (FWriter.IndexRegionNearlyFull and SamplesHaveKeyframe(Block.Samples)) then
+        RotateWriter;
+      if FWriter = nil then Exit;
       try
         FWriter.WriteBlock(Block);
       except
@@ -831,6 +847,38 @@ begin
       end;
     end);
   FLogger.Info('session.' + FConfig.Name, 'Recording to ' + FOutputPath);
+end;
+
+// Fecha o arquivo corrente e segue no seguinte, sem tocar no TBlockBuilder — ele
+// é quem está chamando isto, e liberá-lo aqui derrubaria a sessão.
+procedure TCameraSession.RotateWriter;
+begin
+  try
+    if FWriter <> nil then
+      FWriter.Close(True);
+  except
+    on E: Exception do
+      FLogger.Warn('session.' + FConfig.Name, 'Rotate close failed: ' + E.Message);
+  end;
+  FWriter := nil;
+  // Instante de criação novo: é dele que o servidor tira o começo da faixa deste
+  // arquivo (ver Vms.Server.IndexCache).
+  FRecHeader.CreationUnixMs := FClock.NowUtcMs;
+  FOutputPath := UniqueRecordingPath(BuildOutputPath);
+  try
+    FWriter := TFileRecordingWriter.Create(FOutputPath, FConfig.IndexRegionBytes);
+    FWriter.WriteHeader(FRecHeader);
+    FLogger.Info('session.' + FConfig.Name, 'Index region full; recording to ' + FOutputPath);
+  except
+    on E: Exception do
+    begin
+      // Mesmo tratamento de uma falha de WriteBlock: derruba a sessão para o
+      // supervisor reconectar e recomeçar um arquivo. Seguir com FWriter nil
+      // gravaria em lugar nenhum, calado, até alguém reparar.
+      FWriter := nil;
+      raise EVmsIoError.Create('Rotate open failed: ' + E.Message);
+    end;
+  end;
 end;
 
 procedure TCameraSession.HandleSample(const Sample: TSample);

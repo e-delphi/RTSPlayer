@@ -167,7 +167,12 @@ begin
   // no tamanho evita texto branco em fundo branco quando o estilo é claro.
   FMemo.StyledSettings := FMemo.StyledSettings - [TStyledSetting.Size];
   FMemo.TextSettings.Font.Size := 12;
-  FMemo.WordWrap := True;
+  // SEM quebra de linha automática. O texto colado aqui é JSON, que pode vir
+  // numa linha só de milhares de caracteres sem nenhum espaço; com WordWrap, o
+  // FMX tenta quebrar essa "palavra" e o app trava ao colar pelo menu do Android
+  // (colar pelo botão daqui não travava porque atribui o texto de uma vez).
+  // Sem quebra, a linha longa apenas rola para o lado.
+  FMemo.WordWrap := False;
   // Os mesmos gestos do memo de log: sem LongTap não aparece o menu nativo de
   // colar, que é justamente como o texto entra aqui.
   FMemo.Touch.InteractiveGestures := [TInteractiveGesture.Pan,

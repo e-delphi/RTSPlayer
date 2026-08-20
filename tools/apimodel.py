@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 
 import glob
 import os
+import struct
 
 import vmslib
 
@@ -36,30 +37,50 @@ def camera_files(folder, camera):
 
 
 def file_info(path):
+    """Descreve um arquivo SEM montar índice, como o Vms.Server.IndexCache.
+
+    Arquivo fechado responde pelo rodapé; arquivo em gravação, pelas pontas da
+    região de índice viva. A varredura só sobra para arquivo recém-aberto (antes
+    do primeiro commit) e para gravação de build sem região."""
     with open(path, 'rb') as f:
         data = f.read()
     header = vmslib.read_header(data)
     footer = vmslib.read_footer(data)
-    entries = None
-    try:
-        entries = vmslib.read_block_index(data, footer)
-    except vmslib.VmsError:
-        entries = None
-    if entries:
-        starts = [e.start_unix_ms for e in entries]
-        blocks = len(entries)
-    else:
-        blks = list(vmslib.iter_blocks(data, header, with_data=False))
-        starts = [b.start_unix_ms for b in blks]
-        blocks = len(blks)
-    if not starts:
+
+    o = vmslib.first_block_offset(data, header)
+    if data[o:o + 4] != vmslib.MAGIC_BLOCK:
         return None
-    start, end = starts[0], starts[-1] + ASSUMED_LAST_BLOCK_MS
-    if footer and footer.duration_ms > 0:
+    start = struct.unpack_from('<q', data, o + 12)[0]
+
+    indexed = True
+    if footer is not None:
+        blocks = footer.total_blocks
         end = header.creation_unix_ms + footer.duration_ms + ASSUMED_LAST_BLOCK_MS
+        if end < start:
+            end = start
+    else:
+        region = None
+        try:
+            region = vmslib.read_region(data, header)
+        except vmslib.VmsError:
+            region = None
+        if region and region[2]:
+            start = region[2][0].start_unix_ms
+            end = region[2][-1].start_unix_ms + ASSUMED_LAST_BLOCK_MS
+            blocks = len(region[2])
+        else:
+            blks = list(vmslib.iter_blocks(data, header, with_data=False))
+            if not blks:
+                return None
+            start = blks[0].start_unix_ms
+            end = blks[-1].start_unix_ms + ASSUMED_LAST_BLOCK_MS
+            blocks = len(blks)
+            indexed = False
+    if blocks == 0:
+        return None
     return dict(file=os.path.basename(path), startMs=start, endMs=end,
                 blocks=blocks, closed=footer is not None,
-                indexed=bool(entries), bytes=len(data))
+                indexed=indexed, bytes=len(data))
 
 
 def merge(files, gap_ms):

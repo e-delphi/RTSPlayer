@@ -31,6 +31,7 @@ uses
   VMS.Domain.Clock,
   VMS.Domain.Supervisor,
   VMS.Rtsp.Client,
+  VMS.Rec.Format,
   VMS.App.Config,
   VMS.App.Composition,
   VMS.App.ScreenAwake,
@@ -124,7 +125,7 @@ type
     procedure ListPlay(Sender: TObject; Index: Integer);
     procedure ListEdit(Sender: TObject; Index: Integer);
     procedure ConfirmRemoveCamera(Index: Integer; AfterRemove: TProc);
-    procedure ListExport(Sender: TObject);
+    procedure ListExport(Sender: TObject; Index: Integer);
     procedure ListImport(Sender: TObject);
     procedure ImportBack(Sender: TObject);
     procedure ImportPaste(Sender: TObject);
@@ -191,7 +192,7 @@ begin
   FFrameList.OnPlayCamera := ListPlay;
   FFrameList.OnEditCamera := ListEdit;
   FFrameList.OnDeleteCamera := ListDelete;
-  FFrameList.OnExport := ListExport;
+  FFrameList.OnExportCamera := ListExport;
   FFrameList.OnImport := ListImport;
 
   FFramePlayer := TFramePlayer.Create(Self);
@@ -287,6 +288,7 @@ begin
   FAppCfg.MaxBlockSamples := 256;
   FAppCfg.MaxBlockDurationMs := 2000;
   FAppCfg.MaxBlockSizeBytes := 1048576;
+  FAppCfg.IndexRegionBytes := VMS_REGION_DEFAULT_BYTES;
 end;
 
 function TForm1.CamerasFilePath: string;
@@ -900,33 +902,41 @@ end;
 // As senhas das câmeras vão no texto, em claro. É o mesmo que já está no
 // cameras.json do aparelho, mas aqui ele sai do aparelho: o aviso é o mínimo
 // devido.
-procedure TForm1.ListExport(Sender: TObject);
+// Exporta UMA câmera, com todos os caminhos dela. O texto sai no mesmo formato
+// do cameras.json (uma lista, aqui de um item só), então a importação do outro
+// lado é a mesma, e o arquivo do aparelho continua sendo o mesmo formato.
+//
+// Uma de cada vez porque é assim que se usa: a câmera nova vai para o aparelho
+// de alguém, e não o cadastro inteiro da casa.
+procedure TForm1.ListExport(Sender: TObject; Index: Integer);
 var
-  Texto: string;
+  Texto, Nome: string;
+  Uma: TArray<TCameraConfigEntry>;
 begin
-  if Length(FCameras) = 0 then
-  begin
-    TDialogService.ShowMessage('Nenhuma c'#$E2'mera cadastrada para exportar.');
-    Exit;
-  end;
-  Texto := CamerasToJson(FCameras);
+  if (Index < 0) or (Index > High(FCameras)) then Exit;
+  Nome := Trim(FCameras[Index].Name);
+  if Nome = '' then Nome := 'c'#$E2'mera';
+  SetLength(Uma, 1);
+  Uma[0] := FCameras[Index];
+  Texto := CamerasToJson(Uma);
   // Pergunta antes: aqui os dados SAEM do aparelho, e vão com as senhas em
   // claro. Depois que o texto entra numa conversa, não volta.
   TDialogService.MessageDialog(
-    Format('Exportar %d c'#$E2'mera(s)?' + sLineBreak + sLineBreak +
-      'O texto leva as SENHAS em claro. Mande s'#$F3' para voc'#$EA' mesmo, e apague' +
-      ' a mensagem depois de importar no outro aparelho.', [Length(FCameras)]),
+    Format('Exportar "%s" com %d caminho(s)?' + sLineBreak + sLineBreak +
+      'O texto leva a SENHA da c'#$E2'mera em claro. Mande s'#$F3' para quem deve ter' +
+      ' acesso a ela, e apague a mensagem depois de importar.',
+      [Nome, Length(FCameras[Index].Endpoints)]),
     TMsgDlgType.mtConfirmation, [TMsgDlgBtn.mbYes, TMsgDlgBtn.mbNo], TMsgDlgBtn.mbNo, 0,
     procedure(const AResult: TModalResult)
     begin
       if AResult <> mrYes then Exit;
-      FLogger.Info('ui', Format('exportando %d camera(s), %d caracteres',
-        [Length(FCameras), Length(Texto)]));
-      if ShareText(Format('C'#$E2'meras do RTSPlayer (%d)', [Length(FCameras)]), Texto) then Exit;
+      FLogger.Info('ui', Format('exportando "%s" (%d caminhos, %d caracteres)',
+        [Nome, Length(Uma[0].Endpoints), Length(Texto)]));
+      if ShareText(Format('C'#$E2'mera %s (RTSPlayer)', [Nome]), Texto) then Exit;
       // Sem bandeja (Windows): a área de transferência faz o mesmo papel.
       if ClipboardSetText(Texto) then
-        TDialogService.ShowMessage(Format('%d c'#$E2'mera(s) copiadas para a '#$E1'rea de' +
-          ' transfer'#$EA'ncia.', [Length(FCameras)]))
+        TDialogService.ShowMessage(Format('"%s" copiada para a '#$E1'rea de' +
+          ' transfer'#$EA'ncia.', [Nome]))
       else
         TDialogService.ShowMessage('N'#$E3'o consegui exportar neste aparelho.');
     end);

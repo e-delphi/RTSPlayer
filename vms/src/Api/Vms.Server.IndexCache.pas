@@ -5,15 +5,21 @@ unit Vms.Server.IndexCache;
 //
 // Uma consulta de timeline ("que dias têm gravação da isis?") toca dezenas de
 // arquivos. Abrir e reler cada um a cada requisição é o que tornaria a barra do
-// app inutilizável — daí este cache, com duas velocidades:
+// app inutilizável — daí este cache.
 //
-//   arquivo fechado  -> resumo e índice saem do rodapé (VIDX), leitura O(1).
-//                       O resumo fica em cache; o índice é relido quando pedido,
-//                       porque reler o rodapé é barato e guardar 730 KB por
-//                       arquivo não é.
-//   arquivo em gravação -> não tem rodapé: o índice é varrido UMA vez, fica em
-//                       cache, e nas consultas seguintes só os blocos novos são
-//                       varridos (SeedIndex + ExtendIndex no leitor).
+// A regra que manda aqui: **descrever um arquivo não monta índice**. Para a
+// timeline só interessam começo, fim e tamanho, e isso sai de duas leituras
+// curtas (GetInfo). Índice é outra pergunta, feita por outro caminho (GetIndex),
+// e só quem vai TOCAR aquele arquivo a faz. Montar índice em todo arquivo só
+// para saber onde ele começa era o que fazia a primeira consulta depois de subir
+// o servidor demorar — com um arquivo por câmera por hora, são dezenas de
+// índices lidos por consulta, cada um proporcional às horas gravadas.
+//
+//   arquivo fechado     -> rodapé (blocos + duração) e o primeiro bloco.
+//   arquivo em gravação -> as pontas da região de índice viva (VLIX), que fica
+//                          no máximo um commit atrás (~30 s). Sem região (ou
+//                          antes do primeiro commit), varre — mas aí é um
+//                          arquivo recém-aberto, de poucos blocos.
 //
 // Nada de handle aberto entre consultas: no Windows um arquivo com handle vivo
 // não pode ser apagado, e a varredura de retenção precisa poder apagar.
@@ -49,7 +55,10 @@ type
     Bytes: Int64;
     Blocks: Integer;
     Closed: Boolean;       // tem rodapé: a gravação foi encerrada direito
-    Indexed: Boolean;      // o índice veio do rodapé, não de varredura
+    // Tem índice pronto — no rodapé, se fechado, ou na região viva, se ainda
+    // grava. False = descrever este arquivo custou uma varredura, e tocá-lo
+    // vai custar outra.
+    Indexed: Boolean;
     HasVideo: Boolean;
     VideoCodec: TVideoCodec;
     Width: Word;
@@ -74,19 +83,25 @@ type
       Info: TVmsFileInfo;
       StampSize: Int64;
       StampWrite: TDateTime;
-      // só para arquivo em gravação, onde varrer de novo custa caro
-      ScannedIndex: TVmsIndex;
-      ScannedUpTo: Int64;
+      // Índice, quando alguém já pediu o deste arquivo. Guardado só para os
+      // MAX_CACHED_INDEXES arquivos usados mais recentemente: é ~90 KB por
+      // arquivo, e quem toca uma gravação fica no mesmo arquivo por horas.
+      Index: TVmsIndex;
+      IndexUpTo: Int64;     // primeiro offset ainda não varrido
+      IndexStampSize: Int64; // tamanho do arquivo quando o índice foi montado
+      LastUsed: Int64;
     end;
   strict private
     FStorageDir: string;
     FLogger: ILogger;
     FLock: TCriticalSection;
     FFiles: TObjectDictionary<string, TCachedFile>;
+    FUseTick: Int64;          // relógio de uso, para saber qual índice soltar
     function KeyOf(const Path: string): string;
-    function ReadInfo(const Path: string; const PrevIndex: TVmsIndex; PrevUpTo: Int64;
-                      out Info: TVmsFileInfo; out NewIndex: TVmsIndex;
-                      out NewUpTo: Int64): Boolean;
+    function ReadInfo(const Path: string; out Info: TVmsFileInfo): Boolean;
+    // Solta o índice dos arquivos que não são os MAX_CACHED_INDEXES mais
+    // recentes. Chamada sob FLock.
+    procedure TrimIndexes;
     procedure Log(Level: TLogLevel; const Msg: string);
   public
     constructor Create(const AStorageDir: string; const ALogger: ILogger);
@@ -125,6 +140,12 @@ const
   // exatamente no início do último bloco.
   ASSUMED_LAST_BLOCK_MS = 2000;
 
+  // Quantos índices ficam em memória ao mesmo tempo. Um índice de arquivo de 2 h
+  // são ~90 KB; guardar o de todos os arquivos da retenção seriam dezenas de MB
+  // para nada, porque quem está tocando uma gravação fica no mesmo arquivo (e no
+  // seguinte) por horas.
+  MAX_CACHED_INDEXES = 8;
+
 { TVmsIndexCache }
 
 constructor TVmsIndexCache.Create(const AStorageDir: string; const ALogger: ILogger);
@@ -134,6 +155,7 @@ begin
   FLogger := ALogger;
   FLock := TCriticalSection.Create;
   FFiles := TObjectDictionary<string, TCachedFile>.Create([doOwnsValues]);
+  FUseTick := 0;
 end;
 
 destructor TVmsIndexCache.Destroy;
@@ -154,25 +176,24 @@ begin
   Result := LowerCase(Path);
 end;
 
-// Lê o que interessa de um arquivo. PrevIndex/PrevUpTo, quando vêm preenchidos,
-// evitam revarrer o que já se sabe de um arquivo que ainda cresce.
-function TVmsIndexCache.ReadInfo(const Path: string; const PrevIndex: TVmsIndex;
-  PrevUpTo: Int64; out Info: TVmsFileInfo; out NewIndex: TVmsIndex;
-  out NewUpTo: Int64): Boolean;
+// O resumo de um arquivo, sem montar índice. Duas leituras curtas no caso
+// normal; a varredura só sobra para arquivo recém-aberto (poucos blocos) ou
+// gravado por um build sem região de índice.
+function TVmsIndexCache.ReadInfo(const Path: string; out Info: TVmsFileInfo): Boolean;
 var
   Reader: TVmsReader;
   Footer: TVmsFooter;
   Count: Integer;
   Base: string;
   P: Integer;
+  FirstMs, LastMs: Int64;
+  HaveRange: Boolean;
 begin
   Result := False;
   FillChar(Info, SizeOf(Info), 0);
   Info.Path := '';
   Info.Name := '';
   Info.Camera := '';
-  NewIndex := nil;
-  NewUpTo := 0;
 
   try
     Reader := TVmsReader.Create(Path);
@@ -188,13 +209,49 @@ begin
     Reader.Logger := FLogger;
     if not Reader.ReadHeader then Exit;
 
-    // Com o índice da consulta anterior na mão, só os blocos novos são varridos.
-    if (Length(PrevIndex) > 0) and (PrevUpTo > 0) then
-      Reader.SeedIndex(PrevIndex, PrevUpTo);
-    Reader.EnsureIndex;
-    Reader.ExtendIndex;
-    Count := Reader.IndexCount;
-    if Count = 0 then Exit; // arquivo sem bloco algum: não serve para tocar
+    Count := 0;
+    FirstMs := 0;
+    LastMs := 0;
+    HaveRange := False;
+    Info.Closed := Reader.ReadFooter(Footer);
+    // O começo da faixa é o primeiro BLOCO, não o instante de criação do header:
+    // entre abrir o arquivo e o primeiro sample passa a janela de espera do
+    // áudio, e a timeline mostraria gravação onde não há.
+    if Reader.FirstBlockStartMs(FirstMs) then
+    begin
+      HaveRange := True;
+      LastMs := FirstMs;
+    end;
+
+    if Info.Closed and HaveRange then
+    begin
+      // Arquivo fechado: o rodapé já responde tudo. A duração é medida a partir
+      // do header, então o fim sai dali — e não do primeiro bloco.
+      Count := Integer(Footer.TotalBlocks);
+      LastMs := Reader.Header.CreationUnixMs + Footer.TotalDurationMs;
+      if LastMs < FirstMs then LastMs := FirstMs;
+      Info.Indexed := True;
+    end
+    else if HaveRange and Reader.RegionSummary(Count, FirstMs, LastMs) then
+      // Arquivo em gravação com região: as pontas do que ela já commitou.
+      Info.Indexed := True
+    else
+    begin
+      // Sem rodapé e sem região commitada: não há como saber onde termina sem
+      // olhar bloco a bloco. Acontece com arquivo recém-aberto (é curto) e com
+      // gravação de build antigo (vai embora com a retenção).
+      Count := Reader.EnsureIndex;
+      Info.Indexed := False;
+      if Count > 0 then
+      begin
+        HaveRange := True;
+        FirstMs := Reader.Index[0].StartUnixMs;
+        LastMs := Reader.Index[Count - 1].StartUnixMs;
+      end;
+    end;
+
+    if (not HaveRange) or (Count = 0) then
+      Exit; // arquivo sem bloco algum: não serve para tocar
 
     Info.Path := Path;
     Base := ExtractFileName(Path);
@@ -213,18 +270,11 @@ begin
     end;
 
     Info.Blocks := Count;
-    Info.StartMs := Reader.Index[0].StartUnixMs;
-    Info.EndMs := Reader.Index[Count - 1].StartUnixMs + ASSUMED_LAST_BLOCK_MS;
-    Info.Indexed := Reader.IndexFromFooter;
-    Info.Closed := Reader.ReadFooter(Footer);
-    if Info.Closed and (Footer.TotalDurationMs > 0) then
-    begin
-      // O rodapé mede do header ao último bloco; o fim da faixa é isso mais a
-      // duração do último bloco, que ninguém guarda — daí a estimativa.
-      Info.EndMs := Reader.Header.CreationUnixMs + Footer.TotalDurationMs + ASSUMED_LAST_BLOCK_MS;
-      if Info.EndMs < Info.StartMs then
-        Info.EndMs := Info.StartMs;
-    end;
+    Info.StartMs := FirstMs;
+    // A duração do último bloco ninguém guarda; daí a estimativa no fim.
+    Info.EndMs := LastMs + ASSUMED_LAST_BLOCK_MS;
+    if Info.EndMs < Info.StartMs then
+      Info.EndMs := Info.StartMs;
     Info.DurationMs := Info.EndMs - Info.StartMs;
 
     Info.HasVideo := Reader.Header.VideoPresent;
@@ -241,13 +291,6 @@ begin
     except
       Info.Bytes := 0;
     end;
-
-    // Só vale a pena guardar o índice varrido: o do rodapé se relê num piscar.
-    if not Reader.IndexFromFooter then
-    begin
-      NewIndex := Copy(Reader.Index);
-      NewUpTo := Reader.ScannedUpTo;
-    end;
     Result := True;
   finally
     Reader.Free;
@@ -260,10 +303,6 @@ var
   Entry: TCachedFile;
   Size: Int64;
   Written: TDateTime;
-  PrevIndex: TVmsIndex;
-  PrevUpTo: Int64;
-  NewIndex: TVmsIndex;
-  NewUpTo: Int64;
   Fresh: TVmsFileInfo;
 begin
   Result := False;
@@ -285,8 +324,6 @@ begin
   end;
 
   Key := KeyOf(Path);
-  PrevIndex := nil;
-  PrevUpTo := 0;
   FLock.Enter;
   try
     if FFiles.TryGetValue(Key, Entry) then
@@ -297,19 +334,13 @@ begin
         Info := Entry.Info;
         Exit(True);
       end;
-      // Cresceu: aproveita o índice já varrido e continua dali.
-      if Size > Entry.StampSize then
-      begin
-        PrevIndex := Entry.ScannedIndex;
-        PrevUpTo := Entry.ScannedUpTo;
-      end;
     end;
   finally
     FLock.Leave;
   end;
 
   // Fora do lock: I/O não pode segurar as outras conexões.
-  if not ReadInfo(Path, PrevIndex, PrevUpTo, Fresh, NewIndex, NewUpTo) then Exit;
+  if not ReadInfo(Path, Fresh) then Exit;
 
   FLock.Enter;
   try
@@ -321,8 +352,6 @@ begin
     Entry.Info := Fresh;
     Entry.StampSize := Size;
     Entry.StampWrite := Written;
-    Entry.ScannedIndex := NewIndex;
-    Entry.ScannedUpTo := NewUpTo;
   finally
     FLock.Leave;
   end;
@@ -331,43 +360,123 @@ begin
   Result := True;
 end;
 
+// O índice de blocos de um arquivo — a pergunta cara, feita só por quem vai
+// tocar. Fica em cache para os poucos arquivos em uso; o arquivo que ainda
+// cresce continua de onde parou (SeedIndex + ExtendIndex), sem revarrer.
 function TVmsIndexCache.GetIndex(const Path: string; out Index: TVmsIndex): Boolean;
 var
   Info: TVmsFileInfo;
   Key: string;
   Entry: TCachedFile;
   Reader: TVmsReader;
+  Size: Int64;
+  PrevIndex: TVmsIndex;
+  PrevUpTo, NewUpTo: Int64;
 begin
   Index := nil;
-  // Passa pelo GetInfo primeiro: é ele que revalida o cache e estende o índice
-  // do arquivo que ainda cresce.
-  if not GetInfo(Path, Info) then Exit(False);
+  Result := False;
+  // Passa pelo GetInfo primeiro: é ele que revalida o cache e diz se o arquivo
+  // ainda está lá.
+  if not GetInfo(Path, Info) then Exit;
+  // O tamanho de agora, não o que o resumo trouxe: é ele que diz se o índice em
+  // cache ainda descreve o arquivo inteiro.
+  try
+    Size := TFile.GetSize(Path);
+  except
+    Exit;
+  end;
+  if Size <= 0 then Exit;
 
   Key := KeyOf(Path);
+  PrevIndex := nil;
+  PrevUpTo := 0;
   FLock.Enter;
   try
-    if FFiles.TryGetValue(Key, Entry) and (Length(Entry.ScannedIndex) > 0) then
+    if FFiles.TryGetValue(Key, Entry) and (Length(Entry.Index) > 0) then
     begin
-      Index := Entry.ScannedIndex;
-      Exit(True);
+      Inc(FUseTick);
+      Entry.LastUsed := FUseTick;
+      // Do mesmo tamanho de quando foi montado: nada mudou, serve como está.
+      if Entry.IndexStampSize = Size then
+      begin
+        Index := Entry.Index;
+        Exit(True);
+      end;
+      // Cresceu: continua dali em vez de refazer.
+      if (Size > Entry.IndexStampSize) and (Entry.IndexUpTo > 0) then
+      begin
+        PrevIndex := Entry.Index;
+        PrevUpTo := Entry.IndexUpTo;
+      end;
     end;
   finally
     FLock.Leave;
   end;
 
-  // Arquivo fechado: o índice está no rodapé, e reler custa uma leitura.
+  // Fora do lock: I/O não segura as outras conexões.
   try
     Reader := TVmsReader.Create(Path);
   except
-    Exit(False);
+    Exit;
   end;
   try
-    if not Reader.ReadHeader then Exit(False);
-    if Reader.EnsureIndex = 0 then Exit(False);
+    if not Reader.ReadHeader then Exit;
+    if (Length(PrevIndex) > 0) and (PrevUpTo > 0) then
+      Reader.SeedIndex(PrevIndex, PrevUpTo);
+    Reader.EnsureIndex;
+    Reader.ExtendIndex;
+    if Reader.IndexCount = 0 then Exit;
     Index := Copy(Reader.Index);
-    Result := True;
+    NewUpTo := Reader.ScannedUpTo;
   finally
     Reader.Free;
+  end;
+
+  FLock.Enter;
+  try
+    if FFiles.TryGetValue(Key, Entry) then
+    begin
+      Inc(FUseTick);
+      Entry.Index := Index;
+      Entry.IndexUpTo := NewUpTo;
+      Entry.IndexStampSize := Size;
+      Entry.LastUsed := FUseTick;
+      TrimIndexes;
+    end;
+  finally
+    FLock.Leave;
+  end;
+  Result := True;
+end;
+
+procedure TVmsIndexCache.TrimIndexes;
+var
+  Pair: TPair<string, TCachedFile>;
+  Held: TList<TCachedFile>;
+  I: Integer;
+begin
+  Held := TList<TCachedFile>.Create;
+  try
+    for Pair in FFiles do
+      if Length(Pair.Value.Index) > 0 then
+        Held.Add(Pair.Value);
+    if Held.Count <= MAX_CACHED_INDEXES then Exit;
+    Held.Sort(TComparer<TCachedFile>.Construct(
+      function(const A, B: TCachedFile): Integer
+      begin
+        // mais recente primeiro
+        if A.LastUsed > B.LastUsed then Result := -1
+        else if A.LastUsed < B.LastUsed then Result := 1
+        else Result := 0;
+      end));
+    for I := MAX_CACHED_INDEXES to Held.Count - 1 do
+    begin
+      Held[I].Index := nil;
+      Held[I].IndexUpTo := 0;
+      Held[I].IndexStampSize := 0;
+    end;
+  finally
+    Held.Free;
   end;
 end;
 

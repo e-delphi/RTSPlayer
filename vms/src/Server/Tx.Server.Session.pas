@@ -987,7 +987,12 @@ var
 begin
   Result := False;
   if (not FLiveMode) or (FCameraName = '') then Exit;
-  if (FClock.MonotonicMs - FLastBlockMs) < LIVE_STALL_MS then Exit;
+  // Arquivo que MOSTROU o rodapé acabou de verdade — é o caso da gravação que
+  // rodou de arquivo (região de índice cheia). Aí não há o que esperar: esperar
+  // seria congelar a imagem por LIVE_STALL_MS a cada troca. Sem rodapé, o fim
+  // pode ser só o instante entre dois blocos, e aí vale a espera.
+  if (not FReader.AtClosedEnd) and
+     ((FClock.MonotonicMs - FLastBlockMs) < LIVE_STALL_MS) then Exit;
   Path := FindMostRecentVmsForCamera(FRecordingsDir, FCameraName);
   if (Path = '') or SameText(Path, FVmsFile) then Exit;
   // Já recusado antes: não reabre nem repete o aviso a cada tentativa.

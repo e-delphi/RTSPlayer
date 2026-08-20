@@ -162,6 +162,193 @@ def teste_indice(pasta):
           len(list(vmslib.iter_blocks(dados, h))) == 5)
 
 
+def _varre_cauda(dados, de):
+    """Imita o ScanBlocksFrom do TVmsReader: cabeçalho + índice de cada bloco,
+    sem tocar no payload. Devolve as entradas de índice que ele produziria."""
+    saida = []
+    o = de
+    while o + vmslib.BLOCK_HEADER_SIZE <= len(dados):
+        if dados[o:o + 4] != vmslib.MAGIC_BLOCK:
+            break
+        size = struct.unpack_from('<I', dados, o + 4)[0]
+        if size < vmslib.BLOCK_HEADER_SIZE or o + size > len(dados):
+            break
+        start = struct.unpack_from('<q', dados, o + 12)[0]
+        count = struct.unpack_from('<I', dados, o + 20)[0]
+        isize = struct.unpack_from('<I', dados, o + 24)[0]
+        key = False
+        base = o + vmslib.BLOCK_HEADER_SIZE
+        for i in range(count):
+            b = base + i * vmslib.INDEX_ENTRY_SIZE
+            if b + 1 >= base + isize:
+                break
+            if dados[b] == 0 and (dados[b + 1] & 1):
+                key = True
+                break
+        saida.append((o, start, 1 if key else 0))
+        o += size
+    return saida
+
+
+def _indice_do_leitor(dados):
+    """O índice que o EnsureIndex monta num arquivo SEM rodapé: o que a região
+    commitou, mais a varredura da cauda. É este o caminho que substituiu a
+    varredura do arquivo inteiro."""
+    h = vmslib.read_header(dados)
+    regiao = vmslib.read_region(dados, h)
+    if not regiao or not regiao[2]:
+        return _varre_cauda(dados, vmslib.first_block_offset(dados, h)), 'varredura inteira'
+    ent = [(e.offset, e.start_unix_ms, 1 if e.keyframe else 0) for e in regiao[2]]
+    ultimo = ent[-1][0]
+    size = struct.unpack_from('<I', dados, ultimo + 4)[0]
+    cauda = _varre_cauda(dados, ultimo + size)
+    return ent + cauda, 'região(%d) + cauda(%d)' % (len(ent), len(cauda))
+
+
+def teste_regiao_de_indice(pasta):
+    print('índice vivo (VLIX): região reservada depois do header')
+    p = gerar(pasta, 'reg.vms', blocos=60, regiao_kb=4)
+    dados = open(p, 'rb').read()
+    h = vmslib.read_header(dados)
+    regiao = vmslib.read_region(dados, h)
+    check('região achada logo depois do header', regiao is not None)
+    check('capacidade combina com o tamanho reservado',
+          regiao[0] == 4096 and regiao[1] == (4096 - vmslib.REGION_HEADER_SIZE) // 17)
+    blocos = list(vmslib.iter_blocks(dados, h))
+    check('a mídia começa DEPOIS da região',
+          blocos[0].offset == h.size + regiao[0], 'primeiro bloco em %d' % blocos[0].offset)
+    check('os 60 blocos continuam sendo lidos em sequência', len(blocos) == 60)
+    check('região fechada descreve o arquivo inteiro', len(regiao[2]) == 60)
+    vidx = vmslib.read_block_index(dados)
+    check('região e VIDX do rodapé dizem a mesma coisa',
+          [(e.offset, e.start_unix_ms, e.keyframe) for e in vidx] ==
+          [(e.offset, e.start_unix_ms, e.keyframe) for e in regiao[2]])
+    check('região confere com os blocos do arquivo',
+          vmslib.check_index(blocos, regiao[2]) == [])
+
+    # o caso que motivou tudo: arquivo em gravação, sem rodapé
+    p = gerar(pasta, 'reg_aberto.vms', blocos=60, regiao_kb=4, truncado=True)
+    dados = open(p, 'rb').read()
+    h = vmslib.read_header(dados)
+    inteira = _varre_cauda(dados, vmslib.first_block_offset(dados, h))
+    obtido, como = _indice_do_leitor(dados)
+    check('gravação em curso: sem rodapé', vmslib.read_footer(dados) is None)
+    check('região + cauda == varredura inteira', obtido == inteira, como)
+    check('e a região cobriu a maior parte sozinha',
+          0 < len(vmslib.read_region(dados, h)[2]) < len(inteira))
+
+    # região cheia: para de commitar na capacidade e ninguém perde bloco
+    p = gerar(pasta, 'reg_cheia.vms', blocos=80, regiao_kb=1)   # 1 KB = 57 entradas
+    dados = open(p, 'rb').read()
+    h = vmslib.read_header(dados)
+    regiao = vmslib.read_region(dados, h)
+    check('região cheia commita até a capacidade e para',
+          len(regiao[2]) == regiao[1], '%d de %d' % (len(regiao[2]), regiao[1]))
+    obtido, como = _indice_do_leitor(dados)
+    check('estourando a região, a cauda cobre o resto',
+          obtido == _varre_cauda(dados, vmslib.first_block_offset(dados, h)), como)
+
+    # queda no meio do commit: o slot novo fica quebrado, o anterior salva
+    d = bytearray(open(gerar(pasta, 'reg_torto.vms', blocos=60, regiao_kb=4,
+                             truncado=True), 'rb').read())
+    h = vmslib.read_header(bytes(d))
+    antes = len(vmslib.read_region(bytes(d), h)[2])
+    geracoes = [struct.unpack_from('<I', d, h.size + o + 4)[0]
+                for o in vmslib.REGION_COMMIT_OFS]
+    novo = vmslib.REGION_COMMIT_OFS[0 if geracoes[0] > geracoes[1] else 1]
+    d[h.size + novo + 8] ^= 0xFF                 # estraga o crc do slot valendo
+    depois = vmslib.read_region(bytes(d), h)[2]
+    check('slot de commit quebrado cai no anterior', 0 < len(depois) < antes,
+          '%d -> %d entradas' % (antes, len(depois)))
+    obtido, como = _indice_do_leitor(bytes(d))
+    check('e o índice final continua igual à varredura inteira',
+          obtido == _varre_cauda(bytes(d), vmslib.first_block_offset(bytes(d), h)), como)
+
+    # fragmento servido pela API: header + blocos, sem região
+    p = gerar(pasta, 'reg_frag.vms', blocos=4)
+    dados = open(p, 'rb').read()
+    h = vmslib.read_header(dados)
+    check('fragmento da API não tem região', vmslib.read_region(dados, h) is None)
+    check('e nele a mídia começa em HeaderSize',
+          vmslib.first_block_offset(dados, h) == h.size)
+    check('fragmento sem região continua sendo lido',
+          len(list(vmslib.iter_blocks(dados, h))) == 4)
+
+
+ASSUMIDO_MS = 2000      # mesma estimativa do servidor para o último bloco
+
+
+def _resumo_caro(dados):
+    """Como o inventário era feito: monta o índice e olha as pontas."""
+    h = vmslib.read_header(dados)
+    rodape = vmslib.read_footer(dados)
+    entradas = vmslib.read_block_index(dados, rodape) if rodape else None
+    if entradas is None:
+        entradas = [vmslib.IndexEntry(o, ms, f)
+                    for o, ms, f in _indice_do_leitor(dados)[0]]
+    if not entradas:
+        return None
+    fim = entradas[-1].start_unix_ms + ASSUMIDO_MS
+    if rodape and rodape.duration_ms > 0:
+        fim = h.creation_unix_ms + rodape.duration_ms + ASSUMIDO_MS
+    return dict(inicio=entradas[0].start_unix_ms, fim=fim, blocos=len(entradas))
+
+
+def _resumo_barato(dados):
+    """Como o inventário passou a ser feito: rodapé ou região, sem índice."""
+    h = vmslib.read_header(dados)
+    o = vmslib.first_block_offset(dados, h)
+    if dados[o:o + 4] != vmslib.MAGIC_BLOCK:
+        return None
+    inicio = struct.unpack_from('<q', dados, o + 12)[0]     # 1 leitura curta
+    rodape = vmslib.read_footer(dados)
+    if rodape is not None:
+        return dict(inicio=inicio,
+                    fim=h.creation_unix_ms + rodape.duration_ms + ASSUMIDO_MS,
+                    blocos=rodape.total_blocks)
+    regiao = vmslib.read_region(dados, h)
+    if regiao and regiao[2]:
+        return dict(inicio=regiao[2][0].start_unix_ms,
+                    fim=regiao[2][-1].start_unix_ms + ASSUMIDO_MS,
+                    blocos=len(regiao[2]))
+    return None     # cai na varredura, como o ReadInfo faz
+
+
+def teste_resumo_do_inventario(pasta):
+    print('resumo de arquivo sem montar índice')
+    # fechado: o resumo barato tem de bater EXATAMENTE com o caro
+    dados = open(gerar(pasta, 'inv_fechado.vms', blocos=40, regiao_kb=4), 'rb').read()
+    caro, barato = _resumo_caro(dados), _resumo_barato(dados)
+    check('arquivo fechado: mesmo início', caro['inicio'] == barato['inicio'],
+          '%d vs %d' % (caro['inicio'], barato['inicio']))
+    check('arquivo fechado: mesmo fim', caro['fim'] == barato['fim'],
+          '%d vs %d' % (caro['fim'], barato['fim']))
+    check('arquivo fechado: mesma contagem de blocos',
+          caro['blocos'] == barato['blocos'])
+
+    # em gravação: início exato; fim atrasado no máximo um commit, nunca à frente
+    dados = open(gerar(pasta, 'inv_aberto.vms', blocos=60, regiao_kb=4,
+                       truncado=True), 'rb').read()
+    caro, barato = _resumo_caro(dados), _resumo_barato(dados)
+    check('em gravação: início exato', caro['inicio'] == barato['inicio'])
+    check('em gravação: fim nunca passa do real', barato['fim'] <= caro['fim'])
+    atraso = caro['fim'] - barato['fim']
+    check('em gravação: fim atrasado no máximo um commit',
+          atraso <= genvms.REGION_COMMIT_EVERY * ASSUMIDO_MS,
+          '%d ms de atraso' % atraso)
+    check('em gravação: contagem nunca passa do real',
+          0 < barato['blocos'] <= caro['blocos'])
+
+    # arquivo recém-aberto, antes do primeiro commit: o resumo barato desiste e
+    # quem chamou varre — que é barato, porque o arquivo é curto
+    dados = open(gerar(pasta, 'inv_novo.vms', blocos=3, regiao_kb=4,
+                       truncado=True), 'rb').read()
+    check('antes do primeiro commit, o resumo barato devolve nada',
+          _resumo_barato(dados) is None)
+    check('e a varredura ainda descreve o arquivo',
+          _resumo_caro(dados)['blocos'] == 2)
+
+
 def teste_crc(pasta):
     print('crc de bloco')
     p = gerar(pasta, 'crc.vms', blocos=4)
@@ -268,6 +455,8 @@ def main():
         teste_formato(pasta)
         teste_ancora_nao_desloca_payload(pasta)
         teste_indice(pasta)
+        teste_regiao_de_indice(pasta)
+        teste_resumo_do_inventario(pasta)
         teste_crc(pasta)
         teste_segmentos(pasta)
         teste_fragmento(pasta)

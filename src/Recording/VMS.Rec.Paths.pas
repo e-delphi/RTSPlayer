@@ -35,6 +35,12 @@ function CameraDir(const StorageDir, Camera: string): string;
 // antes de abrir o arquivo.
 function EnsureCameraDir(const StorageDir, Camera: string): string;
 
+// Caminho ainda livre para uma gravação nova. O padrão de nome tem resolução de
+// segundo, e a gravação roda de arquivo quando a região de índice enche — duas
+// trocas no mesmo segundo dariam o mesmo nome, e o writer abre com fmCreate, ou
+// seja, por cima. Isto apagaria a gravação que acabou de fechar.
+function UniqueRecordingPath(const Path: string): string;
+
 implementation
 
 function CameraFolderName(const Camera: string): string;
@@ -74,6 +80,26 @@ begin
   Result := CameraDir(StorageDir, Camera);
   if not DirectoryExists(Result) then
     ForceDirectories(Result);
+end;
+
+function UniqueRecordingPath(const Path: string): string;
+var
+  Dir, Base, Ext: string;
+  I: Integer;
+begin
+  Result := Path;
+  if not FileExists(Result) then Exit;
+  Dir := ExtractFilePath(Path);
+  Ext := ExtractFileExt(Path);
+  Base := ChangeFileExt(ExtractFileName(Path), '');
+  for I := 2 to 999 do
+  begin
+    Result := Dir + Base + '-' + IntToStr(I) + Ext;
+    if not FileExists(Result) then Exit;
+  end;
+  // 999 arquivos no mesmo segundo é outro problema; melhor devolver algo que
+  // não existe do que sobrescrever gravação.
+  Result := Dir + Base + '-' + IntToStr(Random(1000000)) + Ext;
 end;
 
 end.

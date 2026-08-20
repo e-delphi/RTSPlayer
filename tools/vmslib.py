@@ -12,6 +12,9 @@ descrito em VMS.Rec.Format.pas / VMS.Rec.Writer.pas — se mudar lá, muda aqui.
           | sample_count(4) | index_size(4) | index | payload | crc32(4)
   índice: track_id(1) flags(1) pts(8) payload_offset(4) payload_size(4)
   BANC:   'BANC' | video_anchor_ms(8) | audio_anchor_ms(8)   [no fim do índice]
+  VLIX:   'VLIX' | region_size(4) | capacity(4)
+          | slot A(count(4) gen(4) crc(4)) | slot B(idem) | reserva(4)
+          | capacity × (offset(8) start_unix_ms(8) flags(1))
   VIDX:   'VIDX' | chunk_size(4) | count(4)
           | count × (offset(8) start_unix_ms(8) flags(1)) | crc32(4)
   VEOF:   'VEOF' | total_blocks(4) | duration_ms(8) | last_block_offset(8)
@@ -22,8 +25,17 @@ keyframe, 1 = início de quadro, 2 = fim de quadro. O CRC é o CRC-32 padrão
 (polinômio 0xEDB88320), igual ao do zlib.
 
 O VIDX é o índice tempo → posição, escrito quando a gravação fecha; nele, flags
-bit 0 = o bloco contém keyframe de vídeo. O formato está em desenvolvimento e não
-carrega compatibilidade: existe um layout só, e gravação de layout antigo se apaga.
+bit 0 = o bloco contém keyframe de vídeo.
+
+O VLIX é o MESMO índice, mas do arquivo ainda em gravação: uma região reservada
+entre o header e o primeiro bloco, atualizada no lugar a cada punhado de blocos.
+Vale o slot de commit de geração mais alta cujo crc bate (crc sobre as `count`
+primeiras entradas). Quando ela enche, a gravação roda de arquivo — é ela que
+define o tamanho do segmento. Os blocos começam DEPOIS dela: quem percorre o
+arquivo em sequência tem que somar region_size ao header (ver first_block_offset).
+
+O formato está em desenvolvimento e não carrega compatibilidade: existe um layout
+só, e gravação de layout antigo se apaga.
 """
 
 import struct
@@ -42,6 +54,7 @@ MAGIC_BLOCK = b'BLK\x01'
 MAGIC_FOOTER = b'VEOF'
 MAGIC_INDEX = b'VIDX'
 MAGIC_ANCHOR = b'BANC'
+MAGIC_REGION = b'VLIX'
 
 # Versão única do formato: o Delphi recusa arquivo com outra (ver ReadHeader).
 FORMAT_VERSION = 1
@@ -57,6 +70,8 @@ BLOCK_INDEX_ENTRY_SIZE = 17    # entrada do VIDX, uma por bloco
 INDEX_HEADER_SIZE = 12
 ANCHOR_SIZE = 20            # 'BANC' + âncora de vídeo(8) + de áudio(8)
 FOOTER_SIZE = 40
+REGION_HEADER_SIZE = 40     # cabeçalho do VLIX, antes das entradas
+REGION_COMMIT_OFS = (12, 24)  # os dois slots de commit, dentro do cabeçalho
 
 
 class VmsError(Exception):
@@ -161,10 +176,59 @@ def read_header(data):
     return Header(version, size, creation, uri, v, a, crc_ok)
 
 
+def read_region(data, header):
+    """(region_size, capacity, entradas) do VLIX, ou None se o arquivo não tem
+    região — é o caso do fragmento servido pela API, que leva só header+blocos.
+
+    Devolve as entradas do slot de commit válido mais novo; região reservada e
+    ainda sem commit devolve lista vazia."""
+    o = header.size
+    if o + REGION_HEADER_SIZE > len(data) or data[o:o + 4] != MAGIC_REGION:
+        return None
+    size = _u32(data, o + 4)
+    capacity = _u32(data, o + 8)
+    if size <= REGION_HEADER_SIZE or o + size > len(data):
+        return None
+    if capacity != (size - REGION_HEADER_SIZE) // BLOCK_INDEX_ENTRY_SIZE:
+        return None
+    base = o + REGION_HEADER_SIZE
+    best = None
+    for slot in REGION_COMMIT_OFS:
+        count = _u32(data, o + slot)
+        gen = _u32(data, o + slot + 4)
+        crc = _u32(data, o + slot + 8)
+        if count > capacity:
+            continue
+        if best is not None and gen <= best[0]:
+            continue
+        if zlib.crc32(data[base:base + count * BLOCK_INDEX_ENTRY_SIZE]) != crc:
+            continue
+        best = (gen, count)
+    if best is None:
+        raise VmsError('VLIX sem slot de commit válido em %d' % o)
+    out = []
+    p = base
+    for _ in range(best[1]):
+        out.append(IndexEntry(_u64(data, p), _i64(data, p + 8), data[p + 16]))
+        p += BLOCK_INDEX_ENTRY_SIZE
+    return size, capacity, out
+
+
+def first_block_offset(data, header):
+    """Onde a mídia começa: depois do header e, quando existe, da região de
+    índice viva."""
+    o = header.size
+    if o + REGION_HEADER_SIZE <= len(data) and data[o:o + 4] == MAGIC_REGION:
+        size = _u32(data, o + 4)
+        if REGION_HEADER_SIZE < size <= len(data) - o:
+            return o + size
+    return o
+
+
 def iter_blocks(data, header, with_data=True):
     """Percorre os blocos. Para no rodapé, no primeiro magic inválido ou num
     bloco cortado — é o que acontece com arquivo ainda sendo gravado."""
-    o = header.size
+    o = first_block_offset(data, header)
     while o + BLOCK_HEADER_SIZE <= len(data):
         if data[o:o + 4] == MAGIC_FOOTER:
             break

@@ -318,7 +318,12 @@ begin
       O.AddPair('tailscale', TJSONBool.Create(Cams[I].UsesTailscale));
       Arr.AddElement(O);
     end;
-    Result := Arr.ToJSON;
+    // Format e não ToJSON: o ToJSON devolve TUDO numa linha só, e o JSON não tem
+    // um espaço sequer — 2,6 KB sem ponto de quebra. Isso travava o TMemo da tela
+    // de importar no Android (quebrar uma "palavra" de milhares de caracteres é
+    // patológico no layout de texto do FMX) e, de quebra, ficava ilegível na
+    // conversa do WhatsApp. Indentado, cada linha é curta.
+    Result := Arr.Format(2);
   finally
     Arr.Free;
   end;

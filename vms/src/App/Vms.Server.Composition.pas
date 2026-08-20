@@ -80,7 +80,8 @@ begin
         Sink := TRecordingSink.Create(Cam.Name, App.StorageDir, Cam.FilenamePattern,
                                       Cam.Url, Cam.RecordAudio,
                                       App.MaxBlockSamples, App.MaxBlockDurationMs,
-                                      App.MaxBlockSizeBytes, Logger, Clock);
+                                      App.MaxBlockSizeBytes, Logger, Clock,
+                                      1500, App.IndexRegionBytes);
         Logger.Info('composition', Format('Camera "%s": dvrip, gravando via sink', [Cam.Name]));
       end
       else

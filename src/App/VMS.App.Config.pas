@@ -10,6 +10,7 @@ uses
   System.Generics.Collections,
   VMS.Domain.Types,
   VMS.Domain.Logging,
+  VMS.Rec.Format,
   VMS.Rtsp.Client,
   VMS.Domain.Session;
 
@@ -57,6 +58,11 @@ type
     MaxBlockSamples: Integer;
     MaxBlockDurationMs: Integer;
     MaxBlockSizeBytes: Integer;
+    // Região de índice reservada em cada .vms, em bytes. Cabe uma entrada de 17
+    // bytes por bloco, e cheia é o que faz a gravação rodar de arquivo — ou
+    // seja, é este número que decide o tamanho do segmento e quantos arquivos
+    // ficam na pasta da câmera. 64 KB = ~2 h a 2 s por bloco.
+    IndexRegionBytes: Integer;
     Cameras: TArray<TCameraConfigEntry>;
   end;
 
@@ -369,12 +375,17 @@ begin
       FConfig.MaxBlockSamples := GetJsonInt(BlockObj, 'maxSamples', 256);
       FConfig.MaxBlockDurationMs := GetJsonInt(BlockObj, 'maxDurationMs', 2000);
       FConfig.MaxBlockSizeBytes := GetJsonInt(BlockObj, 'maxSizeBytes', 1048576);
+      // Em KB na config: byte a byte não diz nada a quem lê o arquivo, e o
+      // número interessante ("quanto dura um segmento") sai de KB direto.
+      FConfig.IndexRegionBytes := NormalizeRegionBytes(
+        GetJsonInt(BlockObj, 'indexRegionKB', VMS_REGION_DEFAULT_BYTES div 1024) * 1024);
     end
     else
     begin
       FConfig.MaxBlockSamples := 256;
       FConfig.MaxBlockDurationMs := 2000;
       FConfig.MaxBlockSizeBytes := 1048576;
+      FConfig.IndexRegionBytes := VMS_REGION_DEFAULT_BYTES;
     end;
 
     Arr := GetJsonArray(Obj, 'cameras');

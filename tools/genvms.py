@@ -15,6 +15,10 @@ MAGIC_FILE = b'VMS1'
 MAGIC_BLOCK = b'BLK\x01'
 MAGIC_FOOTER = b'VEOF'
 MAGIC_INDEX = b'VIDX'
+MAGIC_REGION = b'VLIX'
+REGION_HEADER_SIZE = 40
+REGION_COMMIT_OFS = (12, 24)
+REGION_COMMIT_EVERY = 16     # mesmo passo do TFileRecordingWriter
 MAGIC_ANCHOR = b'BANC'
 
 u16 = lambda v: struct.pack('<H', v)
@@ -61,6 +65,33 @@ def build_block(seq, start_ms, samples, anchors=None):
     return body + u32(zlib.crc32(body))
 
 
+def reserve_region(region_bytes):
+    """A região de índice viva, zerada — os dois slots de commit nascem em
+    (0 entradas, geração 0), que é 'ainda não commitei nada'."""
+    capacity = (region_bytes - REGION_HEADER_SIZE) // 17
+    head = MAGIC_REGION + u32(region_bytes) + u32(capacity)
+    return bytearray(head + bytes(region_bytes - len(head))), capacity
+
+
+def commit_region(out, region_at, capacity, entries, committed, gen, slot, crc):
+    """Grava na região as entradas que faltam e commita, como o writer faz: as
+    entradas primeiro, o slot depois, alternando os slots."""
+    new = min(len(entries), capacity)
+    if new <= committed:
+        return committed, gen, slot, crc
+    blob = b''
+    for off, ms, flags in entries[committed:new]:
+        blob += i64(off) + i64(ms) + bytes([flags])
+    at = region_at + REGION_HEADER_SIZE + committed * 17
+    out[at:at + len(blob)] = blob
+    crc = zlib.crc32(blob, crc)
+    gen += 1
+    rec = u32(new) + u32(gen) + u32(crc)
+    at = region_at + REGION_COMMIT_OFS[slot]
+    out[at:at + len(rec)] = rec
+    return new, gen, (slot + 1) % 2, crc
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('saida')
@@ -74,10 +105,19 @@ def main():
                     help='grava blocos sem a âncora A/V (bloco degenerado)')
     ap.add_argument('--defasagem', type=int, default=0,
                     help='ms entre o início do vídeo e o do áudio dentro do bloco')
+    ap.add_argument('--regiao-kb', type=int, default=0,
+                    help='reserva região de índice viva (VLIX) deste tamanho; '
+                         '0 = arquivo sem região, como os fragmentos da API')
     args = ap.parse_args()
 
     creation = args.inicio
     out = bytearray(build_header(creation))
+    region_at = capacity = 0
+    committed = gen = slot = crc = 0
+    if args.regiao_kb > 0:
+        region_at = len(out)
+        region, capacity = reserve_region(args.regiao_kb * 1024)
+        out += region
 
     entries = []          # (offset, start_ms, flags)
     start_ms = creation
@@ -100,6 +140,11 @@ def main():
         anchors = None if args.sem_ancora else (start_ms, start_ms + args.defasagem)
         out += build_block(b, start_ms, samples, anchors)
         start_ms += 2000
+        # Commit a cada REGION_COMMIT_EVERY blocos: o fim do arquivo fica FORA da
+        # região de propósito, que é o estado real de uma gravação em curso.
+        if capacity and (len(entries) - committed >= REGION_COMMIT_EVERY):
+            committed, gen, slot, crc = commit_region(
+                out, region_at, capacity, entries, committed, gen, slot, crc)
 
     if args.truncado:
         del out[-40:]
@@ -108,6 +153,11 @@ def main():
         print('%s: %d bytes, %d blocos (último cortado, sem rodapé)'
               % (args.saida, len(out), args.blocos))
         return 0
+
+    # Fechando o arquivo, a região passa a descrever tudo (é o que o Close faz).
+    if capacity:
+        committed, gen, slot, crc = commit_region(
+            out, region_at, capacity, entries, committed, gen, slot, crc)
 
     index_offset = 0
     if not args.sem_indice:

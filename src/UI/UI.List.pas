@@ -21,8 +21,6 @@ type
     pathAdd: TPath;
     btnEdit: TRectangle;
     lblEditMode: TLabel;
-    btnExport: TRectangle;
-    pathExport: TPath;
     btnImport: TRectangle;
     pathImport: TPath;
     sbCameras: TVertScrollBox;
@@ -35,14 +33,14 @@ type
     FOnPlay: TCamIndexEvent;
     FOnEdit: TCamIndexEvent;
     FOnDelete: TCamIndexEvent;
-    FOnExport: TNotifyEvent;
+    FOnExport: TCamIndexEvent;
     FOnImport: TNotifyEvent;
     procedure ClearCards;
     procedure RefreshList;
     procedure btnAddClick(Sender: TObject);
     procedure btnEditClick(Sender: TObject);
-    procedure btnExportClick(Sender: TObject);
     procedure btnImportClick(Sender: TObject);
+    procedure CardExportClick(Sender: TObject);
     procedure CardClick(Sender: TObject);
     procedure CardDeleteClick(Sender: TObject);
   public
@@ -54,9 +52,10 @@ type
     property OnPlayCamera: TCamIndexEvent read FOnPlay write FOnPlay;
     property OnEditCamera: TCamIndexEvent read FOnEdit write FOnEdit;
     property OnDeleteCamera: TCamIndexEvent read FOnDelete write FOnDelete;
-    // Levar o cadastro para outro aparelho: exportar manda o texto pela bandeja
-    // do sistema, importar abre a tela de colar.
-    property OnExport: TNotifyEvent read FOnExport write FOnExport;
+    // Levar câmera para outro aparelho: exportar manda UMA câmera (com todos os
+    // caminhos dela) pela bandeja do sistema; importar abre a tela de colar, e
+    // aceita tanto uma câmera quanto uma lista.
+    property OnExportCamera: TCamIndexEvent read FOnExport write FOnExport;
     property OnImport: TNotifyEvent read FOnImport write FOnImport;
   end;
 
@@ -69,10 +68,8 @@ begin
   inherited;
   FCards := TList<TRectangle>.Create;
   pathAdd.Data.Data := ICON_ADD;
-  pathExport.Data.Data := ICON_EXPORT;
   pathImport.Data.Data := ICON_IMPORT;
   btnAdd.OnClick := btnAddClick;
-  btnExport.OnClick := btnExportClick;
   btnImport.OnClick := btnImportClick;
   btnEdit.OnClick := btnEditClick;
 
@@ -126,9 +123,9 @@ end;
 procedure TFrameList.RefreshList;
 var
   I: Integer;
-  Card, Trash: TRectangle;
+  Card, Trash, Share: TRectangle;
   LblN, LblU: TLabel;
-  PTrash: TPath;
+  PTrash, PShare: TPath;
   Cap: string;
 begin
   ClearCards;
@@ -173,9 +170,38 @@ begin
     PTrash.Fill.Color := COLOR_DANGER;
     PTrash.Data.Data := ICON_TRASH;
 
+    // Exportar esta câmera. Fica no MODO EDIÇÃO, ao lado da lixeira: são as duas
+    // ações que mexem no cadastro, e nenhuma delas deve estar a um toque de
+    // distância de quem só quer assistir. Criado depois da lixeira, então fica à
+    // esquerda dela (alinhados à direita, o primeiro criado é o mais externo).
+    Share := TRectangle.Create(Card);
+    Share.Parent := Card;
+    Share.Align := TAlignLayout.Right;
+    Share.Width := 52;
+    Share.Fill.Kind := TBrushKind.None;
+    Share.Stroke.Kind := TBrushKind.None;
+    Share.HitTest := True;
+    Share.Tag := I;
+    Share.Visible := FEditMode;
+    Share.OnClick := CardExportClick;
+    PShare := TPath.Create(Share);
+    PShare.Parent := Share;
+    PShare.Align := TAlignLayout.Center;
+    PShare.Width := 20;
+    PShare.Height := 20;
+    PShare.HitTest := False;
+    PShare.Stroke.Kind := TBrushKind.None;
+    PShare.Fill.Color := COLOR_DIM;
+    PShare.Data.Data := ICON_EXPORT;
+
     LblN := TLabel.Create(Card);
     LblN.Parent := Card;
     LblN.Align := TAlignLayout.Top;
+    // Y explícito pelo mesmo motivo dos cards acima: o Align=Top ordena os
+    // irmãos pelo Position.Y, e com os dois rótulos em Y=0 o desempate é
+    // instável — foi assim que a tela de caminhos saiu com o endereço impresso
+    // acima do nome.
+    LblN.Position.Y := 0;
     LblN.Height := 28;
     LblN.Margins.Rect := RectF(16, 10, 8, 0);
     LblN.HitTest := False;
@@ -189,6 +215,7 @@ begin
     LblU := TLabel.Create(Card);
     LblU.Parent := Card;
     LblU.Align := TAlignLayout.Top;
+    LblU.Position.Y := 40;
     LblU.Height := 20;
     LblU.Margins.Rect := RectF(16, 0, 8, 0);
     LblU.HitTest := False;
@@ -228,9 +255,10 @@ begin
   if Assigned(FOnDelete) then FOnDelete(Self, Idx);
 end;
 
-procedure TFrameList.btnExportClick(Sender: TObject);
+procedure TFrameList.CardExportClick(Sender: TObject);
 begin
-  if Assigned(FOnExport) then FOnExport(Self);
+  if not (Sender is TRectangle) then Exit;
+  if Assigned(FOnExport) then FOnExport(Self, TRectangle(Sender).Tag);
 end;
 
 procedure TFrameList.btnImportClick(Sender: TObject);

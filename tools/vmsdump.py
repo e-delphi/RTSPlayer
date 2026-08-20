@@ -14,6 +14,33 @@ import sys
 import vmslib
 
 
+def report_region(data, header, blocks):
+    """A região de índice viva. É o que responde 'por que abrir esta gravação
+    está lento?': sem região, ou com região desatualizada, quem for tocá-la
+    varre o arquivo."""
+    try:
+        region = vmslib.read_region(data, header)
+    except vmslib.VmsError as e:
+        print('  região: ATENÇÃO — %s' % e)
+        return
+    if region is None:
+        print('  região: nenhuma (fragmento da API, ou gravado por build antigo)')
+        return
+    size, capacity, entries = region
+    print('  região: %d B, capacidade %d blocos, %d commitados (%.0f%% cheia)'
+          % (size, capacity, len(entries),
+             100.0 * len(entries) / capacity if capacity else 0))
+    if len(entries) < len(blocks):
+        print('         %d blocos além do último commit: quem ler agora varre '
+              'essa cauda' % (len(blocks) - len(entries)))
+    problems = vmslib.check_index(blocks[:len(entries)], entries)
+    if problems:
+        print('  ATENÇÃO: a região não bate com o arquivo (%d divergências):'
+              % len(problems))
+        for p in problems[:10]:
+            print('    %s' % p)
+
+
 def report_footer(data, blocks):
     """Rodapé e índice tempo → posição, conferidos contra a varredura."""
     footer = vmslib.read_footer(data)
@@ -104,6 +131,7 @@ def main():
         len(blocks), wall, wall / max(1, len(blocks) - 1),
         bad_crc if bad_crc else 'nenhum'))
 
+    report_region(data, header, blocks)
     report_footer(data, blocks)
 
     vid = [s for b in blocks for s in b.samples if s.is_video]

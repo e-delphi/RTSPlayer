@@ -164,16 +164,15 @@ lista são o espelho do primeiro caminho.
 
 ### Levar o cadastro para outro aparelho
 
-Na lista de câmeras, os dois ícones à esquerda do **+**:
-
-- **Exportar** (seta saindo) manda o cadastro inteiro — o mesmo texto do
-  `cameras.json` — para a **bandeja de compartilhar do Android**. Dali vai para
-  WhatsApp, e-mail, arquivo, o que você escolher. No Windows, vai para a área de
-  transferência.
-- **Importar** (seta entrando) abre uma caixa onde se cola esse texto. O botão
-  **Colar** puxa da área de transferência num toque. Câmera de mesmo nome é
-  atualizada; as demais entram no fim da lista — o que só existe no aparelho de
-  destino não é apagado.
+- **Exportar uma câmera**: toque em *Editar* na lista e use a seta ao lado da
+  lixeira do card. Sai **aquela câmera com todos os caminhos dela**, em texto,
+  pela **bandeja de compartilhar do Android** — WhatsApp, e-mail, arquivo, o que
+  você escolher. No Windows, vai para a área de transferência.
+- **Importar**: o ícone de seta entrando, na barra da lista, abre uma caixa onde
+  se cola o texto. O botão **Colar** puxa da área de transferência num toque.
+  Câmera de mesmo nome é atualizada; as demais entram no fim da lista — o que só
+  existe no aparelho de destino não é apagado. Aceita tanto uma câmera quanto
+  uma lista inteira.
 
 O texto **leva as senhas em claro** (é o mesmo conteúdo do arquivo), e o app
 avisa isso antes de exportar. Mande só para você mesmo e apague a mensagem
@@ -194,6 +193,11 @@ queda de energia:
   cada bloco é fechado a cada N samples, N ms ou N bytes, o que vier primeiro
 - **Âncora A/V** `BANC` no fim do índice de cada bloco: o instante de parede em
   que cada trilha começou ali, que é o que relaciona dois PTS em bases diferentes
+- **Índice vivo** `VLIX`, região reservada entre o header e o primeiro bloco e
+  atualizada no lugar a cada punhado de blocos: é o que dá índice ao arquivo que
+  ainda está sendo gravado — justamente o que se quer assistir. Quando ela enche,
+  a gravação **roda de arquivo**, então o tamanho dela (`block.indexRegionKB`,
+  64 KB = ~2 h) é o que define o tamanho de cada segmento
 - **Índice** `VIDX` com tempo, posição e "tem keyframe" de cada bloco, escrito
   quando a gravação fecha: achar um instante vira uma busca binária em vez de
   uma varredura do arquivo

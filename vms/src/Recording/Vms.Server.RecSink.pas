@@ -39,6 +39,7 @@ type
     FMaxSamples: Integer;
     FMaxDurationMs: Integer;
     FMaxSizeBytes: Integer;
+    FIndexRegionBytes: Integer;
     FWaitAudioMs: Int64;
     FLogger: ILogger;
     FClock: IClock;
@@ -65,7 +66,11 @@ type
     function OutputPath: string;
     function ReadyToOpen: Boolean;
     procedure NoteFirstFormat;
+    function BuildHeader: TVmsHeader;
     procedure OpenWriter;
+    // Fecha o arquivo corrente e abre o seguinte SEM parar a gravação: o
+    // TBlockBuilder continua o mesmo, só o writer troca.
+    procedure RotateWriter;
     procedure HoldSample(const S: TSample);
     procedure FlushPending;
     procedure CloseWriter(Clean: Boolean);
@@ -76,7 +81,8 @@ type
                        ARecordAudio: Boolean;
                        AMaxSamples, AMaxDurationMs, AMaxSizeBytes: Integer;
                        const ALogger: ILogger; const AClock: IClock;
-                       AWaitAudioMs: Integer = 1500);
+                       AWaitAudioMs: Integer = 1500;
+                       AIndexRegionBytes: Integer = VMS_REGION_DEFAULT_BYTES);
     destructor Destroy; override;
     { IMediaSink }
     procedure OnVideoFormat(Codec: TVideoCodec; Width, Height: Word; const Extradata: TBytes);
@@ -132,7 +138,8 @@ end;
 
 constructor TRecordingSink.Create(const AName, AStorageDir, AFilenamePattern, ASourceUri: string;
   ARecordAudio: Boolean; AMaxSamples, AMaxDurationMs, AMaxSizeBytes: Integer;
-  const ALogger: ILogger; const AClock: IClock; AWaitAudioMs: Integer);
+  const ALogger: ILogger; const AClock: IClock; AWaitAudioMs: Integer;
+  AIndexRegionBytes: Integer);
 begin
   inherited Create;
   FName := AName;
@@ -143,6 +150,7 @@ begin
   FMaxSamples := AMaxSamples;
   FMaxDurationMs := AMaxDurationMs;
   FMaxSizeBytes := AMaxSizeBytes;
+  FIndexRegionBytes := NormalizeRegionBytes(AIndexRegionBytes);
   FLogger := ALogger;
   FClock := AClock;
   if AWaitAudioMs < 0 then AWaitAudioMs := 0;
@@ -213,10 +221,11 @@ begin
   Result := (FClock.MonotonicMs - FFirstFormatMs) >= FWaitAudioMs;
 end;
 
-procedure TRecordingSink.OpenWriter;
+// O header do arquivo, montado do que as trilhas anunciaram. Sai do OpenWriter
+// porque a rotação precisa dele de novo, com outro instante de criação.
+function TRecordingSink.BuildHeader: TVmsHeader;
 var
   Header: TVmsHeader;
-  Path: string;
 begin
   FillChar(Header, SizeOf(Header), 0);
   Header.Version := VMS_FORMAT_VERSION;
@@ -243,21 +252,64 @@ begin
     Header.Audio.BitsPerSample := 16;
     Header.Audio.Extradata := FAExtra;
   end;
+  Result := Header;
+end;
 
-  Path := OutputPath;
-  FWriter := TFileRecordingWriter.Create(Path);
-  FWriter.WriteHeader(Header);
+procedure TRecordingSink.OpenWriter;
+var
+  Path: string;
+begin
+  Path := UniqueRecordingPath(OutputPath);
+  FWriter := TFileRecordingWriter.Create(Path, FIndexRegionBytes);
+  FWriter.WriteHeader(BuildHeader);
 
   FBuilder := TBlockBuilder.Create(FMaxSamples, FMaxDurationMs, FMaxSizeBytes);
   FBuilder.SetOnBlockClosed(
     procedure(const Block: TVmsBlock)
     begin
+      if FWriter = nil then Exit;
+      // Região de índice cheia: roda de arquivo ANTES de gravar este bloco, para
+      // ele já entrar no arquivo novo. Havendo folga, espera um keyframe — assim
+      // o arquivo novo começa por onde o decodificador consegue entrar, que é o
+      // que o cliente procura depois de uma emenda (ver VMS.Play.Engine).
+      if FWriter.IndexRegionFull or
+         (FWriter.IndexRegionNearlyFull and SamplesHaveKeyframe(Block.Samples)) then
+        RotateWriter;
       if FWriter <> nil then
         FWriter.WriteBlock(Block);
     end);
 
   FOpen := True;
   Log('gravando em ' + Path);
+end;
+
+procedure TRecordingSink.RotateWriter;
+var
+  Path: string;
+begin
+  try
+    if FWriter <> nil then
+      FWriter.Close(True);
+  except
+    on E: Exception do
+      Log('falha ao fechar o arquivo na rotacao: ' + E.Message);
+  end;
+  FWriter := nil;
+  Path := UniqueRecordingPath(OutputPath);
+  try
+    FWriter := TFileRecordingWriter.Create(Path, FIndexRegionBytes);
+    FWriter.WriteHeader(BuildHeader);
+    Log('indice cheio; seguindo em ' + ExtractFileName(Path));
+  except
+    on E: Exception do
+    begin
+      // Sem writer, os blocos deste bloco em diante são descartados. Quem fecha
+      // a gravação é o OnSample, DEPOIS de o AddSample retornar: fechar aqui
+      // liberaria o TBlockBuilder de dentro do callback dele mesmo.
+      FWriter := nil;
+      Log('falha ao abrir o arquivo novo: ' + E.Message);
+    end;
+  end;
 end;
 
 procedure TRecordingSink.HoldSample(const S: TSample);
@@ -355,6 +407,11 @@ begin
   end;
   if (Sample.Kind = tkAudio) and (not FRecordAudio) then Exit;
   FBuilder.AddSample(Sample, FClock.NowUtcMs, FClock.MonotonicMs);
+  // Rotação que não conseguiu abrir o arquivo novo (disco cheio, pasta sumiu):
+  // agora que o AddSample retornou, dá para desmontar e tentar de novo no
+  // próximo sample. Os formatos anunciados ficam, então reabre sozinho.
+  if FOpen and (FWriter = nil) then
+    CloseWriter(True);
 end;
 
 procedure TRecordingSink.OnStreamStopped;
