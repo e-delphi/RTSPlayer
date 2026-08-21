@@ -186,23 +186,30 @@ depois de importar.
 ## Formato .vms
 
 Container próprio, pensado para gravação contínua com perda mínima em caso de
-queda de energia:
+queda de energia. O mapa desenhado, byte a byte e com as ligações entre os dois
+arquivos, está em [docs/anatomia-vms.html](docs/anatomia-vms.html) — abra no
+navegador.
 
 - **Header** `VMS1` com metadados das trilhas (codec, resolução, extradata)
 - **Blocos** `BLK` com índice de samples + payload e um CRC32 ao final —
   cada bloco é fechado a cada N samples, N ms ou N bytes, o que vier primeiro
 - **Âncora A/V** `BANC` no fim do índice de cada bloco: o instante de parede em
   que cada trilha começou ali, que é o que relaciona dois PTS em bases diferentes
-- **Índice vivo** `VLIX`, região reservada entre o header e o primeiro bloco e
-  atualizada no lugar a cada punhado de blocos: é o que dá índice ao arquivo que
-  ainda está sendo gravado — justamente o que se quer assistir. Quando ela enche,
-  a gravação **roda de arquivo**, então o tamanho dela (`block.indexRegionKB`,
-  64 KB = ~2 h) é o que define o tamanho de cada segmento
 - **Índice** `VIDX` com tempo, posição e "tem keyframe" de cada bloco, escrito
   quando a gravação fecha: achar um instante vira uma busca binária em vez de
   uma varredura do arquivo
+- **Índice do arquivo em gravação** no `.vms.idx` ao lado, escrito em lotes a
+  cada punhado de blocos enquanto a gravação corre — é o que dá índice ao
+  arquivo de hoje, que é justamente o que se quer assistir. Fechando direito, o
+  `VIDX` entra no fim do `.vms` e o sidecar é apagado; fechando torto, ele fica e
+  continua sendo o índice daquele arquivo
 - **Footer** `VEOF` com total de blocos, duração, offset do último bloco e
   ponteiro para o índice
+
+A gravação **roda de arquivo** a cada `rotateMinutes` (60 por padrão), sempre
+esperando um keyframe para o arquivo novo começar por um ponto de entrada do
+decodificador. É o que mantém a pasta de cada câmera legível, dá granularidade
+para a retenção apagar e limita o tamanho de cada índice.
 
 Um arquivo truncado continua legível até o último bloco completo: o leitor para
 quando faltam bytes, em vez de falhar o arquivo inteiro. Ele também tem um modo

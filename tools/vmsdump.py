@@ -9,36 +9,46 @@ avisa quando divergem — foi essa divergência que deixou a ayla cinza.
 
 import argparse
 import collections
+import os
 import sys
 
 import vmslib
 
 
-def report_region(data, header, blocks):
-    """A região de índice viva. É o que responde 'por que abrir esta gravação
-    está lento?': sem região, ou com região desatualizada, quem for tocá-la
-    varre o arquivo."""
+def report_sidecar(path, header, blocks):
+    """O `.vms.idx` ao lado. É o que responde "por que abrir esta gravação está
+    lento?": sem sidecar, ou com sidecar atrasado, quem for tocá-la varre."""
     try:
-        region = vmslib.read_region(data, header)
+        sidecar = vmslib.read_sidecar(path, header.creation_unix_ms)
     except vmslib.VmsError as e:
-        print('  região: ATENÇÃO — %s' % e)
+        print('  sidecar: ATENÇÃO — %s' % e)
         return
-    if region is None:
-        print('  região: nenhuma (fragmento da API, ou gravado por build antigo)')
+    if sidecar is None:
+        if os.path.exists(vmslib.sidecar_path(path)):
+            print('  sidecar: existe, mas é de outra gravação (ignorado)')
+        elif vmslib.read_footer(data_of(path)) is not None:
+            print('  sidecar: nenhum (gravação fechada; o índice está no fim do .vms)')
+        else:
+            print('  sidecar: NENHUM e sem rodapé — tocar este arquivo custa uma '
+                  'varredura inteira')
         return
-    size, capacity, entries = region
-    print('  região: %d B, capacidade %d blocos, %d commitados (%.0f%% cheia)'
-          % (size, capacity, len(entries),
-             100.0 * len(entries) / capacity if capacity else 0))
+    entries, valid_up_to = sidecar
+    print('  sidecar: %d blocos registrados, válido até o offset %d'
+          % (len(entries), valid_up_to))
     if len(entries) < len(blocks):
-        print('         %d blocos além do último commit: quem ler agora varre '
+        print('           %d blocos além do último lote: quem ler agora varre '
               'essa cauda' % (len(blocks) - len(entries)))
     problems = vmslib.check_index(blocks[:len(entries)], entries)
     if problems:
-        print('  ATENÇÃO: a região não bate com o arquivo (%d divergências):'
+        print('  ATENÇÃO: o sidecar não bate com o arquivo (%d divergências):'
               % len(problems))
         for p in problems[:10]:
             print('    %s' % p)
+
+
+def data_of(path):
+    with open(path, 'rb') as f:
+        return f.read()
 
 
 def report_footer(data, blocks):
@@ -131,7 +141,7 @@ def main():
         len(blocks), wall, wall / max(1, len(blocks) - 1),
         bad_crc if bad_crc else 'nenhum'))
 
-    report_region(data, header, blocks)
+    report_sidecar(args.arquivo, header, blocks)
     report_footer(data, blocks)
 
     vid = [s for b in blocks for s in b.samples if s.is_video]

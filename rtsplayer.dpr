@@ -55,6 +55,7 @@ uses
   VMS.Rec.Reader in 'src\Recording\VMS.Rec.Reader.pas',
   VMS.Rec.Paths in 'src\Recording\VMS.Rec.Paths.pas',
   VMS.Rec.Writer in 'src\Recording\VMS.Rec.Writer.pas',
+  VMS.Rec.Sidecar in 'src\Recording\VMS.Rec.Sidecar.pas',
   VMS.Rtp.Demux in 'src\Rtp\VMS.Rtp.Demux.pas',
   VMS.Rtp.Packet in 'src\Rtp\VMS.Rtp.Packet.pas',
   VMS.Rtsp.Auth in 'src\Rtsp\VMS.Rtsp.Auth.pas',

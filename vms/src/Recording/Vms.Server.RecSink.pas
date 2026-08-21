@@ -39,7 +39,8 @@ type
     FMaxSamples: Integer;
     FMaxDurationMs: Integer;
     FMaxSizeBytes: Integer;
-    FIndexRegionBytes: Integer;
+    FRotateMs: Int64;         // 0 = não roda de arquivo
+    FFileStartedMs: Int64;    // monotônico, de quando o arquivo corrente abriu
     FWaitAudioMs: Int64;
     FLogger: ILogger;
     FClock: IClock;
@@ -68,6 +69,8 @@ type
     procedure NoteFirstFormat;
     function BuildHeader: TVmsHeader;
     procedure OpenWriter;
+    // Está na hora de rodar de arquivo? Ver TCameraSession.RotateDue.
+    function RotateDue(const Block: TVmsBlock): Boolean;
     // Fecha o arquivo corrente e abre o seguinte SEM parar a gravação: o
     // TBlockBuilder continua o mesmo, só o writer troca.
     procedure RotateWriter;
@@ -82,7 +85,7 @@ type
                        AMaxSamples, AMaxDurationMs, AMaxSizeBytes: Integer;
                        const ALogger: ILogger; const AClock: IClock;
                        AWaitAudioMs: Integer = 1500;
-                       AIndexRegionBytes: Integer = VMS_REGION_DEFAULT_BYTES);
+                       ARotateMs: Integer = 0);
     destructor Destroy; override;
     { IMediaSink }
     procedure OnVideoFormat(Codec: TVideoCodec; Width, Height: Word; const Extradata: TBytes);
@@ -103,6 +106,8 @@ const
   VIDEO_TIMESCALE = 90000;
   // teto do buffer de espera, p/ não crescer sem limite se o áudio nunca vier
   MAX_PENDING_BYTES = 8 * 1024 * 1024;
+  // quanto se espera por um keyframe depois de vencido o prazo de rotação
+  ROTATE_KEYFRAME_GRACE_MS = 60000;
 
 function FormatRecFilename(const Pattern, Name: string; CreationUtc: TDateTime): string;
   function Pad(I, W: Integer): string;
@@ -139,7 +144,7 @@ end;
 constructor TRecordingSink.Create(const AName, AStorageDir, AFilenamePattern, ASourceUri: string;
   ARecordAudio: Boolean; AMaxSamples, AMaxDurationMs, AMaxSizeBytes: Integer;
   const ALogger: ILogger; const AClock: IClock; AWaitAudioMs: Integer;
-  AIndexRegionBytes: Integer);
+  ARotateMs: Integer);
 begin
   inherited Create;
   FName := AName;
@@ -150,7 +155,8 @@ begin
   FMaxSamples := AMaxSamples;
   FMaxDurationMs := AMaxDurationMs;
   FMaxSizeBytes := AMaxSizeBytes;
-  FIndexRegionBytes := NormalizeRegionBytes(AIndexRegionBytes);
+  FRotateMs := ARotateMs;
+  if FRotateMs < 0 then FRotateMs := 0;
   FLogger := ALogger;
   FClock := AClock;
   if AWaitAudioMs < 0 then AWaitAudioMs := 0;
@@ -260,20 +266,18 @@ var
   Path: string;
 begin
   Path := UniqueRecordingPath(OutputPath);
-  FWriter := TFileRecordingWriter.Create(Path, FIndexRegionBytes);
+  FWriter := TFileRecordingWriter.Create(Path);
   FWriter.WriteHeader(BuildHeader);
+  FFileStartedMs := FClock.MonotonicMs;
 
   FBuilder := TBlockBuilder.Create(FMaxSamples, FMaxDurationMs, FMaxSizeBytes);
   FBuilder.SetOnBlockClosed(
     procedure(const Block: TVmsBlock)
     begin
       if FWriter = nil then Exit;
-      // Região de índice cheia: roda de arquivo ANTES de gravar este bloco, para
-      // ele já entrar no arquivo novo. Havendo folga, espera um keyframe — assim
-      // o arquivo novo começa por onde o decodificador consegue entrar, que é o
-      // que o cliente procura depois de uma emenda (ver VMS.Play.Engine).
-      if FWriter.IndexRegionFull or
-         (FWriter.IndexRegionNearlyFull and SamplesHaveKeyframe(Block.Samples)) then
+      // Roda de arquivo ANTES de gravar este bloco, para ele já entrar no
+      // arquivo novo — que assim começa por um keyframe.
+      if RotateDue(Block) then
         RotateWriter;
       if FWriter <> nil then
         FWriter.WriteBlock(Block);
@@ -281,6 +285,23 @@ begin
 
   FOpen := True;
   Log('gravando em ' + Path);
+end;
+
+// Passou o tempo de rodar de arquivo. Depois do prazo, espera o próximo bloco
+// com keyframe: assim o arquivo novo começa por um ponto de entrada do
+// decodificador, que é o que o cliente procura depois de uma emenda (ver
+// VMS.Play.Engine). Câmera que não manda keyframe nenhum não pode segurar a
+// rotação para sempre — daí a tolerância.
+function TRecordingSink.RotateDue(const Block: TVmsBlock): Boolean;
+var
+  Age: Int64;
+begin
+  Result := False;
+  if FRotateMs <= 0 then Exit;
+  Age := FClock.MonotonicMs - FFileStartedMs;
+  if Age < FRotateMs then Exit;
+  Result := SamplesHaveKeyframe(Block.Samples) or
+            (Age >= FRotateMs + ROTATE_KEYFRAME_GRACE_MS);
 end;
 
 procedure TRecordingSink.RotateWriter;
@@ -297,9 +318,10 @@ begin
   FWriter := nil;
   Path := UniqueRecordingPath(OutputPath);
   try
-    FWriter := TFileRecordingWriter.Create(Path, FIndexRegionBytes);
+    FWriter := TFileRecordingWriter.Create(Path);
     FWriter.WriteHeader(BuildHeader);
-    Log('indice cheio; seguindo em ' + ExtractFileName(Path));
+    FFileStartedMs := FClock.MonotonicMs;
+    Log('rodando de arquivo; seguindo em ' + ExtractFileName(Path));
   except
     on E: Exception do
     begin

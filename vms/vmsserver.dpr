@@ -60,6 +60,7 @@ uses
   VMS.Rec.Format in '..\src\Recording\VMS.Rec.Format.pas',
   VMS.Rec.Block in '..\src\Recording\VMS.Rec.Block.pas',
   VMS.Rec.Writer in '..\src\Recording\VMS.Rec.Writer.pas',
+  VMS.Rec.Sidecar in '..\src\Recording\VMS.Rec.Sidecar.pas',
   VMS.Rec.Reader in '..\src\Recording\VMS.Rec.Reader.pas',
   VMS.Rec.Paths in '..\src\Recording\VMS.Rec.Paths.pas',
   VMS.App.Clock in '..\src\App\VMS.App.Clock.pas',
@@ -88,6 +89,7 @@ uses
   Vms.Server.RecSink in 'src\Recording\Vms.Server.RecSink.pas',
   Vms.Server.Logger in 'src\App\Vms.Server.Logger.pas',
   Vms.Server.Retention in 'src\App\Vms.Server.Retention.pas',
+  Vms.Server.Repair in 'src\App\Vms.Server.Repair.pas',
   Vms.Server.Config in 'src\App\Vms.Server.Config.pas',
   Vms.Server.Composition in 'src\App\Vms.Server.Composition.pas';
 
@@ -183,18 +185,24 @@ begin
   if Retention.Enabled then
     SweepRetention(StorageDir, Retention, Logger);
 
+  // Gravações que ficaram abertas (queda de energia, processo morto) ganham
+  // agora o índice e o rodapé que não deu tempo de escrever. Tem de ser ANTES de
+  // subir os supervisores: depois deles, o arquivo mais recente de cada câmera
+  // está sendo gravado, e ninguém deve mexer nele.
+  SetLength(CameraNames, Length(App.Cameras));
+  for I := 0 to High(App.Cameras) do
+    CameraNames[I] := App.Cameras[I].Name;
+  FinalizeOrphanRecordings(StorageDir, CameraNames, Logger);
+
   // O hub nasce antes dos supervisores (os sinks deles publicam nele) e morre
   // depois (o servidor RTSP lê dele).
   Hub := nil;
   if LiveCfg.Enabled then
     Hub := TLiveHub.Create(LiveCfg, Logger, Clock);
   try
-    // A API só responde sobre as câmeras configuradas: nome que o cliente manda
-    // é conferido contra esta lista antes de virar caminho de arquivo.
-    SetLength(CameraNames, Length(App.Cameras));
-    for I := 0 to High(App.Cameras) do
-      CameraNames[I] := App.Cameras[I].Name;
-
+    // CameraNames já está montado (a finalização acima usa a mesma lista): é
+    // com ele que a API confere o nome que o cliente manda, antes de virar
+    // caminho de arquivo.
     Api := nil;
     if ApiCfg.Enabled then
       Api := TApiRouter.Create(ApiCfg, StorageDir, CameraNames, Hub, Logger);

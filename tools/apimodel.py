@@ -39,15 +39,15 @@ def camera_files(folder, camera):
 def file_info(path):
     """Descreve um arquivo SEM montar índice, como o Vms.Server.IndexCache.
 
-    Arquivo fechado responde pelo rodapé; arquivo em gravação, pelas pontas da
-    região de índice viva. A varredura só sobra para arquivo recém-aberto (antes
-    do primeiro commit) e para gravação de build sem região."""
+    Arquivo fechado responde pelo rodapé; arquivo em gravação, pelas pontas do
+    `.vms.idx` ao lado. A varredura só sobra para arquivo recém-aberto (antes do
+    primeiro lote) e para gravação de build sem sidecar."""
     with open(path, 'rb') as f:
         data = f.read()
     header = vmslib.read_header(data)
     footer = vmslib.read_footer(data)
 
-    o = vmslib.first_block_offset(data, header)
+    o = header.size
     if data[o:o + 4] != vmslib.MAGIC_BLOCK:
         return None
     start = struct.unpack_from('<q', data, o + 12)[0]
@@ -59,15 +59,15 @@ def file_info(path):
         if end < start:
             end = start
     else:
-        region = None
+        sidecar = None
         try:
-            region = vmslib.read_region(data, header)
+            sidecar = vmslib.read_sidecar(path, header.creation_unix_ms)
         except vmslib.VmsError:
-            region = None
-        if region and region[2]:
-            start = region[2][0].start_unix_ms
-            end = region[2][-1].start_unix_ms + ASSUMED_LAST_BLOCK_MS
-            blocks = len(region[2])
+            sidecar = None
+        if sidecar:
+            start = sidecar[0][0].start_unix_ms
+            end = sidecar[0][-1].start_unix_ms + ASSUMED_LAST_BLOCK_MS
+            blocks = len(sidecar[0])
         else:
             blks = list(vmslib.iter_blocks(data, header, with_data=False))
             if not blks:

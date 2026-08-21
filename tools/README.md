@@ -11,7 +11,7 @@ saíram quatro bugs desta última leva antes de qualquer compilação:
 
 | script | modela |
 |---|---|
-| `genvms.py` | gera `.vms` sintético (com índice, sem índice, truncado, com região de índice viva) para usar de fixture |
+| `genvms.py` | gera `.vms` sintético (com índice, sem índice, truncado, com sidecar `.vms.idx`) para usar de fixture |
 | `apimodel.py` | o que `/api/days` e `/api/segments` devem responder para uma pasta de gravações |
 | `fragment.py` | o que `/api/media` devolve, incluindo cursor e travessia de arquivo |
 | `pacemodel.py` | o ritmo do playback (1×/2×/4×, borrão do seek) com relógio virtual |
@@ -90,18 +90,21 @@ bloco:  'BLK\x01' | block_size(4) | seq(4) | start_unix_ms(8)
 BANC:   'BANC' | video_anchor_ms(8) | audio_anchor_ms(8)               [20B]
         (no FIM da área de índice, contado dentro de index_size)
 
-VLIX:   'VLIX' | region_size(4) | capacity(4)
-        | slot A(count(4) gen(4) crc(4)) | slot B(idem) | reserva(4)  [40B]
-        | capacity × (offset(8) start_unix_ms(8) flags(1))            [17B]
-        (logo depois do header; os blocos começam DEPOIS dela)
-
 VIDX:   'VIDX' | chunk_size(4) | count(4)
         | count × (offset(8) start_unix_ms(8) flags(1))                 [17B]
         | crc32(4)
 
 rodapé: 'VEOF' | total_blocks(4) | duration_ms(8) | last_block_offset(8)
         | index_offset(8) index_count(4) | crc32(4)          [40 bytes]
+
+.vms.idx (arquivo ao lado, só enquanto a gravação corre)
+cabeç.: 'VIDS' | versão(2) | reservado(2) | creation_unix_ms(8) | crc32(4) [20B]
+lote:   'IDXB' | count(4) | valid_up_to(8)
+        | count × (offset(8) start_unix_ms(8) flags(1)) | crc32(4)
 ```
+
+O mesmo layout, desenhado e com as ligações entre os dois arquivos, está em
+[anatomia-vms.html](../docs/anatomia-vms.html).
 
 Little-endian. `track_id` 0 = vídeo, 1 = áudio. `flags` bit 0 = keyframe.
 `payload_offset` é relativo ao início do payload do bloco. Vídeo é Annex-B
@@ -122,19 +125,23 @@ que é o que permite achar por onde começar a decodificar sem varrer o arquivo.
 o que a timeline do app usa (ver [PLANO-TIMELINE.md](../docs/PLANO-TIMELINE.md)).
 Arquivo fechado sem índice continua válido: quem precisar varre.
 
-O `VLIX` é o **mesmo índice, do arquivo ainda em gravação**: uma região de tamanho
-fixo reservada na criação, entre o header e o primeiro bloco, e atualizada no
-lugar a cada 16 blocos. Vale o slot de commit de geração mais alta cujo CRC bate
-(o CRC cobre as `count` primeiras entradas); o outro slot é o seguro contra queda
-de energia no meio da atualização. O que ficou depois do último commit sai de uma
-varredura da cauda — dezenas de blocos, não o arquivo inteiro. Quando a região
-enche, o gravador **roda de arquivo**: é por isso que não existe encadeamento de
-índices, e é o tamanho da região que decide o tamanho do segmento.
+O `.vms.idx` é o **mesmo índice, do arquivo ainda em gravação**, num arquivo ao
+lado. Escrita só em append: a cada 16 blocos sai um lote com as entradas novas e
+o `valid_up_to`, que é o ponto até onde o `.vms` já está coberto. O CRC de cada
+lote cobre o cabeçalho dele E as entradas, então um lote cortado ou torto (queda
+de energia no meio da escrita) é descartado na leitura e vale tudo que veio
+antes; o que ficou depois do último lote válido sai de uma varredura da cauda a
+partir do `valid_up_to` — dezenas de blocos, não o arquivo inteiro.
 
-A região fica FORA do header (e não dentro) porque o header é copiado byte a byte
-para dentro de cada fragmento servido pela `/api/media`: um índice ali viajaria
-para o celular a cada pedaço de reprodução. Fragmento da API, portanto, não tem
-região — e os leitores tratam os dois casos.
+O `creation_unix_ms` amarra o sidecar ao `.vms`: sidecar que não casa é de outra
+gravação e se ignora. Fechando a gravação direito, o `VIDX` vai para o fim do
+`.vms` e o sidecar é apagado — gravação terminada é auto-suficiente. Fechando
+torto (queda de energia), não há `VIDX` e o sidecar FICA, que é o que evita que
+aquele arquivo custe uma varredura para sempre. A retenção apaga os dois juntos.
+
+O corpo do `.vms` não muda em nada com isso: os blocos continuam começando
+imediatamente depois do header, e o fragmento servido pela `/api/media` (header
+copiado byte a byte + blocos crus) continua sendo lido pelo mesmo leitor.
 
 O formato está **em desenvolvimento e não lê layout antigo**: a versão do header é
 sempre 1, não há caminho de leitura para arquivo de layout anterior, e mudança de

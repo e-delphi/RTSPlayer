@@ -92,7 +92,7 @@ begin
   Result.MaxBlockSamples := AppCfg.MaxBlockSamples;
   Result.MaxBlockDurationMs := AppCfg.MaxBlockDurationMs;
   Result.MaxBlockSizeBytes := AppCfg.MaxBlockSizeBytes;
-  Result.IndexRegionBytes := AppCfg.IndexRegionBytes;
+  Result.RotateMs := AppCfg.RotateMs;
   Result.ConnectTimeoutMs := 5000;
   Result.RtspTimeoutMs := 10000;
   Result.RecordEnabled := True;

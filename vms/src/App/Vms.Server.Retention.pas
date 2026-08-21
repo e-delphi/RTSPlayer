@@ -19,6 +19,9 @@ unit Vms.Server.Retention;
 //     não é erro: o arquivo fica para a próxima varredura;
 //   - qualquer coisa que não termine em .vms.
 //
+// Apagando um .vms, o `.vms.idx` dele (índice da gravação que não fechou
+// direito) vai junto: sozinho ele não serve para nada e ninguém mais o apagaria.
+//
 // Por que o mais antigo primeiro, e não cota por câmera: o disco é um só, e a
 // ordem por data é a que alguém consegue prever olhando a pasta. Cota por câmera
 // fica para quando fizer falta (uma câmera muito mais movimentada que as outras
@@ -34,7 +37,8 @@ uses
   System.SyncObjs,
   System.Generics.Collections,
   System.Generics.Defaults,
-  VMS.Domain.Logging;
+  VMS.Domain.Logging,
+  VMS.Rec.Sidecar;
 
 type
   TRetentionPolicy = record
@@ -158,6 +162,9 @@ begin
   try
     repeat
       if (SR.Attr and faDirectory) <> 0 then Continue;
+      // O filtro do sistema casa por nome curto também: sem conferir a extensão,
+      // um `.vms.idx` entraria na lista e seria apagado como se fosse gravação.
+      if not SameText(ExtractFileExt(SR.Name), '.vms') then Continue;
       if N >= Length(Files) then
         if Length(Files) = 0 then
           SetLength(Files, 64)
@@ -225,6 +232,8 @@ var
     if Files[Index].Deleted or Files[Index].Skip then Exit;
     try
       TFile.Delete(Files[Index].Path);
+      // Índice lateral daquela gravação: sem o .vms ao lado é lixo.
+      DeleteSidecar(Files[Index].Path);
     except
       on E: Exception do
       begin

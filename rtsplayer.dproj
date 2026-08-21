@@ -346,6 +346,7 @@
         <DCCReference Include="src\Recording\VMS.Rec.Reader.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Paths.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Writer.pas"/>
+        <DCCReference Include="src\Recording\VMS.Rec.Sidecar.pas"/>
         <DCCReference Include="src\Rtp\VMS.Rtp.Demux.pas"/>
         <DCCReference Include="src\Rtp\VMS.Rtp.Packet.pas"/>
         <DCCReference Include="src\Rtsp\VMS.Rtsp.Auth.pas"/>

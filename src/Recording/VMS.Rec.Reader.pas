@@ -11,6 +11,7 @@ uses
   VMS.Domain.Logging,
   VMS.Rec.Format,
   VMS.Rec.Paths,
+  VMS.Rec.Sidecar,
   VMS.Rec.Crc32;
 
 type
@@ -20,6 +21,10 @@ type
     // vivem em memória. É o mesmo leitor nos dois casos — o formato é um só.
     FStream: TStream;
     FOwnsStream: Boolean;
+    // Caminho do .vms, quando o leitor foi aberto a partir de um arquivo. Vazio
+    // para leitura em memória (o fragmento que a API entrega), que não tem
+    // sidecar nem precisa dele.
+    FFilePath: string;
     FHeader: TVmsHeader;
     FHeaderRead: Boolean;
     FLiveMode: Boolean;
@@ -29,11 +34,6 @@ type
     FIndexCount: Integer;
     FIndexBuilt: Boolean;
     FIndexFromFooter: Boolean;
-    // região de índice viva (VLIX), quando o arquivo tem uma; 0 = não tem
-    FRegionOffset: Int64;
-    FRegionBytes: Integer;
-    FRegionCapacity: Integer;
-    FHasRegion: Boolean;
     FScannedUpTo: Int64;   // primeiro offset ainda não varrido (arquivo crescendo)
     FLogger: ILogger;      // opcional: só para avisar de bloco corrompido
     FBadBlocks: Integer;
@@ -50,15 +50,9 @@ type
     procedure AddIndexEntry(Offset, StartUnixMs: Int64; HasKeyframe: Boolean);
     function ScanBlocksFrom(FromOffset: Int64): Integer;
     function LoadIndexFromFooter: Boolean;
-    // Lê a região logo depois do header, se houver. Chamada pelo ReadHeader:
-    // é ela que faz o primeiro bloco começar depois da região.
-    function ProbeIndexRegion: Boolean;
-    // Os bytes das entradas commitadas na região (o slot de geração mais alta
-    // com CRC válido), e quantas entradas eles trazem.
-    function ReadRegionCommit(out Buf: TBytes; out Count: Integer): Boolean;
-    // Índice do arquivo AINDA EM GRAVAÇÃO, tirado da região. Deixa FScannedUpTo
-    // no fim do último bloco indexado, para a varredura pegar só a cauda.
-    function LoadIndexFromRegion: Boolean;
+    // Índice do arquivo AINDA EM GRAVAÇÃO, lido do `.vms.idx` ao lado. Deixa
+    // FScannedUpTo onde o sidecar parou, para a varredura pegar só a cauda.
+    function LoadIndexFromSidecar: Boolean;
     function WaitForBytes(Need: Int64): Boolean;
   public
     constructor Create(const FilePath: string); overload;
@@ -94,11 +88,10 @@ type
     // O instante do primeiro bloco — o começo real da faixa deste arquivo, que
     // não é o mesmo que o instante de criação gravado no header.
     function FirstBlockStartMs(out StartUnixMs: Int64): Boolean;
-    // O que a região de índice viva já commitou: quantos blocos, e o intervalo
-    // que eles cobrem. Fica até um commit atrás do arquivo (~30 s), o que é
-    // invisível numa timeline; o índice de verdade, com a cauda, sai do
-    // EnsureIndex.
-    function RegionSummary(out Count: Integer; out FirstMs, LastMs: Int64): Boolean;
+    // O que o `.vms.idx` já registrou: quantos blocos, e o intervalo que eles
+    // cobrem. Fica até um lote atrás do arquivo (~30 s), o que é invisível numa
+    // timeline; o índice de verdade, com a cauda, sai do EnsureIndex.
+    function SidecarSummary(out Count: Integer; out FirstMs, LastMs: Int64): Boolean;
 
     function SeekToTime(WallClockMs: Int64): Boolean;
     function SeekToBlock(BlockIdx: Integer): Boolean;
@@ -136,9 +129,6 @@ type
     // cresce. Quem tocava ao vivo pode trocar de arquivo na hora, sem esperar
     // para ver se ele volta a crescer.
     property AtClosedEnd: Boolean read FSawClosedEnd;
-    // Este arquivo tem região de índice viva. Fragmento servido pela API não
-    // tem (o corpo leva só header + blocos), arquivo de gravação tem.
-    property HasIndexRegion: Boolean read FHasRegion;
     // Quem quiser saber de bloco corrompido põe um logger aqui; sem ele o
     // leitor pula em silêncio e só o contador registra.
     property Logger: ILogger read FLogger write FLogger;
@@ -158,6 +148,7 @@ begin
   // servidor o lê.
   FStream := TFileStream.Create(FilePath, fmOpenRead or fmShareDenyNone);
   FOwnsStream := True;
+  FFilePath := FilePath;
   FHeaderRead := False;
 end;
 
@@ -166,6 +157,7 @@ begin
   inherited Create;
   FStream := AStream;
   FOwnsStream := AOwnsStream;
+  FFilePath := '';
   FHeaderRead := False;
 end;
 
@@ -286,56 +278,12 @@ begin
   FHeaderRead := True;
   FSawClosedEnd := False;
   FFirstBlockOffset := FStream.Position;
-  // A região de índice viva mora entre o header e o primeiro bloco: quem lê em
-  // sequência tem que passar por cima dela, senão o primeiro "bloco" que
-  // encontra é ela. Ver VMS.Rec.Format.
-  if ProbeIndexRegion then
-    FFirstBlockOffset := FRegionOffset + Int64(FRegionBytes);
-  // Deixa o stream ONDE A MÍDIA COMEÇA: há quem chame ReadHeader e emende
-  // direto no ReadNextBlock (o pacer do servidor, o app desmontando um pedaço).
-  FStream.Position := FFirstBlockOffset;
   // header novo, índice velho não vale mais
   FIndexBuilt := False;
   FIndexFromFooter := False;
   FIndexCount := 0;
   SetLength(FIndex, 0);
   FScannedUpTo := 0;
-  Result := True;
-end;
-
-function TVmsReader.ProbeIndexRegion: Boolean;
-var
-  Buf: TBytes;
-  Offset: Integer;
-  At: Int64;
-  Size, Cap: Cardinal;
-begin
-  Result := False;
-  FRegionOffset := 0;
-  FRegionBytes := 0;
-  FRegionCapacity := 0;
-  FHasRegion := False;
-  At := FFirstBlockOffset;
-  if At + VMS_REGION_HEADER_SIZE > FStream.Size then Exit;
-  FStream.Position := At;
-  SetLength(Buf, 12);
-  if FStream.Read(Buf[0], 12) <> 12 then Exit;
-  if (Buf[0] <> VMS_MAGIC_REGION[0]) or (Buf[1] <> VMS_MAGIC_REGION[1]) or
-     (Buf[2] <> VMS_MAGIC_REGION[2]) or (Buf[3] <> VMS_MAGIC_REGION[3]) then Exit;
-  Offset := 4;
-  Size := ReadU32(Buf, Offset);
-  Cap := ReadU32(Buf, Offset);
-  // Tamanho e capacidade têm que combinar entre si e caber no arquivo, senão
-  // isto não é uma região e sim bytes que por acaso começam com 'VLIX'.
-  // Teto antes de qualquer cast: tamanho absurdo em arquivo corrompido viraria
-  // Integer negativo, e daí em diante toda conta estaria errada.
-  if (Size < VMS_REGION_MIN_BYTES) or (Size > VMS_REGION_MAX_BYTES) then Exit;
-  if At + Int64(Size) > FStream.Size then Exit;
-  if Cap <> Cardinal(RegionCapacity(Integer(Size))) then Exit;
-  FRegionOffset := At;
-  FRegionBytes := Integer(Size);
-  FRegionCapacity := Integer(Cap);
-  FHasRegion := True;
   Result := True;
 end;
 
@@ -756,73 +704,6 @@ end;
 // estado consistente, alguns blocos atrás — e a varredura de cauda cobre a
 // diferença. Nenhum dos dois batendo, devolve False e cai na varredura inteira,
 // que é lenta mas não mente.
-// Escolhe o slot de commit que vale e devolve as entradas cobertas por ele.
-// Dois slots: vale o de geração mais alta cujo CRC bate. Se o de cima estiver
-// quebrado (queda no meio da atualização), o de baixo ainda descreve um estado
-// consistente, alguns blocos atrás. Nenhum dos dois batendo, devolve False e
-// quem chamou varre — lento, mas não mente.
-function TVmsReader.ReadRegionCommit(out Buf: TBytes; out Count: Integer): Boolean;
-var
-  Head: TBytes;
-  Offset, Slot, Best: Integer;
-  Gen, BestGen: Cardinal;
-  SlotOfs: array[0..1] of Integer;
-  Counts, Gens, Crcs: array[0..1] of Cardinal;
-  SavedPos: Int64;
-begin
-  Result := False;
-  Buf := nil;
-  Count := 0;
-  if (not FHasRegion) or (FRegionCapacity <= 0) then Exit;
-  SavedPos := FStream.Position;
-  try
-    FStream.Position := FRegionOffset;
-    SetLength(Head, VMS_REGION_HEADER_SIZE);
-    if FStream.Read(Head[0], VMS_REGION_HEADER_SIZE) <> VMS_REGION_HEADER_SIZE then Exit;
-    SlotOfs[0] := VMS_REGION_COMMIT_A_OFS;
-    SlotOfs[1] := VMS_REGION_COMMIT_B_OFS;
-    for Slot := 0 to VMS_REGION_SLOTS - 1 do
-    begin
-      Offset := SlotOfs[Slot];
-      Counts[Slot] := ReadU32(Head, Offset);
-      Gens[Slot] := ReadU32(Head, Offset);
-      Crcs[Slot] := ReadU32(Head, Offset);
-    end;
-
-    // Lê a área de entradas uma vez só e confere cada candidato contra ela.
-    SetLength(Buf, FRegionCapacity * VMS_INDEX_ENTRY_SIZE);
-    FStream.Position := FRegionOffset + VMS_REGION_HEADER_SIZE;
-    if FStream.Read(Buf[0], Length(Buf)) <> Length(Buf) then
-    begin
-      Buf := nil;
-      Exit;
-    end;
-
-    Best := -1;
-    BestGen := 0;
-    for Slot := 0 to VMS_REGION_SLOTS - 1 do
-    begin
-      Gen := Gens[Slot];
-      if Counts[Slot] > Cardinal(FRegionCapacity) then Continue;
-      if (Best >= 0) and (Gen <= BestGen) then Continue;
-      if Crc32Update(0, Buf, 0, Integer(Counts[Slot]) * VMS_INDEX_ENTRY_SIZE) <> Crcs[Slot] then
-        Continue;
-      Best := Slot;
-      BestGen := Gen;
-      Count := Integer(Counts[Slot]);
-    end;
-    if Best < 0 then
-    begin
-      Buf := nil;
-      Count := 0;
-      Exit;
-    end;
-    Result := True;
-  finally
-    FStream.Position := SavedPos;
-  end;
-end;
-
 function TVmsReader.FirstBlockStartMs(out StartUnixMs: Int64): Boolean;
 var
   BlockSize: Cardinal;
@@ -841,71 +722,61 @@ begin
   end;
 end;
 
-function TVmsReader.RegionSummary(out Count: Integer; out FirstMs, LastMs: Int64): Boolean;
-var
-  Buf: TBytes;
-  Offset: Integer;
+function TVmsReader.SidecarSummary(out Count: Integer;
+  out FirstMs, LastMs: Int64): Boolean;
 begin
   Count := 0;
   FirstMs := 0;
   LastMs := 0;
   Result := False;
-  if not ReadRegionCommit(Buf, Count) then Exit;
-  if Count <= 0 then Exit;
-  // Só as pontas interessam aqui; montar as entradas todas seria justamente o
-  // custo que este caminho existe para evitar. O +8 pula o offset da entrada.
-  Offset := 8;
-  FirstMs := ReadI64(Buf, Offset);
-  Offset := (Count - 1) * VMS_INDEX_ENTRY_SIZE + 8;
-  LastMs := ReadI64(Buf, Offset);
-  Result := True;
+  if (FFilePath = '') or (not FHeaderRead) then Exit;
+  Result := VMS.Rec.Sidecar.SidecarSummary(FFilePath, FHeader.CreationUnixMs,
+                                           Count, FirstMs, LastMs);
 end;
 
-function TVmsReader.LoadIndexFromRegion: Boolean;
+// Índice do arquivo que ainda está sendo gravado, lido do `.vms.idx` ao lado.
+// O que ficou depois do último lote sai da varredura da cauda, a partir de
+// FScannedUpTo — que é o ponto de append que o gravador registrou no lote.
+function TVmsReader.LoadIndexFromSidecar: Boolean;
 var
-  Buf: TBytes;
-  Offset, I, Count: Integer;
-  EndOffset: Int64;
-  BlockSize: Cardinal;
-  StartMs: Int64;
-  HasKey: Boolean;
+  Index: TVmsIndex;
+  ValidUpTo, Size: Int64;
+  Cut: Integer;
 begin
   Result := False;
-  if not ReadRegionCommit(Buf, Count) then Exit;
-  // Região reservada mas ainda sem bloco algum commitado: não é índice, é um
-  // arquivo recém-aberto. Quem chamou varre (são poucos blocos).
-  if Count <= 0 then Exit;
+  if FFilePath = '' then Exit;
+  if not ReadSidecar(FFilePath, FHeader.CreationUnixMs, Index, ValidUpTo) then Exit;
+  if (Length(Index) = 0) or (ValidUpTo <= FFirstBlockOffset) then Exit;
 
-  SetLength(FIndex, Count);
-  FIndexCount := 0;
-  Offset := 0;
-  for I := 0 to Count - 1 do
+  Size := FStream.Size;
+  if ValidUpTo <= Size then
   begin
-    FIndex[I].Offset := ReadI64(Buf, Offset);
-    FIndex[I].StartUnixMs := ReadI64(Buf, Offset);
-    FIndex[I].Flags := Buf[Offset]; Inc(Offset);
-    Inc(FIndexCount);
+    FIndex := Index;
+    FIndexCount := Length(Index);
+    FScannedUpTo := ValidUpTo;
+    Exit(True);
   end;
 
-  // Onde a varredura de cauda começa: o fim do último bloco indexado. Não dá
-  // para deduzir do índice (o fim de um bloco é o começo do seguinte, e do
-  // último não há seguinte), então lê-se o cabeçalho dele. Não conseguindo,
-  // joga a última entrada fora e deixa a varredura refazê-la — repetir um bloco
-  // no índice seria pior que relê-lo.
-  EndOffset := FIndex[FIndexCount - 1].Offset;
-  if ReadBlockMeta(EndOffset, BlockSize, StartMs, HasKey) and (BlockSize > 0) then
-    FScannedUpTo := EndOffset + Int64(BlockSize)
-  else
-  begin
-    Dec(FIndexCount);
-    SetLength(FIndex, FIndexCount);
-    FScannedUpTo := EndOffset;
-    if FIndexCount = 0 then
-    begin
-      FScannedUpTo := 0;
-      Exit;
-    end;
-  end;
+  // O sidecar está À FRENTE do .vms. São dois arquivos, e o sistema não despeja
+  // os dois no mesmo instante: uma queda de energia pode levar a cauda da mídia
+  // e não a do índice. Aproveita o prefixo que ainda tem arquivo por baixo, em
+  // vez de descartar o índice inteiro e varrer — este arquivo nunca mais vai
+  // ganhar um rodapé, então varrer aqui seria varrer em toda subida do servidor.
+  Cut := 0;
+  while (Cut < Length(Index)) and (Index[Cut].Offset < Size) do Inc(Cut);
+  // A última entrada que ainda cabia pode descrever um bloco cortado ao meio:
+  // ela também sai, e a varredura recomeça nela — é a varredura que sabe
+  // recusar bloco que passa do fim do arquivo.
+  if Cut > 0 then Dec(Cut);
+  if Cut <= 0 then Exit;
+  FScannedUpTo := Index[Cut].Offset;   // antes do SetLength: a entrada some ali
+  SetLength(Index, Cut);
+  FIndex := Index;
+  FIndexCount := Cut;
+  if FLogger <> nil then
+    FLogger.Warn('vms.reader',
+      Format('%s: indice adiante da midia (queda de energia?); aproveitando %d blocos',
+        [ExtractFileName(FFilePath), Cut]));
   Result := True;
 end;
 
@@ -923,10 +794,10 @@ begin
     FIndexFromFooter := LoadIndexFromFooter;
     if not FIndexFromFooter then
     begin
-      // Arquivo em gravação: a região dá o índice até o último commit e a
+      // Arquivo em gravação: o sidecar dá o índice até o último lote e a
       // varredura pega só o que veio depois — em vez de percorrer o arquivo
       // inteiro bloco a bloco, que é o que doía ao abrir a gravação de hoje.
-      if LoadIndexFromRegion then
+      if LoadIndexFromSidecar then
         ScanBlocksFrom(FScannedUpTo)
       else
       begin
@@ -1089,6 +960,9 @@ begin
   BestTime := 0;
   for I := 0 to High(Files) do
   begin
+    // O filtro do sistema casa por nome curto também: sem conferir a extensão,
+    // um `.vms.idx` recém-escrito seria "a gravação mais recente".
+    if not SameText(ExtractFileExt(Files[I]), '.vms') then Continue;
     T := TFile.GetLastWriteTime(Files[I]);
     if T > BestTime then
     begin

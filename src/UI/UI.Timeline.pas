@@ -1,4 +1,4 @@
-unit UI.Timeline;
+﻿unit UI.Timeline;
 
 // Barra de tempo do dia, na base do player: faixas gravadas, régua de horários,
 // cabeça de leitura, zoom, play/pausa, velocidade e o botão de voltar ao vivo.
@@ -702,3 +702,4 @@ begin
 end;
 
 end.
+

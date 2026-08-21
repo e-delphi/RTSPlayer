@@ -31,7 +31,6 @@ uses
   VMS.Domain.Clock,
   VMS.Domain.Supervisor,
   VMS.Rtsp.Client,
-  VMS.Rec.Format,
   VMS.App.Config,
   VMS.App.Composition,
   VMS.App.ScreenAwake,
@@ -288,7 +287,7 @@ begin
   FAppCfg.MaxBlockSamples := 256;
   FAppCfg.MaxBlockDurationMs := 2000;
   FAppCfg.MaxBlockSizeBytes := 1048576;
-  FAppCfg.IndexRegionBytes := VMS_REGION_DEFAULT_BYTES;
+  FAppCfg.RotateMs := DEFAULT_ROTATE_MINUTES * 60000;
 end;
 
 function TForm1.CamerasFilePath: string;

@@ -10,9 +10,18 @@ uses
   System.Generics.Collections,
   VMS.Domain.Types,
   VMS.Domain.Logging,
-  VMS.Rec.Format,
   VMS.Rtsp.Client,
   VMS.Domain.Session;
+
+const
+  // De quanto em quanto tempo a gravação roda de arquivo, quando a config não
+  // diz. Uma hora dá ~290 MB por arquivo a 650 kbps e 24 arquivos por dia por
+  // câmera — pasta que continua legível, retenção com granularidade fina, e
+  // índice de ~43 KB por arquivo na memória do servidor.
+  DEFAULT_ROTATE_MINUTES = 60;
+  // Um dia inteiro num arquivo só já é mais do que qualquer uso quer; acima
+  // disso a conta em ms nem cabe num Integer.
+  MAX_ROTATE_MINUTES = 1440;
 
 type
   TReconnectConfig = record
@@ -58,11 +67,10 @@ type
     MaxBlockSamples: Integer;
     MaxBlockDurationMs: Integer;
     MaxBlockSizeBytes: Integer;
-    // Região de índice reservada em cada .vms, em bytes. Cabe uma entrada de 17
-    // bytes por bloco, e cheia é o que faz a gravação rodar de arquivo — ou
-    // seja, é este número que decide o tamanho do segmento e quantos arquivos
-    // ficam na pasta da câmera. 64 KB = ~2 h a 2 s por bloco.
-    IndexRegionBytes: Integer;
+    // De quanto em quanto tempo a gravação roda de arquivo, em ms. É o que
+    // decide o tamanho de cada segmento e quantos arquivos ficam na pasta da
+    // câmera. 0 = não roda, e um arquivo cobre a sessão inteira.
+    RotateMs: Integer;
     Cameras: TArray<TCameraConfigEntry>;
   end;
 
@@ -333,7 +341,7 @@ var
   Root: TJSONValue;
   Obj, BlockObj: TJSONObject;
   Arr: TJSONArray;
-  I: Integer;
+  I, RotateMin: Integer;
   V: TJSONValue;
   LevelStr: string;
   Level: TLogLevel;
@@ -375,18 +383,21 @@ begin
       FConfig.MaxBlockSamples := GetJsonInt(BlockObj, 'maxSamples', 256);
       FConfig.MaxBlockDurationMs := GetJsonInt(BlockObj, 'maxDurationMs', 2000);
       FConfig.MaxBlockSizeBytes := GetJsonInt(BlockObj, 'maxSizeBytes', 1048576);
-      // Em KB na config: byte a byte não diz nada a quem lê o arquivo, e o
-      // número interessante ("quanto dura um segmento") sai de KB direto.
-      FConfig.IndexRegionBytes := NormalizeRegionBytes(
-        GetJsonInt(BlockObj, 'indexRegionKB', VMS_REGION_DEFAULT_BYTES div 1024) * 1024);
     end
     else
     begin
       FConfig.MaxBlockSamples := 256;
       FConfig.MaxBlockDurationMs := 2000;
       FConfig.MaxBlockSizeBytes := 1048576;
-      FConfig.IndexRegionBytes := VMS_REGION_DEFAULT_BYTES;
     end;
+
+    // Em minutos na config: é a unidade em que se pensa "de quanto em quanto
+    // tempo quero um arquivo novo". Aparado antes de virar ms, senão um número
+    // grande demais estoura o Integer e vira rotação a cada instante.
+    RotateMin := GetJsonInt(Obj, 'rotateMinutes', DEFAULT_ROTATE_MINUTES);
+    if RotateMin < 0 then RotateMin := 0;
+    if RotateMin > MAX_ROTATE_MINUTES then RotateMin := MAX_ROTATE_MINUTES;
+    FConfig.RotateMs := RotateMin * 60000;
 
     Arr := GetJsonArray(Obj, 'cameras');
     if Arr <> nil then

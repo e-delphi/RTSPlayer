@@ -190,102 +190,220 @@ def _varre_cauda(dados, de):
     return saida
 
 
-def _indice_do_leitor(dados):
-    """O índice que o EnsureIndex monta num arquivo SEM rodapé: o que a região
-    commitou, mais a varredura da cauda. É este o caminho que substituiu a
-    varredura do arquivo inteiro."""
+def _indice_do_leitor(caminho):
+    """O índice que o EnsureIndex monta num arquivo SEM rodapé: o que o sidecar
+    registrou, mais a varredura da cauda a partir do valid_up_to dele. É este o
+    caminho que substituiu a varredura do arquivo inteiro."""
+    dados = open(caminho, 'rb').read()
     h = vmslib.read_header(dados)
-    regiao = vmslib.read_region(dados, h)
-    if not regiao or not regiao[2]:
-        return _varre_cauda(dados, vmslib.first_block_offset(dados, h)), 'varredura inteira'
-    ent = [(e.offset, e.start_unix_ms, 1 if e.keyframe else 0) for e in regiao[2]]
-    ultimo = ent[-1][0]
-    size = struct.unpack_from('<I', dados, ultimo + 4)[0]
-    cauda = _varre_cauda(dados, ultimo + size)
-    return ent + cauda, 'região(%d) + cauda(%d)' % (len(ent), len(cauda))
+    try:
+        sc = vmslib.read_sidecar(caminho, h.creation_unix_ms)
+    except vmslib.VmsError:
+        sc = None
+    if not sc:
+        return _varre_cauda(dados, h.size), 'varredura inteira'
+    ent = [(e.offset, e.start_unix_ms, 1 if e.keyframe else 0) for e in sc[0]]
+    de = sc[1]
+    if de > len(dados):
+        # sidecar adiante da mídia: aproveita o prefixo que ainda tem arquivo
+        # por baixo, e recomeça a varredura na última entrada descartada
+        corte = 0
+        while corte < len(ent) and ent[corte][0] < len(dados):
+            corte += 1
+        if corte > 0:
+            corte -= 1
+        if corte <= 0:
+            return _varre_cauda(dados, h.size), 'varredura inteira'
+        de, ent = ent[corte][0], ent[:corte]
+    cauda = _varre_cauda(dados, de)
+    return ent + cauda, 'sidecar(%d) + cauda(%d)' % (len(ent), len(cauda))
 
 
-def teste_regiao_de_indice(pasta):
-    print('índice vivo (VLIX): região reservada depois do header')
-    p = gerar(pasta, 'reg.vms', blocos=60, regiao_kb=4)
-    dados = open(p, 'rb').read()
-    h = vmslib.read_header(dados)
-    regiao = vmslib.read_region(dados, h)
-    check('região achada logo depois do header', regiao is not None)
-    check('capacidade combina com o tamanho reservado',
-          regiao[0] == 4096 and regiao[1] == (4096 - vmslib.REGION_HEADER_SIZE) // 17)
-    blocos = list(vmslib.iter_blocks(dados, h))
-    check('a mídia começa DEPOIS da região',
-          blocos[0].offset == h.size + regiao[0], 'primeiro bloco em %d' % blocos[0].offset)
-    check('os 60 blocos continuam sendo lidos em sequência', len(blocos) == 60)
-    check('região fechada descreve o arquivo inteiro', len(regiao[2]) == 60)
-    vidx = vmslib.read_block_index(dados)
-    check('região e VIDX do rodapé dizem a mesma coisa',
-          [(e.offset, e.start_unix_ms, e.keyframe) for e in vidx] ==
-          [(e.offset, e.start_unix_ms, e.keyframe) for e in regiao[2]])
-    check('região confere com os blocos do arquivo',
-          vmslib.check_index(blocos, regiao[2]) == [])
-
+def teste_sidecar(pasta):
+    print('índice do arquivo em gravação (.vms.idx)')
     # o caso que motivou tudo: arquivo em gravação, sem rodapé
-    p = gerar(pasta, 'reg_aberto.vms', blocos=60, regiao_kb=4, truncado=True)
+    p = gerar(pasta, 'sc_aberto.vms', blocos=60, sidecar=True, truncado=True)
     dados = open(p, 'rb').read()
     h = vmslib.read_header(dados)
-    inteira = _varre_cauda(dados, vmslib.first_block_offset(dados, h))
-    obtido, como = _indice_do_leitor(dados)
     check('gravação em curso: sem rodapé', vmslib.read_footer(dados) is None)
-    check('região + cauda == varredura inteira', obtido == inteira, como)
-    check('e a região cobriu a maior parte sozinha',
-          0 < len(vmslib.read_region(dados, h)[2]) < len(inteira))
+    check('e com sidecar ao lado', os.path.exists(p + '.idx'))
+    entradas, valid = vmslib.read_sidecar(p, h.creation_unix_ms)
+    inteira = _varre_cauda(dados, h.size)
+    check('sidecar confere com os blocos que ele cobre',
+          vmslib.check_index(list(vmslib.iter_blocks(dados, h))[:len(entradas)],
+                             entradas) == [])
+    obtido, como = _indice_do_leitor(p)
+    check('sidecar + cauda == varredura inteira', obtido == inteira, como)
+    check('e o sidecar cobriu a maior parte sozinho',
+          0 < len(entradas) < len(inteira),
+          '%d de %d blocos' % (len(entradas), len(inteira)))
+    check('valid_up_to cai exatamente no começo de um bloco',
+          valid in [b[0] for b in inteira])
 
-    # região cheia: para de commitar na capacidade e ninguém perde bloco
-    p = gerar(pasta, 'reg_cheia.vms', blocos=80, regiao_kb=1)   # 1 KB = 57 entradas
+    # fechou direito: o VIDX foi para o fim do .vms e o sidecar sumiu
+    p = gerar(pasta, 'sc_fechado.vms', blocos=40, sidecar=True)
     dados = open(p, 'rb').read()
-    h = vmslib.read_header(dados)
-    regiao = vmslib.read_region(dados, h)
-    check('região cheia commita até a capacidade e para',
-          len(regiao[2]) == regiao[1], '%d de %d' % (len(regiao[2]), regiao[1]))
-    obtido, como = _indice_do_leitor(dados)
-    check('estourando a região, a cauda cobre o resto',
-          obtido == _varre_cauda(dados, vmslib.first_block_offset(dados, h)), como)
+    check('gravação fechada: sidecar apagado', not os.path.exists(p + '.idx'))
+    entradas = vmslib.read_block_index(dados)
+    check('e o índice completo ficou no fim do .vms',
+          entradas is not None and len(entradas) == 40)
+    check('índice do rodapé confere com a varredura',
+          vmslib.check_index(list(vmslib.iter_blocks(dados, h)), entradas) == [])
 
-    # queda no meio do commit: o slot novo fica quebrado, o anterior salva
-    d = bytearray(open(gerar(pasta, 'reg_torto.vms', blocos=60, regiao_kb=4,
-                             truncado=True), 'rb').read())
-    h = vmslib.read_header(bytes(d))
-    antes = len(vmslib.read_region(bytes(d), h)[2])
-    geracoes = [struct.unpack_from('<I', d, h.size + o + 4)[0]
-                for o in vmslib.REGION_COMMIT_OFS]
-    novo = vmslib.REGION_COMMIT_OFS[0 if geracoes[0] > geracoes[1] else 1]
-    d[h.size + novo + 8] ^= 0xFF                 # estraga o crc do slot valendo
-    depois = vmslib.read_region(bytes(d), h)[2]
-    check('slot de commit quebrado cai no anterior', 0 < len(depois) < antes,
-          '%d -> %d entradas' % (antes, len(depois)))
-    obtido, como = _indice_do_leitor(bytes(d))
+    # queda no meio da escrita de um lote: vale o que veio antes dele
+    p = gerar(pasta, 'sc_torto.vms', blocos=60, sidecar=True, truncado=True)
+    bruto = bytearray(open(p + '.idx', 'rb').read())
+    antes = len(vmslib.read_sidecar(p, vmslib.read_header(
+        open(p, 'rb').read()).creation_unix_ms)[0])
+    bruto[-8] ^= 0xFF                     # estraga a última entrada do último lote
+    open(p + '.idx', 'wb').write(bruto)
+    depois = vmslib.read_sidecar(p, vmslib.read_header(
+        open(p, 'rb').read()).creation_unix_ms)
+    check('lote com crc quebrado é descartado',
+          depois is not None and len(depois[0]) < antes,
+          '%d -> %d entradas' % (antes, len(depois[0])))
+    obtido, como = _indice_do_leitor(p)
     check('e o índice final continua igual à varredura inteira',
-          obtido == _varre_cauda(bytes(d), vmslib.first_block_offset(bytes(d), h)), como)
+          obtido == _varre_cauda(open(p, 'rb').read(),
+                                 vmslib.read_header(open(p, 'rb').read()).size), como)
 
-    # fragmento servido pela API: header + blocos, sem região
-    p = gerar(pasta, 'reg_frag.vms', blocos=4)
+    # lote cortado no meio (o que a gravação em curso deixa no fim do arquivo)
+    p = gerar(pasta, 'sc_cortado.vms', blocos=60, sidecar=True, truncado=True)
+    bruto = open(p + '.idx', 'rb').read()
+    open(p + '.idx', 'wb').write(bruto[:-30])
+    obtido, como = _indice_do_leitor(p)
+    check('lote cortado no fim não atrapalha',
+          obtido == _varre_cauda(open(p, 'rb').read(),
+                                 vmslib.read_header(open(p, 'rb').read()).size), como)
+
+    # sidecar de OUTRA gravação não pode ser usado
+    p2 = gerar(pasta, 'sc_outro.vms', blocos=20, sidecar=True, truncado=True,
+               inicio=1755000000000)
+    p3 = gerar(pasta, 'sc_alvo.vms', blocos=20, sidecar=True, truncado=True,
+               inicio=1755229501000)
+    import shutil
+    shutil.copyfile(p2 + '.idx', p3 + '.idx')
+    alvo = vmslib.read_header(open(p3, 'rb').read())
+    check('sidecar de outra gravação é ignorado',
+          vmslib.read_sidecar(p3, alvo.creation_unix_ms) is None)
+
+    # queda de energia levando a cauda da MÍDIA e não a do índice: os dois
+    # arquivos não vão para o disco no mesmo instante
+    p = gerar(pasta, 'sc_adiante.vms', blocos=60, sidecar=True, truncado=True)
+    bruto = open(p, 'rb').read()
+    entradas = vmslib.read_sidecar(p, vmslib.read_header(bruto).creation_unix_ms)[0]
+    # corta a mídia no meio do trecho que o sidecar já registrou
+    corte = entradas[len(entradas) // 2].offset + 40
+    open(p, 'wb').write(bruto[:corte])
+    obtido, como = _indice_do_leitor(p)
+    esperado = _varre_cauda(open(p, 'rb').read(), vmslib.read_header(bruto).size)
+    check('índice adiante da mídia: aproveita o prefixo, não varre tudo',
+          'sidecar(' in como, como)
+    check('e o resultado é o mesmo da varredura inteira', obtido == esperado, como)
+    check('nenhum bloco duplicado ou fora do arquivo',
+          len(obtido) == len(set(b[0] for b in obtido)) and
+          all(b[0] < corte for b in obtido))
+
+    # fragmento da API: header + blocos, sem sidecar nenhum
+    p = gerar(pasta, 'sc_frag.vms', blocos=4)
     dados = open(p, 'rb').read()
     h = vmslib.read_header(dados)
-    check('fragmento da API não tem região', vmslib.read_region(dados, h) is None)
-    check('e nele a mídia começa em HeaderSize',
-          vmslib.first_block_offset(dados, h) == h.size)
-    check('fragmento sem região continua sendo lido',
-          len(list(vmslib.iter_blocks(dados, h))) == 4)
+    check('fragmento da API não tem sidecar', not os.path.exists(p + '.idx'))
+    check('e a mídia começa em HeaderSize',
+          list(vmslib.iter_blocks(dados, h))[0].offset == h.size)
+
+
+def _finaliza_orfao(caminho):
+    """Modelo do Vms.Server.Repair: monta o índice (sidecar + cauda), corta a
+    cauda que a queda deixou pela metade e escreve VIDX + rodapé no fim do .vms.
+    Devolve False quando não há o que fazer."""
+    dados = open(caminho, 'rb').read()
+    h = vmslib.read_header(dados)
+    if not os.path.exists(caminho + '.idx'):
+        return False
+    if vmslib.read_footer(dados) is not None:
+        os.remove(caminho + '.idx')      # sobra de um fechamento que deu certo
+        return False
+    entradas, _ = _indice_do_leitor(caminho)
+    if not entradas:
+        os.remove(caminho + '.idx')
+        return False
+
+    ultimo = entradas[-1][0]
+    fim_midia = ultimo + struct.unpack_from('<I', dados, ultimo + 4)[0]
+    corpo = genvms.MAGIC_INDEX + genvms.u32(12 + len(entradas) * 17 + 4) \
+        + genvms.u32(len(entradas))
+    for off, ms, flags in entradas:
+        corpo += genvms.i64(off) + genvms.i64(ms) + bytes([flags])
+    chunk = corpo + genvms.u32(zlib.crc32(corpo))
+
+    duracao = max(0, entradas[-1][1] - h.creation_unix_ms)
+    foot = (vmslib.MAGIC_FOOTER + genvms.u32(len(entradas)) + genvms.i64(duracao)
+            + genvms.u64(ultimo) + genvms.u64(fim_midia) + genvms.u32(len(entradas)))
+    rodape = foot + genvms.u32(zlib.crc32(foot))
+
+    with open(caminho, 'wb') as f:
+        f.write(dados[:fim_midia] + chunk + rodape)
+    os.remove(caminho + '.idx')
+    return True
+
+
+def teste_finaliza_gravacao_aberta(pasta):
+    print('gravação que ficou aberta é fechada na subida do servidor')
+    p = gerar(pasta, 'rep_orfao.vms', blocos=60, sidecar=True, truncado=True)
+    antes = open(p, 'rb').read()
+    esperado = _varre_cauda(antes, vmslib.read_header(antes).size)
+    tamanho_antes = len(antes)
+
+    check('antes: sem rodapé e com sidecar',
+          vmslib.read_footer(antes) is None and os.path.exists(p + '.idx'))
+    check('finalizou', _finaliza_orfao(p) is True)
+
+    dados = open(p, 'rb').read()
+    rodape = vmslib.read_footer(dados)
+    check('depois: tem rodapé', rodape is not None)
+    check('e o sidecar sumiu', not os.path.exists(p + '.idx'))
+    entradas = vmslib.read_block_index(dados, rodape)
+    check('índice no fim do .vms == o que a varredura acha',
+          [(e.offset, e.start_unix_ms, 1 if e.keyframe else 0) for e in entradas]
+          == esperado)
+    check('índice confere com os blocos, entrada por entrada',
+          vmslib.check_index(list(vmslib.iter_blocks(dados, vmslib.read_header(dados))),
+                             entradas) == [])
+    check('o rodapé conta os mesmos blocos', rodape.total_blocks == len(esperado))
+    check('a cauda incompleta foi descartada',
+          rodape.index_offset == esperado[-1][0] +
+          struct.unpack_from('<I', dados, esperado[-1][0] + 4)[0],
+          'índice começa em %d' % rodape.index_offset)
+    check('e o arquivo encolheu (o pedaço cortado saiu)',
+          rodape.index_offset < tamanho_antes)
+
+    # agora ele é indistinguível de uma gravação que fechou direito
+    caro, barato = _resumo_caro(p), _resumo_barato(p)
+    check('depois de fechado, o resumo barato bate com o caro',
+          caro == barato, '%s vs %s' % (caro, barato))
+
+    # arquivo que JÁ tinha rodapé: o .vms não pode ser tocado, só a sobra sai
+    p = gerar(pasta, 'rep_fechado.vms', blocos=20, sidecar=True)
+    open(p + '.idx', 'wb').write(b'sobra que nao deveria estar aqui')
+    antes = open(p, 'rb').read()
+    check('arquivo já fechado não é finalizado de novo', _finaliza_orfao(p) is False)
+    check('o .vms fica byte a byte igual', open(p, 'rb').read() == antes)
+    check('e a sobra de sidecar é removida', not os.path.exists(p + '.idx'))
 
 
 ASSUMIDO_MS = 2000      # mesma estimativa do servidor para o último bloco
 
 
-def _resumo_caro(dados):
+def _resumo_caro(caminho):
     """Como o inventário era feito: monta o índice e olha as pontas."""
+    dados = open(caminho, 'rb').read()
     h = vmslib.read_header(dados)
     rodape = vmslib.read_footer(dados)
     entradas = vmslib.read_block_index(dados, rodape) if rodape else None
     if entradas is None:
         entradas = [vmslib.IndexEntry(o, ms, f)
-                    for o, ms, f in _indice_do_leitor(dados)[0]]
+                    for o, ms, f in _indice_do_leitor(caminho)[0]]
     if not entradas:
         return None
     fim = entradas[-1].start_unix_ms + ASSUMIDO_MS
@@ -294,10 +412,11 @@ def _resumo_caro(dados):
     return dict(inicio=entradas[0].start_unix_ms, fim=fim, blocos=len(entradas))
 
 
-def _resumo_barato(dados):
-    """Como o inventário passou a ser feito: rodapé ou região, sem índice."""
+def _resumo_barato(caminho):
+    """Como o inventário passou a ser feito: rodapé ou sidecar, sem índice."""
+    dados = open(caminho, 'rb').read()
     h = vmslib.read_header(dados)
-    o = vmslib.first_block_offset(dados, h)
+    o = h.size
     if dados[o:o + 4] != vmslib.MAGIC_BLOCK:
         return None
     inicio = struct.unpack_from('<q', dados, o + 12)[0]     # 1 leitura curta
@@ -306,19 +425,19 @@ def _resumo_barato(dados):
         return dict(inicio=inicio,
                     fim=h.creation_unix_ms + rodape.duration_ms + ASSUMIDO_MS,
                     blocos=rodape.total_blocks)
-    regiao = vmslib.read_region(dados, h)
-    if regiao and regiao[2]:
-        return dict(inicio=regiao[2][0].start_unix_ms,
-                    fim=regiao[2][-1].start_unix_ms + ASSUMIDO_MS,
-                    blocos=len(regiao[2]))
+    sc = vmslib.read_sidecar(caminho, h.creation_unix_ms)
+    if sc:
+        return dict(inicio=sc[0][0].start_unix_ms,
+                    fim=sc[0][-1].start_unix_ms + ASSUMIDO_MS,
+                    blocos=len(sc[0]))
     return None     # cai na varredura, como o ReadInfo faz
 
 
 def teste_resumo_do_inventario(pasta):
     print('resumo de arquivo sem montar índice')
     # fechado: o resumo barato tem de bater EXATAMENTE com o caro
-    dados = open(gerar(pasta, 'inv_fechado.vms', blocos=40, regiao_kb=4), 'rb').read()
-    caro, barato = _resumo_caro(dados), _resumo_barato(dados)
+    p = gerar(pasta, 'inv_fechado.vms', blocos=40, sidecar=True)
+    caro, barato = _resumo_caro(p), _resumo_barato(p)
     check('arquivo fechado: mesmo início', caro['inicio'] == barato['inicio'],
           '%d vs %d' % (caro['inicio'], barato['inicio']))
     check('arquivo fechado: mesmo fim', caro['fim'] == barato['fim'],
@@ -326,27 +445,25 @@ def teste_resumo_do_inventario(pasta):
     check('arquivo fechado: mesma contagem de blocos',
           caro['blocos'] == barato['blocos'])
 
-    # em gravação: início exato; fim atrasado no máximo um commit, nunca à frente
-    dados = open(gerar(pasta, 'inv_aberto.vms', blocos=60, regiao_kb=4,
-                       truncado=True), 'rb').read()
-    caro, barato = _resumo_caro(dados), _resumo_barato(dados)
+    # em gravação: início exato; fim atrasado no máximo um lote, nunca à frente
+    p = gerar(pasta, 'inv_aberto.vms', blocos=60, sidecar=True, truncado=True)
+    caro, barato = _resumo_caro(p), _resumo_barato(p)
     check('em gravação: início exato', caro['inicio'] == barato['inicio'])
     check('em gravação: fim nunca passa do real', barato['fim'] <= caro['fim'])
     atraso = caro['fim'] - barato['fim']
-    check('em gravação: fim atrasado no máximo um commit',
-          atraso <= genvms.REGION_COMMIT_EVERY * ASSUMIDO_MS,
+    check('em gravação: fim atrasado no máximo um lote',
+          atraso <= genvms.SIDECAR_BATCH_BLOCKS * ASSUMIDO_MS,
           '%d ms de atraso' % atraso)
     check('em gravação: contagem nunca passa do real',
           0 < barato['blocos'] <= caro['blocos'])
 
-    # arquivo recém-aberto, antes do primeiro commit: o resumo barato desiste e
+    # arquivo recém-aberto, antes do primeiro lote: o resumo barato desiste e
     # quem chamou varre — que é barato, porque o arquivo é curto
-    dados = open(gerar(pasta, 'inv_novo.vms', blocos=3, regiao_kb=4,
-                       truncado=True), 'rb').read()
-    check('antes do primeiro commit, o resumo barato devolve nada',
-          _resumo_barato(dados) is None)
+    p = gerar(pasta, 'inv_novo.vms', blocos=3, sidecar=True, truncado=True)
+    check('antes do primeiro lote, o resumo barato devolve nada',
+          _resumo_barato(p) is None)
     check('e a varredura ainda descreve o arquivo',
-          _resumo_caro(dados)['blocos'] == 2)
+          _resumo_caro(p)['blocos'] == 2)
 
 
 def teste_crc(pasta):
@@ -455,8 +572,9 @@ def main():
         teste_formato(pasta)
         teste_ancora_nao_desloca_payload(pasta)
         teste_indice(pasta)
-        teste_regiao_de_indice(pasta)
+        teste_sidecar(pasta)
         teste_resumo_do_inventario(pasta)
+        teste_finaliza_gravacao_aberta(pasta)
         teste_crc(pasta)
         teste_segmentos(pasta)
         teste_fragmento(pasta)

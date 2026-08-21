@@ -50,9 +50,9 @@ type
     MaxBlockSamples: Integer;
     MaxBlockDurationMs: Integer;
     MaxBlockSizeBytes: Integer;
-    // Tamanho da região de índice viva do .vms. É ela que decide de quanto em
-    // quanto tempo a gravação roda de arquivo (ver VMS.Rec.Format).
-    IndexRegionBytes: Integer;
+    // De quanto em quanto tempo a gravação roda de arquivo. 0 = nunca roda,
+    // e aí um arquivo cobre a sessão inteira.
+    RotateMs: Integer;
     ConnectTimeoutMs: Cardinal;
     RtspTimeoutMs: Cardinal;
     RecordEnabled: Boolean;
@@ -97,6 +97,7 @@ type
     // O header do arquivo em gravação, guardado para a rotação poder reabrir
     // outro igual sem voltar ao SDP.
     FRecHeader: TVmsHeader;
+    FFileStartedMs: Int64;   // monotônico, de quando o arquivo corrente abriu
     FMediaSink: IMediaSink;
     FFormatNotified: Boolean;  // o sink já soube do formato desta sessão
     FUsedTransport: TTransportKind;
@@ -122,6 +123,7 @@ type
     procedure CleanupTransportAttempt;
     procedure SetupDepacketizers;
     procedure WriteHeaderFromSdp;
+    function RotateDue(const Block: TVmsBlock): Boolean;
     procedure RotateWriter;
     procedure HandleSample(const Sample: TSample);
     procedure AccountRtp(IsVideo: Boolean; const Packet: TRtpPacket);
@@ -157,6 +159,8 @@ const
   CONNECT_DEFAULT_TIMEOUT = 5000;
   RTSP_DEFAULT_TIMEOUT = 10000;
   UDP_DRAIN_MAX = 256; // pacotes drenados por iteração (limita rajada de keyframe)
+  // quanto se espera por um keyframe depois de vencido o prazo de rotação
+  ROTATE_KEYFRAME_GRACE_MS = 60000;
 
 function FormatFilename(const Pattern, Name: string; CreationUtc: TDateTime): string;
   function Pad(I, W: Integer): string;
@@ -822,8 +826,9 @@ begin
 
   FRecHeader := Header;
   FOutputPath := UniqueRecordingPath(BuildOutputPath);
-  FWriter := TFileRecordingWriter.Create(FOutputPath, FConfig.IndexRegionBytes);
+  FWriter := TFileRecordingWriter.Create(FOutputPath);
   FWriter.WriteHeader(Header);
+  FFileStartedMs := FClock.MonotonicMs;
 
   FBlockBuilder := TBlockBuilder.Create(FConfig.MaxBlockSamples,
                                         FConfig.MaxBlockDurationMs,
@@ -832,11 +837,9 @@ begin
     procedure(const Block: TVmsBlock)
     begin
       if FWriter = nil then Exit;
-      // Região de índice cheia: roda de arquivo antes de gravar este bloco.
-      // Com folga, espera um keyframe, para o arquivo novo começar por um ponto
-      // de entrada do decodificador.
-      if FWriter.IndexRegionFull or
-         (FWriter.IndexRegionNearlyFull and SamplesHaveKeyframe(Block.Samples)) then
+      // Roda de arquivo antes de gravar este bloco, para ele já entrar no
+      // arquivo novo — que assim começa por um keyframe.
+      if RotateDue(Block) then
         RotateWriter;
       if FWriter = nil then Exit;
       try
@@ -847,6 +850,22 @@ begin
       end;
     end);
   FLogger.Info('session.' + FConfig.Name, 'Recording to ' + FOutputPath);
+end;
+
+// Passou o tempo de rodar de arquivo. Depois do prazo, espera o próximo bloco
+// com keyframe, para o arquivo novo começar por um ponto de entrada do
+// decodificador; câmera sem keyframe nenhum não segura a rotação além da
+// tolerância.
+function TCameraSession.RotateDue(const Block: TVmsBlock): Boolean;
+var
+  Age: Int64;
+begin
+  Result := False;
+  if FConfig.RotateMs <= 0 then Exit;
+  Age := FClock.MonotonicMs - FFileStartedMs;
+  if Age < FConfig.RotateMs then Exit;
+  Result := SamplesHaveKeyframe(Block.Samples) or
+            (Age >= FConfig.RotateMs + ROTATE_KEYFRAME_GRACE_MS);
 end;
 
 // Fecha o arquivo corrente e segue no seguinte, sem tocar no TBlockBuilder — ele
@@ -866,9 +885,10 @@ begin
   FRecHeader.CreationUnixMs := FClock.NowUtcMs;
   FOutputPath := UniqueRecordingPath(BuildOutputPath);
   try
-    FWriter := TFileRecordingWriter.Create(FOutputPath, FConfig.IndexRegionBytes);
+    FWriter := TFileRecordingWriter.Create(FOutputPath);
     FWriter.WriteHeader(FRecHeader);
-    FLogger.Info('session.' + FConfig.Name, 'Index region full; recording to ' + FOutputPath);
+    FFileStartedMs := FClock.MonotonicMs;
+    FLogger.Info('session.' + FConfig.Name, 'Rotating; recording to ' + FOutputPath);
   except
     on E: Exception do
     begin

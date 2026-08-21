@@ -16,10 +16,10 @@ unit Vms.Server.IndexCache;
 // índices lidos por consulta, cada um proporcional às horas gravadas.
 //
 //   arquivo fechado     -> rodapé (blocos + duração) e o primeiro bloco.
-//   arquivo em gravação -> as pontas da região de índice viva (VLIX), que fica
-//                          no máximo um commit atrás (~30 s). Sem região (ou
-//                          antes do primeiro commit), varre — mas aí é um
-//                          arquivo recém-aberto, de poucos blocos.
+//   arquivo em gravação -> as pontas do `.vms.idx` ao lado, que fica no máximo
+//                          um lote atrás (~30 s). Sem sidecar (ou antes do
+//                          primeiro lote), varre — mas aí é um arquivo
+//                          recém-aberto, de poucos blocos.
 //
 // Nada de handle aberto entre consultas: no Windows um arquivo com handle vivo
 // não pode ser apagado, e a varredura de retenção precisa poder apagar.
@@ -55,9 +55,9 @@ type
     Bytes: Int64;
     Blocks: Integer;
     Closed: Boolean;       // tem rodapé: a gravação foi encerrada direito
-    // Tem índice pronto — no rodapé, se fechado, ou na região viva, se ainda
-    // grava. False = descrever este arquivo custou uma varredura, e tocá-lo
-    // vai custar outra.
+    // Tem índice pronto — no rodapé, se fechado, ou no `.vms.idx` ao lado, se
+    // ainda grava. False = descrever este arquivo custou uma varredura, e
+    // tocá-lo vai custar outra.
     Indexed: Boolean;
     HasVideo: Boolean;
     VideoCodec: TVideoCodec;
@@ -177,8 +177,8 @@ begin
 end;
 
 // O resumo de um arquivo, sem montar índice. Duas leituras curtas no caso
-// normal; a varredura só sobra para arquivo recém-aberto (poucos blocos) ou
-// gravado por um build sem região de índice.
+// normal; a varredura só sobra para arquivo aberto agora, antes de o primeiro
+// lote do sidecar sair — e aí são poucos blocos.
 function TVmsIndexCache.ReadInfo(const Path: string; out Info: TVmsFileInfo): Boolean;
 var
   Reader: TVmsReader;
@@ -232,14 +232,14 @@ begin
       if LastMs < FirstMs then LastMs := FirstMs;
       Info.Indexed := True;
     end
-    else if HaveRange and Reader.RegionSummary(Count, FirstMs, LastMs) then
-      // Arquivo em gravação com região: as pontas do que ela já commitou.
+    else if HaveRange and Reader.SidecarSummary(Count, FirstMs, LastMs) then
+      // Arquivo em gravação: as pontas do que o `.vms.idx` já registrou.
       Info.Indexed := True
     else
     begin
-      // Sem rodapé e sem região commitada: não há como saber onde termina sem
-      // olhar bloco a bloco. Acontece com arquivo recém-aberto (é curto) e com
-      // gravação de build antigo (vai embora com a retenção).
+      // Sem rodapé e sem sidecar legível: não há como saber onde termina sem
+      // olhar bloco a bloco. É o arquivo aberto há menos de um lote — curto, por
+      // definição.
       Count := Reader.EnsureIndex;
       Info.Indexed := False;
       if Count > 0 then
@@ -531,7 +531,9 @@ begin
   SetLength(Tmp, Length(Paths));
   Count := 0;
   for I := 0 to High(Paths) do
-    if GetInfo(Paths[I], Info) then
+    // O filtro do sistema casa por nome curto também; conferir a extensão é o
+    // que garante que um `.vms.idx` nunca entre na lista como se fosse gravação.
+    if SameText(ExtractFileExt(Paths[I]), '.vms') and GetInfo(Paths[I], Info) then
     begin
       Tmp[Count] := Info;
       Inc(Count);

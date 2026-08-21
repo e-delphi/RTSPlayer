@@ -204,6 +204,7 @@
         <DCCReference Include="..\src\Recording\VMS.Rec.Format.pas"/>
         <DCCReference Include="..\src\Recording\VMS.Rec.Block.pas"/>
         <DCCReference Include="..\src\Recording\VMS.Rec.Writer.pas"/>
+        <DCCReference Include="..\src\Recording\VMS.Rec.Sidecar.pas"/>
         <DCCReference Include="..\src\Recording\VMS.Rec.Reader.pas"/>
         <DCCReference Include="..\src\Recording\VMS.Rec.Paths.pas"/>
         <DCCReference Include="..\src\App\VMS.App.Clock.pas"/>
@@ -230,6 +231,7 @@
         <DCCReference Include="src\Recording\Vms.Server.RecSink.pas"/>
         <DCCReference Include="src\App\Vms.Server.Logger.pas"/>
         <DCCReference Include="src\App\Vms.Server.Retention.pas"/>
+        <DCCReference Include="src\App\Vms.Server.Repair.pas"/>
         <DCCReference Include="src\App\Vms.Server.Config.pas"/>
         <DCCReference Include="src\App\Vms.Server.Composition.pas"/>
         <BuildConfiguration Include="Base">

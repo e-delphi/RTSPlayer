@@ -36,9 +36,9 @@ function CameraDir(const StorageDir, Camera: string): string;
 function EnsureCameraDir(const StorageDir, Camera: string): string;
 
 // Caminho ainda livre para uma gravação nova. O padrão de nome tem resolução de
-// segundo, e a gravação roda de arquivo quando a região de índice enche — duas
-// trocas no mesmo segundo dariam o mesmo nome, e o writer abre com fmCreate, ou
-// seja, por cima. Isto apagaria a gravação que acabou de fechar.
+// segundo, e a gravação roda de arquivo por tempo — duas trocas no mesmo segundo
+// dariam o mesmo nome, e o writer abre com fmCreate, ou seja, por cima. Isto
+// apagaria a gravação que acabou de fechar.
 function UniqueRecordingPath(const Path: string): string;
 
 implementation

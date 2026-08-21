@@ -988,7 +988,7 @@ begin
   Result := False;
   if (not FLiveMode) or (FCameraName = '') then Exit;
   // Arquivo que MOSTROU o rodapé acabou de verdade — é o caso da gravação que
-  // rodou de arquivo (região de índice cheia). Aí não há o que esperar: esperar
+  // rodou de arquivo no tempo dela. Aí não há o que esperar: esperar
   // seria congelar a imagem por LIVE_STALL_MS a cada troca. Sem rodapé, o fim
   // pode ser só o instante entre dois blocos, e aí vale a espera.
   if (not FReader.AtClosedEnd) and

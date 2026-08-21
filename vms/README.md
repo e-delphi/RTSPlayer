@@ -49,6 +49,34 @@ Os dois caminhos gravam o mesmo `.vms`, por vias diferentes:
   entra o `TRecordingSink`, que usa as mesmas peças (`TBlockBuilder` +
   `TFileRecordingWriter`) para gerar um `.vms` idêntico.
 
+Cada gravação **roda de arquivo** a cada `rotateMinutes` (60), sempre esperando um
+keyframe para o arquivo novo começar por um ponto de entrada do decodificador.
+
+### O índice, e o que acontece numa queda de energia
+
+> Desenhado, byte a byte: [docs/anatomia-vms.html](../docs/anatomia-vms.html).
+
+Enquanto grava, cada `.vms` tem um `.vms.idx` ao lado com o índice tempo →
+posição, escrito em lotes a cada 16 blocos. É o que permite buscar um instante na
+gravação de agora sem varrer o arquivo. Fechando direito, esse índice vai para o
+fim do `.vms` (chunk `VIDX`) e o sidecar é apagado.
+
+Caiu a energia no meio? O `.vms` fica sem rodapé e o `.vms.idx` fica no disco. Na
+**subida seguinte do servidor** — depois da varredura de retenção e antes de as
+câmeras começarem a gravar — o `Vms.Server.Repair` termina o serviço: monta o
+índice, descarta o pedaço de bloco que a queda deixou pela metade, escreve `VIDX`
+e rodapé, e apaga o sidecar. O resultado é indistinguível de uma gravação que
+fechou normalmente:
+
+```
+[INFO ] repair: isis_2026-08-16_18-38-21.vms fechado: 1794 blocos indexados, 91320 bytes de cauda incompleta descartados
+[INFO ] repair: 1 gravacao(oes) que ficaram abertas foram fechadas
+```
+
+Arquivo em uso por outra instância do servidor é pulado (o handle é aberto em
+modo exclusivo), e arquivo sem sidecar não é tocado — fechá-lo custaria uma
+varredura completa, e isso não pode segurar a subida do servidor.
+
 ## Como o ao vivo é publicado
 
 O mesmo sample que vai para a gravação vai também para um buffer circular em
