@@ -60,6 +60,13 @@ type
     FZoom: Integer;              // índice em ZOOM_SPANS
     FPositionMs: Int64;
     FFollow: Boolean;            // a janela acompanha a reprodução?
+    // Reservas de controles reaproveitados entre redesenhos. Ver TakeSeg.
+    FSegPool: TArray<TRectangle>;
+    FSegUsed: Integer;
+    FTickPool: TArray<TRectangle>;
+    FTickUsed: Integer;
+    FLblPool: TArray<TLabel>;
+    FLblUsed: Integer;
     FPanActive: Boolean;
     FPanMoved: Boolean;
     FPanStartX: Single;
@@ -74,6 +81,12 @@ type
     function MsToX(Ms: Int64): Single;
     function ViewSpanMs: Int64;
     procedure PanToStart(NewStartMs: Int64);
+    // Um controle da reserva, criando mais um só quando a reserva acaba.
+    function TakeSeg: TRectangle;
+    function TakeTick: TRectangle;
+    function TakeLabel: TLabel;
+    procedure HideUnusedPools;
+    procedure EndPan;
     procedure TrackMouseDown(Sender: TObject; Button: TMouseButton;
       Shift: TShiftState; X, Y: Single);
     procedure TrackMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
@@ -114,6 +127,8 @@ implementation
 
 const
   BAR_HEIGHT = 28;
+  // Maior velocidade do ciclo do botão. O engine aceita até isto (SetSpeed).
+  MAX_SPEED = 64;
   // marca cheia (6) + rótulo: apertar mais corta o texto embaixo
   RULER_HEIGHT = 20;
   ICON_PLAY  = 'M7 4 L19 12 L7 20 Z';
@@ -219,6 +234,12 @@ begin
   // fora da barra nunca chegava aqui e o FPanActive ficava ligado para sempre.
   // Com AutoCapture o controle captura no MouseDown e recebe o resto do gesto
   // onde quer que ele termine — inclusive fora da janela.
+  //
+  // Só que a captura NÃO é garantia: no Windows quem a sustenta é um
+  // SetCapture() do sistema, e o FMX não trata WM_CAPTURECHANGED. Quando o
+  // sistema a tira no meio do gesto (outra janela ativa, um menu, alt-tab), o
+  // botão sobe e ninguém avisa este controle. Por isso o TrackMouseMove também
+  // sabe encerrar o arrasto sozinho — ver EndPan.
   FTrack.AutoCapture := True;
   FTrack.OnMouseDown := TrackMouseDown;
   FTrack.OnMouseMove := TrackMouseMove;
@@ -415,6 +436,90 @@ begin
   Result := 5000;
 end;
 
+// ---------------------------------------------------------------------------
+// Reservas de controles
+//
+// O redesenho acontece a cada MouseMove de um arrasto. Recriar os controles a
+// cada passada era o que travava a barra: criar um TLabel no FMX dispara uma
+// busca de estilo, e a régua tem dezenas deles. Aqui os controles nascem uma vez
+// e depois só mudam de posição, tamanho e texto; o que sobrar num redesenho
+// menor fica invisível esperando o próximo.
+// ---------------------------------------------------------------------------
+
+function TFrameTimeline.TakeSeg: TRectangle;
+begin
+  if FSegUsed < Length(FSegPool) then
+    Result := FSegPool[FSegUsed]
+  else
+  begin
+    Result := TRectangle.Create(Self);
+    Result.Parent := FTrack;
+    Result.Align := TAlignLayout.None;
+    Result.HitTest := False;   // o toque é da barra, não das faixas
+    Result.Stroke.Kind := TBrushKind.None;
+    Result.Fill.Color := COLOR_ACCENT;
+    Result.Position.Y := 0;
+    SetLength(FSegPool, FSegUsed + 1);
+    FSegPool[FSegUsed] := Result;
+    // Faixa nova entra por cima do cursor; devolve o cursor para a frente.
+    if FCursor <> nil then FCursor.BringToFront;
+  end;
+  Result.Visible := True;
+  Inc(FSegUsed);
+end;
+
+function TFrameTimeline.TakeTick: TRectangle;
+begin
+  if FTickUsed < Length(FTickPool) then
+    Result := FTickPool[FTickUsed]
+  else
+  begin
+    Result := TRectangle.Create(Self);
+    Result.Parent := FRuler;
+    Result.Align := TAlignLayout.None;
+    Result.HitTest := False;
+    Result.Stroke.Kind := TBrushKind.None;
+    Result.Width := 1;
+    Result.Position.Y := 0;
+    SetLength(FTickPool, FTickUsed + 1);
+    FTickPool[FTickUsed] := Result;
+  end;
+  Result.Visible := True;
+  Inc(FTickUsed);
+end;
+
+function TFrameTimeline.TakeLabel: TLabel;
+begin
+  if FLblUsed < Length(FLblPool) then
+    Result := FLblPool[FLblUsed]
+  else
+  begin
+    Result := TLabel.Create(Self);
+    Result.Parent := FRuler;
+    Result.HitTest := False;
+    Result.StyledSettings := [];
+    Result.TextSettings.FontColor := COLOR_DIM;
+    Result.TextSettings.Font.Size := 11;
+    Result.TextSettings.HorzAlign := TTextAlign.Center;
+    Result.Width := 60;
+    Result.Height := RULER_HEIGHT - 6;
+    Result.Position.Y := 6;   // logo abaixo da marca cheia
+    SetLength(FLblPool, FLblUsed + 1);
+    FLblPool[FLblUsed] := Result;
+  end;
+  Result.Visible := True;
+  Inc(FLblUsed);
+end;
+
+procedure TFrameTimeline.HideUnusedPools;
+var
+  I: Integer;
+begin
+  for I := FSegUsed to High(FSegPool) do FSegPool[I].Visible := False;
+  for I := FTickUsed to High(FTickPool) do FTickPool[I].Visible := False;
+  for I := FLblUsed to High(FLblPool) do FLblPool[I].Visible := False;
+end;
+
 // As faixas são retângulos posicionados em pixels, então tudo que muda a escala
 // (zoom, pan, giro de tela, dia novo) passa por aqui.
 procedure TFrameTimeline.RedrawTrack;
@@ -424,32 +529,29 @@ var
   X1, X2: Single;
 begin
   if FTrack = nil then Exit;
-  for I := FTrack.ChildrenCount - 1 downto 0 do
-    if FTrack.Children[I] <> FCursor then
-      FTrack.Children[I].Free;
-
-  for I := 0 to High(FSegments) do
-  begin
-    // fora da janela: nem cria
-    if FSegments[I].EndMs < FViewStartMs then Continue;
-    if FSegments[I].StartMs > FViewEndMs then Continue;
-    X1 := MsToX(FSegments[I].StartMs);
-    X2 := MsToX(FSegments[I].EndMs);
-    Seg := TRectangle.Create(Self);
-    Seg.Parent := FTrack;
-    Seg.Align := TAlignLayout.None;
-    Seg.HitTest := False;   // o toque é da barra, não das faixas
-    Seg.Fill.Color := COLOR_ACCENT;
-    Seg.Stroke.Kind := TBrushKind.None;
-    Seg.Height := FTrack.Height;
-    Seg.Position.Y := 0;
-    Seg.Position.X := X1;
-    Seg.Width := X2 - X1;
-    if Seg.Width < 2 then Seg.Width := 2; // trecho curto ainda precisa aparecer
+  // Um repaint só no fim, em vez de um por propriedade mexida.
+  FTrack.BeginUpdate;
+  try
+    FSegUsed := 0;
+    for I := 0 to High(FSegments) do
+    begin
+      // fora da janela: nem ocupa um controle
+      if FSegments[I].EndMs < FViewStartMs then Continue;
+      if FSegments[I].StartMs > FViewEndMs then Continue;
+      X1 := MsToX(FSegments[I].StartMs);
+      X2 := MsToX(FSegments[I].EndMs);
+      Seg := TakeSeg;
+      Seg.Height := FTrack.Height;
+      Seg.Position.X := X1;
+      Seg.Width := X2 - X1;
+      if Seg.Width < 2 then Seg.Width := 2; // trecho curto ainda precisa aparecer
+    end;
+  finally
+    FTrack.EndUpdate;
   end;
 
   RedrawRuler;
-  FCursor.BringToFront;
+  HideUnusedPools;
 end;
 
 // Marcas e horários sob a barra: sem isso não dá para saber que horas são as
@@ -462,88 +564,75 @@ var
   Tick: TRectangle;
   Lbl: TLabel;
   Fine: Boolean;
+  S: string;
 begin
   if (FRuler = nil) or (ViewSpanMs <= 0) or (FTrack.Width <= 0) then Exit;
-  for I := FRuler.ChildrenCount - 1 downto 0 do
-    FRuler.Children[I].Free;
+  FTickUsed := 0;
+  FLblUsed := 0;
+  FRuler.BeginUpdate;
+  try
+    Interval := TickIntervalMs(ViewSpanMs);
+    PxPerTick := FTrack.Width * (Interval / ViewSpanMs);
+    // Marcas muito juntas: rotula uma a cada N, mas mantém o risco de todas.
+    Step := 1;
+    if PxPerTick > 0 then
+      while (PxPerTick * Step) < MIN_LABEL_PX do
+        Inc(Step);
+    Fine := Interval < ONE_MIN_MS;
 
-  Interval := TickIntervalMs(ViewSpanMs);
-  PxPerTick := FTrack.Width * (Interval / ViewSpanMs);
-  // Marcas muito juntas: rotula uma a cada N, mas mantém o risco de todas.
-  Step := 1;
-  if PxPerTick > 0 then
-    while (PxPerTick * Step) < MIN_LABEL_PX do
-      Inc(Step);
-  Fine := Interval < ONE_MIN_MS;
+    // Subdivisões sem rótulo, mais curtas e mais apagadas. Só entram se houver
+    // espaço: encostadas umas nas outras virariam um borrão cinza.
+    Minor := MinorIntervalMs(Interval);
+    PxPerMinor := FTrack.Width * (Minor / ViewSpanMs);
+    if PxPerMinor >= MIN_MINOR_PX then
+    begin
+      T := FDayStartMs + ((FViewStartMs - FDayStartMs + Minor - 1) div Minor) * Minor;
+      while T <= FViewEndMs do
+      begin
+        // a marca cheia já é desenhada no laço principal
+        if ((T - FDayStartMs) mod Interval) <> 0 then
+        begin
+          Tick := TakeTick;
+          Tick.Fill.Color := TICK_MINOR;
+          Tick.Height := 3;
+          Tick.Position.X := MsToX(T);
+        end;
+        Inc(T, Minor);
+      end;
+    end;
 
-  // Subdivisões sem rótulo, mais curtas e mais apagadas. Só entram se houver
-  // espaço: encostadas umas nas outras virariam um borrão cinza.
-  Minor := MinorIntervalMs(Interval);
-  PxPerMinor := FTrack.Width * (Minor / ViewSpanMs);
-  if PxPerMinor >= MIN_MINOR_PX then
-  begin
-    T := FDayStartMs + ((FViewStartMs - FDayStartMs + Minor - 1) div Minor) * Minor;
+    // primeira marca >= início da janela, contada a partir da meia-noite local
+    T := FDayStartMs + ((FViewStartMs - FDayStartMs + Interval - 1) div Interval) * Interval;
+    I := 0;
     while T <= FViewEndMs do
     begin
-      // a marca cheia já é desenhada no laço principal
-      if ((T - FDayStartMs) mod Interval) <> 0 then
+      X := MsToX(T);
+
+      Tick := TakeTick;
+      Tick.Fill.Color := COLOR_DIM;
+      Tick.Height := 6;
+      Tick.Position.X := X;
+
+      if (I mod Step) = 0 then
       begin
-        Tick := TRectangle.Create(Self);
-        Tick.Parent := FRuler;
-        Tick.Align := TAlignLayout.None;
-        Tick.HitTest := False;
-        Tick.Stroke.Kind := TBrushKind.None;
-        Tick.Fill.Color := TICK_MINOR;
-        Tick.Width := 1;
-        Tick.Height := 3;
-        Tick.Position.X := MsToX(T);
-        Tick.Position.Y := 0;
+        Lbl := TakeLabel;
+        Lbl.Position.X := X - 30;
+        if Fine then
+          S := FormatDateTime('hh:nn:ss',
+            TTimeZone.Local.ToLocalTime(UnixToDateTime(T div 1000, True)))
+        else
+          S := FormatDateTime('hh:nn',
+            TTimeZone.Local.ToLocalTime(UnixToDateTime(T div 1000, True)));
+        // Trocar o Text remede o rótulo; num pan a maioria continua a mesma.
+        if Lbl.Text <> S then Lbl.Text := S;
       end;
-      Inc(T, Minor);
-    end;
-  end;
 
-  // primeira marca >= início da janela, contada a partir da meia-noite local
-  T := FDayStartMs + ((FViewStartMs - FDayStartMs + Interval - 1) div Interval) * Interval;
-  I := 0;
-  while T <= FViewEndMs do
-  begin
-    X := MsToX(T);
-
-    Tick := TRectangle.Create(Self);
-    Tick.Parent := FRuler;
-    Tick.Align := TAlignLayout.None;
-    Tick.HitTest := False;
-    Tick.Stroke.Kind := TBrushKind.None;
-    Tick.Fill.Color := COLOR_DIM;
-    Tick.Width := 1;
-    Tick.Height := 6;
-    Tick.Position.X := X;
-    Tick.Position.Y := 0;
-
-    if (I mod Step) = 0 then
-    begin
-      Lbl := TLabel.Create(Self);
-      Lbl.Parent := FRuler;
-      Lbl.HitTest := False;
-      Lbl.StyledSettings := [];
-      Lbl.TextSettings.FontColor := COLOR_DIM;
-      Lbl.TextSettings.Font.Size := 11;
-      Lbl.TextSettings.HorzAlign := TTextAlign.Center;
-      Lbl.Width := 60;
-      Lbl.Height := RULER_HEIGHT - 6;
-      Lbl.Position.X := X - 30;
-      Lbl.Position.Y := 6;   // logo abaixo da marca cheia
-      if Fine then
-        Lbl.Text := FormatDateTime('hh:nn:ss',
-          TTimeZone.Local.ToLocalTime(UnixToDateTime(T div 1000, True)))
-      else
-        Lbl.Text := FormatDateTime('hh:nn',
-          TTimeZone.Local.ToLocalTime(UnixToDateTime(T div 1000, True)));
+      Inc(T, Interval);
+      Inc(I);
     end;
 
-    Inc(T, Interval);
-    Inc(I);
+  finally
+    FRuler.EndUpdate;
   end;
 end;
 
@@ -639,11 +728,20 @@ begin
   UpdateZoomLabel;
 end;
 
+// Encerra o arrasto sem navegar. Chamada tanto pelo caminho normal (MouseUp)
+// quanto pelo de recuperação, quando o MouseUp nunca chega.
+procedure TFrameTimeline.EndPan;
+begin
+  FPanActive := False;
+  FPanMoved := False;
+end;
+
 procedure TFrameTimeline.TrackMouseDown(Sender: TObject; Button: TMouseButton;
   Shift: TShiftState; X, Y: Single);
 begin
+  // Arrasto anterior que ficou pendurado: começa limpo em vez de herdar estado.
+  EndPan;
   FPanActive := True;
-  FPanMoved := False;
   FPanStartX := X;
   FPanStartView := FViewStartMs;
 end;
@@ -655,6 +753,19 @@ var
   DeltaMs: Int64;
 begin
   if not FPanActive then Exit;
+  // O botão já está solto e o MouseUp nunca chegou — a captura se perdeu no
+  // caminho (ver AutoCapture, na construção). Sem esta saída a barra continua
+  // arrastando presa ao ponteiro solto, e o "seguir ao vivo" nunca mais volta,
+  // porque ele só roda com FPanActive desligado.
+  //
+  // Vale nas duas plataformas: no Windows o WM_MOUSEMOVE traz MK_LBUTTON
+  // enquanto o botão está pressionado, e no Android o toque em movimento chega
+  // como [ssLeft, ssTouch].
+  if not (ssLeft in Shift) then
+  begin
+    EndPan;
+    Exit;
+  end;
   DeltaPx := X - FPanStartX;
   if (not FPanMoved) and (Abs(DeltaPx) < DRAG_THRESHOLD_PX) then Exit;
   FPanMoved := True;
@@ -667,12 +778,15 @@ end;
 
 procedure TFrameTimeline.TrackMouseUp(Sender: TObject; Button: TMouseButton;
   Shift: TShiftState; X, Y: Single);
+var
+  Moved: Boolean;
 begin
   if not FPanActive then Exit;
-  FPanActive := False;
+  Moved := FPanMoved;
+  EndPan;
   // Arrastou = navegou, e o player continua onde estava. Só o toque simples
   // manda o player para outro instante.
-  if FPanMoved then Exit;
+  if Moved then Exit;
   FPositionMs := XToMs(X);
   FFollow := True;
   UpdateCursor;
@@ -684,10 +798,12 @@ begin
   if Assigned(FOnTogglePlay) then FOnTogglePlay(Self);
 end;
 
-// 1x -> 2x -> 4x -> 1x. Fora de 1x o áudio não sai (o AudioTrack não acompanha).
+// 1x -> 2x -> 4x -> 8x -> 16x -> 32x -> 64x -> 1x. Fora de 1x o áudio não sai
+// (o AudioTrack não acompanha), e acima de 4x só os keyframes são baixados para
+// a fila e decodificados — ver PLAY_ALLFRAMES_MAX_SPEED em VMS.Play.Engine.
 procedure TFrameTimeline.SpeedClick(Sender: TObject);
 begin
-  if FSpeed >= 4 then
+  if FSpeed >= MAX_SPEED then
     FSpeed := 1
   else
     FSpeed := FSpeed * 2;

@@ -336,6 +336,17 @@ end;
 
 procedure TForm1.ShowFrame(F: TControl);
 begin
+  // Sair da tela do player para QUALQUER outra encerra o que estava tocando.
+  // Trocar de tela escondia o vídeo mas não parava a engine: o áudio continuava
+  // saindo por trás da lista de gravações, e o decodificador seguia gastando
+  // bateria e rede numa tela que ninguém está vendo. Aqui é o único ponto por
+  // onde toda navegação passa, então é aqui que a regra vale para todos os
+  // caminhos — inclusive os que ainda não existem.
+  if (FActive = FFramePlayer) and (F <> FFramePlayer) then
+  begin
+    StopPlayback;
+    StopPlay;
+  end;
   FFrameList.Visible := F = FFrameList;
   FFramePlayer.Visible := F = FFramePlayer;
   FFrameEditor.Visible := F = FFrameEditor;
@@ -695,7 +706,11 @@ begin
   SetKeepScreenOn(True);
   FTimeline.Visible := True;
   FTimeline.SetPlaying(True);
+  // Gravação nova começa em 1x — no rótulo E na engine. O SeekTo passa pelo
+  // mesmo Start, então zerar a velocidade lá dentro faria arrastar a barra a 8x
+  // cair para 1x; aqui é o único ponto que significa "outra gravação".
   FTimeline.SetSpeedLabel(1);
+  FPlayback.SetSpeed(1);
   FFramePlayer.SetPlaying(True);
   FFramePlayer.SetSpinner(True);
   FFramePlayer.SetStatus(STAT_YELLOW, 'Carregando');

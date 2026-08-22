@@ -51,6 +51,19 @@ const
   // do pacer do servidor.
   PLAY_MAX_WAIT_MS = 1000;
   PLAY_MAX_LAG_MS  = 2000;
+  // Teto de velocidade, e a partir de onde a reprodução vira varredura.
+  PLAY_MAX_SPEED = 64;
+  // Acima disto só keyframe é entregue ao decodificador. 8x de 30 fps são 240
+  // quadros por segundo, que decodificador de celular nenhum sustenta; sem esta
+  // regra o player não fica rápido, fica ATRASADO — o pacer re-ancora sem parar
+  // e a posição anda a uma fração da velocidade pedida.
+  PLAY_ALLFRAMES_MAX_SPEED = 4;
+  // Teto absoluto da fila, em ms de mídia. O alvo cresce com a velocidade (ver
+  // AdaptPrefetch) porque a 64x a fila esvazia 64 vezes mais rápido, e a conta
+  // quem paga é a memória do celular. Estes 4 minutos só são alcançáveis em
+  // varredura, e lá a fila guarda SÓ keyframes (ver PushChunk): são ~120
+  // imagens, e não os ~19 mil samples que 4 minutos de mídia teriam.
+  PLAY_MAX_QUEUE_MS = 240000;
 
 type
   TPlayState = (pbIdle, pbBuffering, pbPlaying, pbPaused, pbEnded, pbError);
@@ -404,11 +417,27 @@ begin
 end;
 
 procedure TPlaybackEngine.SetSpeed(Value: Double);
+var
+  EraVarredura, ViraVarredura: Boolean;
+  Pos: Int64;
 begin
   if Value < 0.25 then Value := 0.25;
-  if Value > 8 then Value := 8;
+  if Value > PLAY_MAX_SPEED then Value := PLAY_MAX_SPEED;
+  EraVarredura := FSpeed > PLAY_ALLFRAMES_MAX_SPEED;
+  ViraVarredura := Value > PLAY_ALLFRAMES_MAX_SPEED;
   FSpeed := Value;
   Log(llInfo, Format('velocidade %.2gx', [Value]));
+
+  // Cruzar o limiar da varredura muda O QUE entra na fila, e o que já está lá
+  // foi filtrado pela regra anterior. Saindo de 64x para 1x, seriam minutos de
+  // slideshow antes de o vídeo completo voltar; entrando, seriam minutos de
+  // vídeo completo antes de a varredura acelerar de verdade. Recomeçar da
+  // posição atual é mais barato de entender do que remendar a fila.
+  if EraVarredura <> ViraVarredura then
+  begin
+    Pos := PositionMs;
+    if Pos > 0 then SeekTo(Pos);
+  end;
 end;
 
 procedure TPlaybackEngine.AnnounceFormats(const Header: TVmsHeader);
@@ -449,7 +478,9 @@ var
   HaveFirst: array[0..1] of Boolean;
   Anchor: Int64;
   First: Boolean;
+  Spd: Double;
 begin
+  Spd := FSpeed;
   Stream := TBytesStream.Create(Chunk.Data);
   Reader := nil;
   try
@@ -489,9 +520,6 @@ begin
         Item.Sample.TrackId := Entry.TrackId;
         Item.Sample.Pts := Entry.Pts;
         Item.Sample.Flags := ByteToFlags(Entry.FlagsByte);
-        SetLength(Item.Sample.Data, Entry.PayloadSize);
-        if Entry.PayloadSize > 0 then
-          Move(Block.Payload[Entry.PayloadOffset], Item.Sample.Data[0], Entry.PayloadSize);
 
         // Instante de parede: cada trilha é contada a partir do próprio primeiro
         // PTS no bloco, e ancorada no instante em que ELA começou aqui. A âncora
@@ -499,11 +527,27 @@ begin
         // começam juntas no bloco, e a defasagem real fica congelada na saída.
         // Bloco com uma trilha só não tem as duas âncoras: aí vale o começo do
         // bloco, que é essa mesma suposição.
+        //
+        // Isto vem ANTES de qualquer descarte de propósito: a base é o primeiro
+        // PTS do bloco, e se ela mudasse conforme o que foi pulado, o instante de
+        // todo o resto do bloco mudaria junto.
         if not HaveFirst[Track] then
         begin
           FirstPts[Track] := Entry.Pts;
           HaveFirst[Track] := True;
         end;
+
+        // Varredura rápida: o que não vai ser decodificado não entra na fila.
+        // Antes ele era copiado, enfileirado e só descartado lá adiante, pelo
+        // pacer — a 64x são ~97% da mídia ocupando memória para nada, e era isso
+        // que impedia a fila de cobrir tempo de relógio suficiente.
+        if Spd > PLAY_ALLFRAMES_MAX_SPEED then
+          if (Track = 1) or (not (sfKeyframe in Item.Sample.Flags)) then Continue;
+
+        SetLength(Item.Sample.Data, Entry.PayloadSize);
+        if Entry.PayloadSize > 0 then
+          Move(Block.Payload[Entry.PayloadOffset], Item.Sample.Data[0], Entry.PayloadSize);
+
         if Track = 0 then
           Anchor := Block.VideoAnchorMs
         else
@@ -560,6 +604,7 @@ procedure TPlaybackEngine.AdaptPrefetch(FetchMs, MediaMs: Int64);
 var
   Antes: Integer;
   Razao: Int64;   // custo da busca sobre a mídia que ela trouxe, em %
+  Spd: Double;
 begin
   if MediaMs <= 0 then Exit;
   Antes := FBlocksPerFetch;
@@ -589,9 +634,21 @@ begin
 
   // A fila cobre quatro buscas: tempo de reagir a uma oscilação sem virar
   // atraso de seek.
-  FTargetBufferMs := FetchMs * 4;
-  if FTargetBufferMs < PLAY_MIN_BUFFER_MS then FTargetBufferMs := PLAY_MIN_BUFFER_MS;
-  if FTargetBufferMs > PLAY_MAX_BUFFER_MS then FTargetBufferMs := PLAY_MAX_BUFFER_MS;
+  //
+  // Ela é medida em tempo de MÍDIA, mas o que precisa cobrir é tempo de
+  // RELÓGIO — e a 8x a mídia sai da fila oito vezes mais rápido. Sem multiplicar
+  // pela velocidade, os 4 s de fila viram meio segundo a 8x, e o player passa a
+  // vida esperando o pedaço seguinte: era isto que faria 8x e 16x engasgarem
+  // mesmo com rede sobrando.
+  Spd := FSpeed;
+  if Spd < 1 then Spd := 1;
+  FTargetBufferMs := Round(FetchMs * 4 * Spd);
+  if FTargetBufferMs < Round(PLAY_MIN_BUFFER_MS * Spd) then
+    FTargetBufferMs := Round(PLAY_MIN_BUFFER_MS * Spd);
+  if FTargetBufferMs > Round(PLAY_MAX_BUFFER_MS * Spd) then
+    FTargetBufferMs := Round(PLAY_MAX_BUFFER_MS * Spd);
+  if FTargetBufferMs > PLAY_MAX_QUEUE_MS then
+    FTargetBufferMs := PLAY_MAX_QUEUE_MS;
 
   if Antes <> FBlocksPerFetch then
     Log(llDebug, Format('prefetch: %d blocos por pedido, fila de %d ms (busca %d ms para %d ms de midia)',
@@ -790,6 +847,14 @@ begin
 
   // Áudio só faz sentido em 1x: acima disso o AudioTrack não acompanha.
   if (Item.Sample.Kind = tkAudio) and (Abs(Spd - 1.0) > 0.01) then Exit;
+
+  // Varredura rápida: acima de PLAY_ALLFRAMES_MAX_SPEED só o keyframe entra.
+  // Cada um decodifica sozinho, sem depender de quadro anterior, então o que sai
+  // é uma sequência de imagens inteiras andando na velocidade pedida — em vez de
+  // um vídeo completo que o decodificador não dá conta e que acaba andando mais
+  // devagar do que o botão promete.
+  if (Item.Sample.Kind = tkVideo) and (Spd > PLAY_ALLFRAMES_MAX_SPEED) and
+     (not (sfKeyframe in Item.Sample.Flags)) then Exit;
 
   // Quem dita o ritmo é o vídeo; o áudio sai na posição em que foi gravado, sem
   // espera própria. Sem trilha de vídeo, quem dita é o áudio.

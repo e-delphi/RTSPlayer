@@ -15,6 +15,12 @@ uses
   VMS.Media.Renderer,
   UI.Common;
 
+const
+  VIDEO_ZOOM_MIN  = 1.0;
+  VIDEO_ZOOM_MAX  = 6.0;
+  VIDEO_ZOOM_STEP = 1.25;   // por entalhe da roda
+  VIDEO_TAP_PX    = 8;      // acima disto é arrasto, não toque
+
 type
   TFramePlayer = class(TFrame)
     imgVideo: TImage;
@@ -51,6 +57,37 @@ type
     // exigiria abrir o designer só para isto.
     FBtnPlayback: TRectangle;
     FPathPlayback: TPath;
+    // Camada transparente sobre o vídeo que recebe o toque. Ela existe porque o
+    // imgVideo passa a ser ESCALADO no zoom, e as coordenadas locais de um
+    // controle escalado já vêm divididas pela escala — arrastar por elas daria
+    // realimentação. Esta camada nunca é escalada, então o pixel que ela
+    // reporta é o pixel da tela.
+    FGesture: TRectangle;
+    FZoom: Single;             // 1 = imagem inteira na tela
+    FOffX, FOffY: Single;      // canto do vídeo ampliado, em pixels da moldura
+    FPinchDist: Integer;       // distância entre os dedos no quadro anterior
+    FPinched: Boolean;         // houve pinça neste toque: não é um toque simples
+    FVDown: Boolean;
+    FVMoved: Boolean;
+    FVStartX, FVStartY: Single;
+    FVStartOffX, FVStartOffY: Single;
+    FVLastX, FVLastY: Single;  // último ponto sob o ponteiro, para a roda
+    procedure CreateGestureLayer;
+    procedure ApplyVideoTransform;
+    procedure VideoHostResize(Sender: TObject);
+    // Leva o zoom para NewZoom mantendo parado o ponto (SX,SY), em pixels da
+    // camada de toque — que são pixels de tela.
+    procedure ZoomAt(NewZoom, SX, SY: Single);
+    procedure VideoMouseDown(Sender: TObject; Button: TMouseButton;
+                             Shift: TShiftState; X, Y: Single);
+    procedure VideoMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
+    procedure VideoMouseUp(Sender: TObject; Button: TMouseButton;
+                           Shift: TShiftState; X, Y: Single);
+    procedure VideoMouseWheel(Sender: TObject; Shift: TShiftState;
+                              WheelDelta: Integer; var Handled: Boolean);
+    procedure VideoGesture(Sender: TObject; const EventInfo: TGestureEventInfo;
+                           var Handled: Boolean);
+    procedure VideoDblClick(Sender: TObject);
     procedure CreatePlaybackButton;
     procedure btnBackClick(Sender: TObject);
     procedure btnDebugClick(Sender: TObject);
@@ -71,6 +108,9 @@ type
     procedure ShowControls;
     procedure HideControls;
     procedure ClearVideo;
+    // Volta o vídeo ao enquadramento inteiro. Chamada ao trocar de câmera ou de
+    // gravação: zoom é do que se estava vendo, não do player.
+    procedure ResetVideoZoom;
     procedure ResetForNewPlay;
     procedure AppendLog(const Lines: TArray<string>);
     procedure ClearLog;
@@ -102,6 +142,7 @@ begin
   imgVideo.OnClick := imgVideoClick;
   UpdateMuteIcon;
   CreatePlaybackButton;
+  CreateGestureLayer;
 
   // layTop é overlay sobre o vídeo (não ocupa espaço): precisa ficar por cima do
   // placeholder e do vídeo na ordem-z. O spinner logo abaixo dele.
@@ -134,6 +175,232 @@ begin
   FPathPlayback.Data.Data := ICON_CLOCK;
 end;
 
+// ---------------------------------------------------------------------------
+// Zoom no vídeo
+//
+// O zoom é uma transformação do CONTROLE, não do bitmap: o quadro continua
+// chegando do decodificador no tamanho que ele tem, e quem amplia é o FMX. Assim
+// o PresentFrame não muda em nada e ampliar não custa CPU por quadro.
+//
+// Ampliar é dar ao imgVideo um retângulo MAIOR que a área de vídeo e deslizá-lo
+// por baixo dela; o recorte do frame esconde o que sobra. Nada de Scale nem de
+// RotationCenter: sem rotação o FMX ignora o RotationCenter e escala a partir do
+// canto (ver TControl.DoMatrixChanged), então a única coisa que translada um
+// controle é mesmo o Position.
+//
+//   x_tela(p) = Off + p*W0*Z      p = ponto do vídeo, 0..1
+//
+// Daí saem as duas contas: arrastar é somar o deslocamento do dedo em Off, e
+// ampliar em torno de um ponto é achar que p está sob ele e recalcular Off para
+// que continue lá.
+// ---------------------------------------------------------------------------
+
+procedure TFramePlayer.CreateGestureLayer;
+begin
+  FGesture := TRectangle.Create(Self);
+  FGesture.Parent := Self;
+  FGesture.Align := TAlignLayout.Client;
+  FGesture.Fill.Kind := TBrushKind.None;     // invisível: só serve de alvo
+  FGesture.Stroke.Kind := TBrushKind.None;
+  FGesture.HitTest := True;
+  // Sem isto o arrasto morre assim que o dedo sai do controle.
+  FGesture.AutoCapture := True;
+  FGesture.OnMouseDown := VideoMouseDown;
+  FGesture.OnMouseMove := VideoMouseMove;
+  FGesture.OnMouseUp := VideoMouseUp;
+  FGesture.OnMouseWheel := VideoMouseWheel;
+  FGesture.OnDblClick := VideoDblClick;
+  FGesture.OnGesture := VideoGesture;
+  // A camada é Align=Client, então ela SEMPRE tem o tamanho da área de vídeo.
+  // É dela que sai a moldura de referência, e é o Resize dela que avisa que a
+  // tela girou ou a janela mudou de tamanho.
+  FGesture.OnResize := VideoHostResize;
+  FGesture.Touch.InteractiveGestures := [TInteractiveGesture.Zoom];
+  // Ordem-z: o vídeo no fundo, a camada de toque logo acima dele, e as barras
+  // (criadas antes, no .fmx) acima de tudo — daí os BringToFront no construtor.
+  // O rectPlaceholder (tela preta de "sem vídeo") fica acima da camada, e é ele
+  // que recebe o toque enquanto não há imagem — que é o que já acontecia antes.
+  FGesture.SendToBack;
+  imgVideo.SendToBack;
+  // Ampliado, o vídeo desenha além do retângulo dele. Sem recorte isso vazaria
+  // para fora do frame.
+  Self.ClipChildren := True;
+  // Quem responde ao toque agora é a camada; o vídeo vira só pixel.
+  imgVideo.HitTest := False;
+  // Sai do alinhamento: quem posiciona e dimensiona o vídeo agora é o zoom, e
+  // o alinhador sobrescreveria o Position a cada realinhamento.
+  imgVideo.Align := TAlignLayout.None;
+
+  FZoom := 1;
+  FOffX := 0;
+  FOffY := 0;
+  ApplyVideoTransform;
+end;
+
+procedure TFramePlayer.VideoHostResize(Sender: TObject);
+begin
+  ApplyVideoTransform;
+end;
+
+procedure TFramePlayer.ApplyVideoTransform;
+var
+  W0, H0, MinX, MinY: Single;
+begin
+  if (imgVideo = nil) or (FGesture = nil) then Exit;
+  W0 := FGesture.Width;
+  H0 := FGesture.Height;
+  if (W0 <= 0) or (H0 <= 0) then Exit;
+
+  if FZoom < VIDEO_ZOOM_MIN then FZoom := VIDEO_ZOOM_MIN;
+  if FZoom > VIDEO_ZOOM_MAX then FZoom := VIDEO_ZOOM_MAX;
+
+  // Sem ampliação o vídeo é exatamente a moldura; ampliado, ele é maior e
+  // desliza por baixo dela. O recorte do frame é que esconde o que sobra.
+  MinX := W0 - W0 * FZoom;   // <= 0
+  MinY := H0 - H0 * FZoom;
+  if FOffX > 0 then FOffX := 0;
+  if FOffX < MinX then FOffX := MinX;
+  if FOffY > 0 then FOffY := 0;
+  if FOffY < MinY then FOffY := MinY;
+
+  imgVideo.SetBounds(FGesture.Position.X + FOffX, FGesture.Position.Y + FOffY,
+                     W0 * FZoom, H0 * FZoom);
+end;
+
+procedure TFramePlayer.ZoomAt(NewZoom, SX, SY: Single);
+var
+  W0, H0, PX, PY: Single;
+begin
+  if (FGesture = nil) then Exit;
+  W0 := FGesture.Width;
+  H0 := FGesture.Height;
+  if (W0 <= 0) or (H0 <= 0) then Exit;
+  if NewZoom < VIDEO_ZOOM_MIN then NewZoom := VIDEO_ZOOM_MIN;
+  if NewZoom > VIDEO_ZOOM_MAX then NewZoom := VIDEO_ZOOM_MAX;
+
+  // Que ponto do vídeo (0..1) está sob (SX,SY) agora...
+  PX := (SX - FOffX) / (W0 * FZoom);
+  PY := (SY - FOffY) / (H0 * FZoom);
+  FZoom := NewZoom;
+  // ...e onde o canto tem de ficar para ele continuar exatamente ali.
+  FOffX := SX - PX * W0 * FZoom;
+  FOffY := SY - PY * H0 * FZoom;
+  ApplyVideoTransform;
+end;
+
+procedure TFramePlayer.ResetVideoZoom;
+begin
+  FZoom := 1;
+  FOffX := 0;
+  FOffY := 0;
+  FPinchDist := 0;
+  ApplyVideoTransform;
+end;
+
+procedure TFramePlayer.VideoDblClick(Sender: TObject);
+begin
+  ResetVideoZoom;
+end;
+
+procedure TFramePlayer.VideoMouseDown(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+begin
+  FVDown := True;
+  FVMoved := False;
+  FPinched := False;
+  FVStartX := X;
+  FVStartY := Y;
+  FVStartOffX := FOffX;
+  FVStartOffY := FOffY;
+  FVLastX := X;
+  FVLastY := Y;
+end;
+
+procedure TFramePlayer.VideoMouseMove(Sender: TObject; Shift: TShiftState;
+  X, Y: Single);
+begin
+  FVLastX := X;
+  FVLastY := Y;
+  if not FVDown then Exit;
+  // Pinça em andamento: os dois dedos também geram evento de mouse, e deixar o
+  // arrasto correr junto faria a imagem escorregar enquanto se amplia.
+  if FPinchDist > 0 then Exit;
+  // Botão solto sem o MouseUp ter chegado (a captura se perdeu): encerra aqui,
+  // senão o vídeo continua panoramizando preso ao ponteiro.
+  if not (ssLeft in Shift) then
+  begin
+    FVDown := False;
+    Exit;
+  end;
+  if (Abs(X - FVStartX) > VIDEO_TAP_PX) or (Abs(Y - FVStartY) > VIDEO_TAP_PX) then
+    FVMoved := True;
+  if FZoom <= VIDEO_ZOOM_MIN + 0.001 then Exit;  // sem ampliação não se arrasta
+
+  // A camada não é escalada, então o que ela reporta é pixel de tela, e o
+  // Position do vídeo está na mesma escala: o vídeo segue o dedo 1 para 1.
+  FOffX := FVStartOffX + (X - FVStartX);
+  FOffY := FVStartOffY + (Y - FVStartY);
+  ApplyVideoTransform;
+end;
+
+procedure TFramePlayer.VideoMouseUp(Sender: TObject; Button: TMouseButton;
+  Shift: TShiftState; X, Y: Single);
+var
+  Moved: Boolean;
+begin
+  if not FVDown then Exit;
+  Moved := FVMoved or FPinched;
+  FVDown := False;
+  FVMoved := False;
+  FPinched := False;
+  // Arrastar e ampliar é enquadrar; só o toque simples mostra/esconde os
+  // controles.
+  if Moved then Exit;
+  imgVideoClick(Sender);
+end;
+
+procedure TFramePlayer.VideoMouseWheel(Sender: TObject; Shift: TShiftState;
+  WheelDelta: Integer; var Handled: Boolean);
+var
+  Factor: Single;
+begin
+  if WheelDelta > 0 then Factor := VIDEO_ZOOM_STEP else Factor := 1 / VIDEO_ZOOM_STEP;
+  // Amplia em torno do ponteiro: é o que faz a roda parecer uma lupa em vez de
+  // um controle de escala.
+  ZoomAt(FZoom * Factor, FVLastX, FVLastY);
+  Handled := True;
+end;
+
+procedure TFramePlayer.VideoGesture(Sender: TObject;
+  const EventInfo: TGestureEventInfo; var Handled: Boolean);
+var
+  P: TPointF;
+begin
+  if EventInfo.GestureID <> igiZoom then Exit;
+  if TInteractiveGestureFlag.gfBegin in EventInfo.Flags then
+  begin
+    FPinchDist := EventInfo.Distance;
+    Handled := True;
+    Exit;
+  end;
+  if TInteractiveGestureFlag.gfEnd in EventInfo.Flags then
+  begin
+    FPinchDist := 0;
+    Handled := True;
+    Exit;
+  end;
+  if (FPinchDist > 0) and (EventInfo.Distance > 0) then
+  begin
+    // Location vem em coordenadas de tela e é o ponto entre os dois dedos.
+    P := FGesture.ScreenToLocal(EventInfo.Location);
+    ZoomAt(FZoom * (EventInfo.Distance / FPinchDist), P.X, P.Y);
+    FPinched := True;
+  end;
+  if EventInfo.Distance > 0 then
+    FPinchDist := EventInfo.Distance;
+  Handled := True;
+end;
+
 procedure TFramePlayer.btnPlaybackClick(Sender: TObject);
 begin
   ShowControls; // o toque foi na barra: reinicia o auto-ocultar
@@ -151,6 +418,9 @@ procedure TFramePlayer.SetPlaying(Value: Boolean);
 begin
   FPlaying := Value;
   rectPlaceholder.Visible := not Value;
+  // O vídeo saiu do alinhamento automático, então o retângulo dele é calculado.
+  // No construtor a moldura ainda não tem o tamanho final; aqui já tem.
+  if Value then ApplyVideoTransform;
   if not Value then
     SetSpinner(False);
 end;
@@ -230,6 +500,8 @@ end;
 procedure TFramePlayer.ResetForNewPlay;
 begin
   FLoggedShown := False;
+  // Zoom é do que se estava vendo: câmera nova entra enquadrada.
+  ResetVideoZoom;
   ClearLog;
 end;
 
