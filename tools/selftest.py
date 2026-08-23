@@ -24,6 +24,7 @@ import genvms
 import apimodel
 import fragment
 import pacemodel
+import eventlib
 
 VERBOSE = '-v' in sys.argv
 FALHAS = []
@@ -544,6 +545,69 @@ def teste_fragmento(pasta):
 
 # ---------------------------------------------------------------- ritmo
 
+def teste_varredura(pasta):
+    print('varredura: o servidor entrega só o que vai ser exibido')
+    rec = os.path.join(pasta, 'rec3')
+    os.makedirs(os.path.join(rec, 'cam'), exist_ok=True)
+    gerar(os.path.join(rec, 'cam'), 'cam_0.vms', blocos=30, inicio=0)
+    arquivos = fragment.scan(rec, 'cam')
+    ts = arquivos[0]['header'].video.timescale or 90000
+
+    inteiro = fragment.fetch(arquivos, from_ms=0, blocks=30)
+    varrido = fragment.fetch(arquivos, from_ms=0, blocks=30, step_ms=6000)
+
+    # 1) o fragmento decimado continua sendo um .vms que abre no mesmo leitor
+    h = vmslib.read_header(varrido['data'])
+    blocos = list(vmslib.iter_blocks(varrido['data'], h))
+    check('fragmento da varredura abre no leitor normal', len(blocos) > 0)
+    check('todo bloco entregue tem crc válido', all(b.crc_ok for b in blocos))
+
+    amostras = [s for b in blocos for s in b.samples]
+    check('só vídeo: o áudio não atravessa a rede',
+          all(s.is_video for s in amostras))
+    check('só keyframe: quadro P precisa de referência que não vai junto',
+          all(s.keyframe for s in amostras))
+
+    # 2) o horário de cada quadro sobrevive à remontagem do bloco — é o que
+    #    quebraria se a âncora não fosse recalculada
+    def horarios(frag):
+        hh = vmslib.read_header(frag['data'])
+        tsc = hh.video.timescale or 90000
+        out = []
+        for b in vmslib.iter_blocks(frag['data'], hh):
+            base = next(s.pts for s in b.samples if s.is_video)
+            anc = b.video_anchor_ms or b.start_unix_ms
+            for smp in b.samples:
+                if smp.is_video and smp.keyframe:
+                    out.append(anc + (smp.pts - base) * 1000 // tsc)
+        return out
+
+    esperado = horarios(inteiro)
+    obtido = horarios(varrido)
+    check('os quadros entregues são um subconjunto dos originais',
+          set(obtido).issubset(set(esperado)),
+          '%s vs %s' % (obtido[:4], esperado[:4]))
+    check('e cada um mantém o horário que tinha na gravação',
+          obtido == [t for t in esperado if t in set(obtido)])
+
+    # 3) o espaçamento é respeitado ATRAVÉS dos blocos, não só dentro de cada um
+    faltas = [b - a for a, b in zip(obtido, obtido[1:]) if b - a < 6000]
+    check('nenhum par entregue mais junto que o passo pedido', faltas == [],
+          'intervalos curtos: %s' % faltas[:4])
+
+    # 4) e o ponto de tudo isto: rede
+    check('a varredura carrega uma fração dos bytes',
+          len(varrido['data']) * 4 < len(inteiro['data']),
+          '%d B contra %d B' % (len(varrido['data']), len(inteiro['data'])))
+
+    # 5) passo maior entrega menos; passo zero entrega tudo, como antes
+    esparso = fragment.fetch(arquivos, from_ms=0, blocks=30, step_ms=20000)
+    check('passo maior entrega menos quadros',
+          len(horarios(esparso)) < len(obtido))
+    check('sem passo, o fragmento é idêntico ao de antes',
+          fragment.fetch(arquivos, from_ms=0, blocks=30)['data'] == inteiro['data'])
+
+
 def teste_ritmo(pasta):
     print('ritmo do playback')
     p = gerar(pasta, 'pace.vms', blocos=10)
@@ -566,6 +630,186 @@ def teste_ritmo(pasta):
     check('o seek encurta o tempo de relógio', seek['elapsed_s'] < um['elapsed_s'])
 
 
+# ------------------------------------------------- eventos da analise
+
+
+def teste_eventos_formato(pasta):
+    print('formato .vev (eventos da análise)')
+    dia = 1755950000000
+    evs = [
+        eventlib.build_record(dia, dia + 4000, eventlib.KIND_MOTION, 'movimento',
+                              score=0.08, count=1, box=(0.1, 0.2, 0.4, 0.9)),
+        eventlib.build_record(dia + 10000, dia + 22000, eventlib.KIND_OBJECT,
+                              'person', score=0.87, count=3,
+                              box=(0.0, 0.0, 1.0, 1.0)),
+    ]
+    dados = eventlib.build_header(dia) + b''.join(evs)
+
+    lidos = eventlib.read_file(dados)
+    check('cabeçalho .vev com crc válido', lidos is not None)
+    check('dois eventos lidos', len(lidos) == 2, 'vieram %d' % len(lidos))
+    check('rótulo sobrevive à ida e volta', lidos[1]['name'] == 'person')
+    check('contagem sobrevive', lidos[1]['count'] == 3)
+    check('score volta com erro menor que 0,01%',
+          abs(lidos[1]['score'] - 0.87) < 0.0001,
+          'voltou %.6f' % lidos[1]['score'])
+    check('caixa 0..1 volta dentro de 1/65535',
+          max(abs(a - b) for a, b in zip(lidos[0]['box'], (0.1, 0.2, 0.4, 0.9)))
+          < 1.0 / 65535,
+          'voltou %s' % (lidos[0]['box'],))
+    check('caixa cheia continua cheia', lidos[1]['box'] == (0.0, 0.0, 1.0, 1.0))
+
+    # queda de energia no meio de um append: sobra um rabo de tamanho errado
+    truncado = dados[:-20]
+    lidos = eventlib.read_file(truncado)
+    check('rabo truncado sai de fora, o resto fica',
+          len(lidos) == 1 and lidos[0]['name'] == 'movimento',
+          'vieram %d' % len(lidos))
+
+    # um registro corrompido nao leva os vizinhos junto
+    corrompido = bytearray(dados)
+    corrompido[eventlib.HEADER_SIZE + 5] ^= 0xFF
+    lidos = eventlib.read_file(bytes(corrompido))
+    check('registro com crc quebrado é descartado sozinho',
+          len(lidos) == 1 and lidos[0]['name'] == 'person',
+          'vieram %d' % len(lidos))
+
+    # cabecalho corrompido invalida o arquivo inteiro: nao da para confiar nem
+    # no tamanho de registro que ele declara
+    ruim = bytearray(dados)
+    ruim[10] ^= 0xFF
+    check('cabeçalho corrompido rejeita o arquivo',
+          eventlib.read_file(bytes(ruim)) is None)
+
+    # rotulo mais longo que o campo e truncado, e nao corrompe o registro
+    longo = eventlib.build_header(dia) + eventlib.build_record(
+        dia, dia, eventlib.KIND_OBJECT, 'x' * 60)
+    lidos = eventlib.read_file(longo)
+    check('rótulo longo demais é truncado, não quebra o registro',
+          len(lidos) == 1 and len(lidos[0]['name']) == eventlib.NAME_SIZE,
+          'veio %r' % (lidos and lidos[0]['name']))
+
+    check('todo registro tem exatamente %d bytes' % eventlib.RECORD_SIZE,
+          all(len(e) == eventlib.RECORD_SIZE for e in evs))
+    check('o arquivo é cabeçalho + n registros, sem sobra',
+          (len(dados) - eventlib.HEADER_SIZE) % eventlib.RECORD_SIZE == 0)
+
+
+def teste_eventos_consulta(pasta):
+    print('consulta de eventos por janela')
+    base = 1755950000000
+    evs = [
+        {'start_ms': base - 120000, 'end_ms': base + 60000, 'kind': 0,
+         'name': 'movimento', 'score': 0.05},
+        {'start_ms': base + 10000, 'end_ms': base + 12000, 'kind': 1,
+         'name': 'person', 'score': 0.9},
+        {'start_ms': base + 900000, 'end_ms': base + 901000, 'kind': 1,
+         'name': 'car', 'score': 0.4},
+    ]
+    janela = eventlib.query(evs, base, base + 60000)
+    check('evento que COMEÇOU antes da janela entra se ainda estava em curso',
+          any(e['name'] == 'movimento' for e in janela))
+    check('evento fora da janela fica de fora',
+          not any(e['name'] == 'car' for e in janela))
+    check('resultado vem em ordem de início',
+          [e['start_ms'] for e in janela] == sorted(e['start_ms'] for e in janela))
+    check('filtro por tipo isola os objetos',
+          [e['name'] for e in eventlib.query(evs, base, base + 60000, kind=1)]
+          == ['person'])
+    check('filtro por rótulo é insensível a maiúscula',
+          len(eventlib.query(evs, base, base + 60000, name='PERSON')) == 1)
+    check('limiar de confiança corta o que está abaixo',
+          [e['name'] for e in eventlib.query(evs, base, base + 1000000,
+                                             min_score=0.5)] == ['person'])
+
+
+def teste_movimento(pasta):
+    print('detecção de movimento')
+    W, H = 160, 90
+    m = eventlib.Motion()
+    fundo = eventlib.gray_frame(W, H, 100)
+
+    r = m.feed(1000, fundo, W, H)
+    check('primeiro quadro não gera evento (não há com o que comparar)',
+          not r['moved'] and not r['scene'])
+
+    r = m.feed(3000, eventlib.gray_frame(W, H, 100), W, H)
+    check('cena parada não acusa movimento', not r['moved'],
+          'score %.4f' % r['score'])
+
+    # um vulto atravessando
+    vulto = eventlib.gray_frame(W, H, 100)
+    eventlib.paint(vulto, W, H, 60, 30, 80, 70, 220)
+    r = m.feed(5000, vulto, W, H)
+    check('um vulto na cena acusa movimento', r['moved'],
+          'score %.4f' % r['score'])
+    check('a caixa cerca o vulto, e não a tela inteira',
+          r['box'] is not None and r['box'][0] > 0.25 and r['box'][2] < 0.75,
+          'caixa %s' % (r['box'],))
+
+    # luz acesa: o quadro inteiro muda de nivel
+    m2 = eventlib.Motion()
+    m2.feed(1000, eventlib.gray_frame(W, H, 60), W, H)
+    r = m2.feed(3000, eventlib.gray_frame(W, H, 200), W, H)
+    check('luz acesa é CENA NOVA, não movimento',
+          r['scene'] and not r['moved'], 'score %.4f' % r['score'])
+    r = m2.feed(5000, eventlib.gray_frame(W, H, 200), W, H)
+    check('e a referência já é a cena nova no quadro seguinte',
+          not r['moved'] and not r['scene'], 'score %.4f' % r['score'])
+
+    # buraco de gravacao: os dois lados nao sao comparaveis
+    m3 = eventlib.Motion()
+    m3.feed(1000, eventlib.gray_frame(W, H, 60), W, H)
+    r = m3.feed(1000 + 3600000, eventlib.gray_frame(W, H, 190), W, H)
+    check('salto no tempo zera a referência em vez de acusar movimento',
+          not r['moved'] and not r['scene'])
+
+    # ruido de compressao abaixo do limiar de celula nao acende nada
+    m4 = eventlib.Motion()
+    m4.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    r = m4.feed(3000, eventlib.gray_frame(W, H, 108), W, H)
+    check('oscilação de 8 níveis é ruído, não movimento', not r['moved'],
+          'score %.4f' % r['score'])
+
+
+def teste_agregacao_eventos(pasta):
+    print('agregação de avistamentos em eventos')
+    base = 1755950000000
+    g = eventlib.Merger(merge_gap_ms=8000)
+    # uma pessoa atravessando: oito quadros de 2 em 2 segundos
+    for i in range(8):
+        g.note(base + i * 2000, 'person', eventlib.KIND_OBJECT,
+               score=0.5 + i * 0.05, count=1, box=(0.1 * i, 0, 0.1 * i + 0.1, 1))
+    # e volta bem depois: outra passagem
+    g.note(base + 120000, 'person', eventlib.KIND_OBJECT, score=0.6)
+    evs = g.flush()
+
+    pessoas = [e for e in evs if e['name'] == 'person']
+    check('oito avistamentos seguidos viram UM evento, não oito',
+          len(pessoas) == 2, 'vieram %d' % len(pessoas))
+    check('o evento cobre do primeiro ao último avistamento',
+          pessoas[0]['start_ms'] == base and
+          pessoas[0]['end_ms'] == base + 14000,
+          '%d..%d' % (pessoas[0]['start_ms'], pessoas[0]['end_ms']))
+    check('o score guardado é o do PICO',
+          abs(pessoas[0]['score'] - 0.85) < 1e-6,
+          'ficou %.3f' % pessoas[0]['score'])
+    check('a caixa guardada é a do quadro de pico, não a união',
+          abs(pessoas[0]['box'][0] - 0.7) < 1e-6,
+          'ficou %s' % (pessoas[0]['box'],))
+    check('passagem depois da janela de fusão é OUTRO evento',
+          pessoas[1]['start_ms'] == base + 120000)
+
+    # rotulos diferentes no mesmo instante sao eventos separados
+    g2 = eventlib.Merger()
+    g2.note(base, 'person', eventlib.KIND_OBJECT, score=0.9)
+    g2.note(base, 'car', eventlib.KIND_OBJECT, score=0.8)
+    g2.note(base + 2000, 'person', eventlib.KIND_OBJECT, score=0.7)
+    evs = g2.flush()
+    check('rótulos diferentes não se fundem', len(evs) == 2,
+          'vieram %d' % len(evs))
+
+
 def main():
     pasta = tempfile.mkdtemp(prefix='vms_selftest_')
     try:
@@ -578,7 +822,12 @@ def main():
         teste_crc(pasta)
         teste_segmentos(pasta)
         teste_fragmento(pasta)
+        teste_varredura(pasta)
         teste_ritmo(pasta)
+        teste_eventos_formato(pasta)
+        teste_eventos_consulta(pasta)
+        teste_movimento(pasta)
+        teste_agregacao_eventos(pasta)
     finally:
         shutil.rmtree(pasta, ignore_errors=True)
 

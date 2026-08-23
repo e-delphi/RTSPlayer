@@ -1,4 +1,4 @@
-unit Vms.Server.Composition;
+﻿unit Vms.Server.Composition;
 
 // Monta um supervisor por câmera habilitada, sempre gravando .vms.
 //
@@ -13,11 +13,18 @@ unit Vms.Server.Composition;
 // sample vai para a memória (de onde o servidor RTSP publica /live/<camera>, sem
 // esperar o bloco fechar no disco) e para a gravação. Hub nil = servidor lê do
 // arquivo, como antes.
+//
+// A análise de imagem (BuildAnalytics) é montada aqui pelo mesmo motivo que as
+// miniaturas: é o único lugar do servidor que pode conhecer implementação
+// concreta. É daqui que sai a decisão de rodar só movimento quando o modelo ONNX
+// não está no disco — decisão que, feita em qualquer outro lugar, viraria um
+// `if` espalhado por três camadas.
 
 interface
 
 uses
   System.SysUtils,
+  System.SyncObjs,      // TEvent: o sinal de parada que os workers observam
   VMS.Domain.Logging,
   VMS.Domain.Clock,
   VMS.Domain.Reconnect,
@@ -27,9 +34,52 @@ uses
   VMS.Depk.Intf,
   VMS.App.Config,
   VMS.App.Composition,
+  Vms.Server.IndexCache,   // TVmsIndexCache, que a fonte de miniaturas consulta
+  Vms.Thumb.Intf,          // IThumbSource, o que esta unit devolve
+  Vms.Analytics.Types,
+  Vms.Analytics.Intf,      // IEventSource, o que a rota /api/events enxerga
+  Vms.Analytics.Store,
+  Vms.Analytics.Worker,
   Vms.Server.LiveHub;
 
 function IsDvripUrl(const Url: string): Boolean;
+
+// Monta a cadeia das miniaturas. É aqui — e só aqui — que as implementações
+// concretas aparecem: quem acha o keyframe, quem decodifica, quem encoda e onde
+// guardar. Sem FFmpeg na máquina, devolve a fonte nula, e nada acima disto muda
+// de comportamento.
+function BuildThumbSource(const StorageDir: string; Cache: TVmsIndexCache;
+                          ThumbWidth, ThumbHeight: Integer;
+                          const Logger: ILogger): IThumbSource;
+
+type
+  // O que a análise devolve para o `.dpr` amarrar: a fonte que a API consulta,
+  // o dono do arquivo de eventos e as threads que precisam ser paradas.
+  // Um registro, e não uma classe, porque não há comportamento aqui — é o
+  // resultado da montagem, e quem o recebe só guarda e libera.
+  TAnalyticsRig = record
+    Events: IEventSource;
+    Store: TEventFileStore;
+    Workers: TArray<TAnalyticsWorker>;
+    procedure Stop;
+    // Não se chama Free: quem chama isto é um registro, não um objeto, e a
+    // ordem importa — os workers antes das interfaces que eles seguram.
+    procedure Release;
+  end;
+
+// Monta a análise: um detector de movimento e um analisador POR CÂMERA (têm
+// estado e comparam quadros consecutivos), um detector de objetos para TODAS
+// (o modelo ocupa memória demais para ter um por câmera) e um arquivo de
+// eventos compartilhado.
+//
+// Reusa a cadeia das miniaturas inteira: quem acha o keyframe e quem decodifica
+// são exatamente as mesmas interfaces. Sem FFmpeg na máquina não há como
+// decodificar quadro nenhum, e aí a análise nem sobe — com um aviso, porque
+// nesse caso o usuário pediu algo que não vai acontecer.
+function BuildAnalytics(const Cfg: TAnalyticsConfig; const StorageDir: string;
+                        const Cameras: TArray<string>; Cache: TVmsIndexCache;
+                        const Clock: IClock; const Logger: ILogger;
+                        Stop: TEvent): TAnalyticsRig;
 
 // Recebe só a config comum: os campos próprios do servidor (porta, bind) não
 // interessam aqui, então esta unit não precisa conhecer a config derivada.
@@ -41,7 +91,141 @@ function BuildServerSupervisors(const App: TAppConfig; const Logger: ILogger;
 implementation
 
 uses
+  Vms.Thumb.Cache,
+  Vms.Thumb.Keyframe,
+  Vms.Thumb.Service,
+  Vms.Analytics.Motion,
+  Vms.Analytics.Analyzer,
+{$IFDEF MSWINDOWS}
+  Vms.Thumb.FFmpeg,
+  Vms.Thumb.JpegVcl,
+  Vms.Analytics.Onnx,
+{$ENDIF}
   Vms.Server.RecSink;
+
+function BuildThumbSource(const StorageDir: string; Cache: TVmsIndexCache;
+  ThumbWidth, ThumbHeight: Integer; const Logger: ILogger): IThumbSource;
+{$IFDEF MSWINDOWS}
+var
+  Grabber: IFrameGrabber;
+{$ENDIF}
+begin
+{$IFDEF MSWINDOWS}
+  Grabber := TFFmpegFrameGrabber.Create(Logger);
+  // Pergunta uma vez, na subida: sem as DLLs do FFmpeg ao lado do exe não há
+  // como decodificar, e é melhor a barra ficar sem miniatura do que cada
+  // requisição descobrir isso de novo.
+  if Grabber.Available then
+    Exit(TThumbService.Create(TVmsKeyframeSource.Create(Cache, Logger),
+                              Grabber,
+                              TVclJpegEncoder.Create,
+                              TThumbDiskCache.Create(StorageDir),
+                              ThumbWidth, ThumbHeight, Logger));
+{$ENDIF}
+  Result := TNullThumbSource.Create;
+end;
+
+{ TAnalyticsRig }
+
+// Sinaliza todos antes de esperar por qualquer um: parar em série custaria o
+// tempo de cada thread somado, e uma delas pode estar no meio de uma
+// inferência de centenas de milissegundos.
+procedure TAnalyticsRig.Stop;
+var
+  I: Integer;
+begin
+  for I := 0 to High(Workers) do
+    if Workers[I] <> nil then Workers[I].Terminate;
+  for I := 0 to High(Workers) do
+    if Workers[I] <> nil then Workers[I].WaitFor;
+end;
+
+procedure TAnalyticsRig.Release;
+var
+  I: Integer;
+begin
+  for I := 0 to High(Workers) do
+    Workers[I].Free;
+  Workers := nil;
+  // A interface primeiro: é ela que aponta para o mesmo objeto do Store, e
+  // liberar o objeto com a interface ainda viva deixaria um ponteiro morto.
+  Events := nil;
+  Store := nil;
+end;
+
+// Metade dos núcleos, no mínimo 1. A outra metade é da gravação, que é o
+// trabalho que não pode atrasar: uma câmera cujo RTP não é lido a tempo perde
+// pacote, e pacote perdido é buraco no arquivo — enquanto uma análise mais
+// lenta só demora mais a chegar ao presente.
+function ThreadsParaInferencia: Integer;
+begin
+  Result := CPUCount div 2;
+  if Result < 1 then Result := 1;
+end;
+
+function BuildAnalytics(const Cfg: TAnalyticsConfig; const StorageDir: string;
+  const Cameras: TArray<string>; Cache: TVmsIndexCache; const Clock: IClock;
+  const Logger: ILogger; Stop: TEvent): TAnalyticsRig;
+var
+  Grabber: IFrameGrabber;
+  Keyframes: IKeyframeSource;
+  Objetos: IObjectDetector;
+  Store: TEventFileStore;
+  Analyzer: IFrameAnalyzer;
+  I: Integer;
+begin
+  Result.Events := nil;
+  Result.Store := nil;
+  Result.Workers := nil;
+  if not Cfg.Enabled then Exit;
+  if Length(Cameras) = 0 then Exit;
+
+  Grabber := nil;
+{$IFDEF MSWINDOWS}
+  Grabber := TFFmpegFrameGrabber.Create(Logger);
+{$ENDIF}
+  // Sem decodificador não há quadro para analisar, e nenhuma parte do resto
+  // adiantaria. É diferente do modelo ausente, que só desliga metade.
+  if (Grabber = nil) or (not Grabber.Available) then
+  begin
+    Logger.Warn('analytics', 'ligada na config, mas nao ha como decodificar ' +
+      'video nesta maquina (FFmpeg ausente). A analise nao vai subir.');
+    Exit;
+  end;
+
+  Objetos := nil;
+{$IFDEF MSWINDOWS}
+  if Cfg.ModelPath <> '' then
+    Objetos := TOnnxObjectDetector.Create(Cfg.ModelPath, Cfg.OnnxDllPath,
+                 0, 0, ThreadsParaInferencia, Logger);
+{$ENDIF}
+  // Modelo ausente, DLL ausente ou modelo que não carregou: segue só com
+  // movimento. Ver o cabeçalho — ausência de recurso não vira exceção.
+  if (Objetos = nil) or (not Objetos.Available) then
+    Objetos := TNullObjectDetector.Create;
+
+  Store := TEventFileStore.Create(StorageDir, Logger);
+  Result.Store := Store;
+  Result.Events := Store;   // o mesmo objeto pelas duas interfaces
+  Keyframes := TVmsKeyframeSource.Create(Cache, Logger);
+
+  Logger.Info('analytics', Cfg.Describe);
+  Logger.Info('analytics', Objetos.Describe);
+
+  SetLength(Result.Workers, Length(Cameras));
+  for I := 0 to High(Cameras) do
+  begin
+    // Um detector de movimento e um analisador POR CÂMERA: os dois comparam o
+    // quadro atual com o que veio antes NAQUELA cena. Compartilhá-los faria
+    // cada câmera apagar a referência da outra.
+    Analyzer := TFrameAnalyzer.Create(Cameras[I],
+      TFrameDiffMotionDetector.Create(Cfg.MotionThreshold,
+        Cfg.SceneChangeThreshold, Cfg.StepMs * 4),
+      Objetos, Store, Cfg, Logger);
+    Result.Workers[I] := TAnalyticsWorker.Create(Cameras[I], Keyframes, Grabber,
+      Analyzer, Store, Cache, Cfg, Clock, Logger, Stop);
+  end;
+end;
 
 function IsDvripUrl(const Url: string): Boolean;
 begin

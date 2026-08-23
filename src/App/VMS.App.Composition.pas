@@ -55,8 +55,7 @@ var
 begin
   Composite := TCompositeLogger.Create;
   try
-    Composite.SetMinLevel(AppCfg.LogLevel);
-    Console := TConsoleLogger.Create(AppCfg.LogLevel);
+    Console := TConsoleLogger.Create;
     Composite.Add(Console);
     if Trim(AppCfg.LogDir) <> '' then
     begin
@@ -65,7 +64,7 @@ begin
         ForceDirectories(AbsDir);
       LogPath := IncludeTrailingPathDelimiter(AbsDir) +
                  FormatDateTime('yyyy-mm-dd', Now) + '.log';
-      FileL := TFileLogger.Create(LogPath, AppCfg.LogLevel);
+      FileL := TFileLogger.Create(LogPath);
       Composite.Add(FileL);
     end;
   except

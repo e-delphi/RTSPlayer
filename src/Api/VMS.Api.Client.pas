@@ -59,6 +59,23 @@ type
     EndMs: Int64;
   end;
 
+  // Um evento que a análise do servidor registrou sobre a gravação.
+  //
+  // A caixa vem NORMALIZADA (0..1 sobre a largura e a altura do quadro), e não
+  // em pixels: quem desenha é o app, sobre um vídeo que pode estar em qualquer
+  // resolução — e a mesma câmera muda de perfil sem avisar.
+  TApiEvent = record
+    StartMs: Int64;
+    EndMs: Int64;
+    Kind: string;      // 'motion' | 'object'
+    Name: string;      // 'movimento', 'person', 'car'…
+    Score: Double;     // 0..1
+    Count: Integer;
+    BoxL, BoxT, BoxR, BoxB: Double;
+    function IsMotion: Boolean;
+    function DurationMs: Int64;
+  end;
+
   // Um pedaço de mídia: o corpo é um .vms completo (header + N blocos), e os
   // cabeçalhos dizem onde ele cai na linha do tempo e como continuar.
   TApiMediaChunk = record
@@ -72,6 +89,7 @@ type
     Discontinuity: Boolean;
     Keyframe: Boolean;
     Growing: Boolean;
+    Thinned: Boolean;   // veio decimado pelo servidor: é varredura
   end;
 
   TVmsApiClient = class
@@ -100,11 +118,22 @@ type
     function GetSegments(const Camera, Day: string; out Segments: TArray<TApiSegment>;
                          out DayStartMs, DayEndMs: Int64): Boolean;
     // Busca por instante (início de reprodução e seek).
+    // StepMs > 0 pede varredura: o servidor entrega no máximo um quadro a cada
+    // StepMs de mídia, só keyframe e sem áudio (ver Vms.Server.Media).
     function GetMediaAt(const Camera: string; FromMs: Int64; Blocks: Integer;
-                        out Chunk: TApiMediaChunk): Boolean;
+                        StepMs: Int64; out Chunk: TApiMediaChunk): Boolean;
     // Continuação: devolve o cursor da resposta anterior, sem busca nenhuma.
     function GetMediaNext(const Camera, Cursor: string; Blocks: Integer;
-                          out Chunk: TApiMediaChunk): Boolean;
+                          StepMs: Int64; out Chunk: TApiMediaChunk): Boolean;
+    // A miniatura do instante. ActualMs é o minuto que a imagem representa —
+    // vem do servidor porque é ele que decide o arredondamento.
+    function GetThumb(const Camera: string; Ms: Int64; out Data: TBytes;
+                      out ActualMs: Int64): Boolean;
+    // Os eventos de uma janela de tempo. Kind vazio = os dois tipos; a janela é
+    // limitada a 7 dias pelo servidor. False também quando o servidor não tem
+    // análise (503) — ver LastStatus para separar isso de rede fora.
+    function GetEvents(const Camera: string; FromMs, ToMs: Int64;
+                       const Kind: string; out Events: TArray<TApiEvent>): Boolean;
     // Trocável: mudar de câmera pode mudar de servidor, e trocar o OBJETO
     // cliente por baixo da engine deixaria a thread de rede com um ponteiro
     // morto na mão. Trocar só a base é seguro — a requisição em voo já montou
@@ -427,6 +456,63 @@ begin
   end;
 end;
 
+{ TApiEvent }
+
+function TApiEvent.IsMotion: Boolean;
+begin
+  Result := SameText(Kind, 'motion');
+end;
+
+function TApiEvent.DurationMs: Int64;
+begin
+  Result := EndMs - StartMs;
+  if Result < 0 then Result := 0;
+end;
+
+function TVmsApiClient.GetEvents(const Camera: string; FromMs, ToMs: Int64;
+  const Kind: string; out Events: TArray<TApiEvent>): Boolean;
+var
+  Root, Item, Caixa: TJSONObject;
+  Arr: TJSONArray;
+  I: Integer;
+  Query: string;
+begin
+  Events := nil;
+  Query := Format('/api/events?camera=%s&fromMs=%d&toMs=%d',
+    [TNetEncoding.URL.Encode(Camera), FromMs, ToMs]);
+  if Trim(Kind) <> '' then
+    Query := Query + '&kind=' + TNetEncoding.URL.Encode(Kind);
+  Result := GetJson(Query, Root);
+  if not Result then Exit;
+  try
+    Arr := Root.GetValue('events') as TJSONArray;
+    if Arr = nil then Exit;
+    SetLength(Events, Arr.Count);
+    for I := 0 to Arr.Count - 1 do
+    begin
+      Item := Arr.Items[I] as TJSONObject;
+      Events[I].StartMs := JsonInt(Item, 'startMs');
+      Events[I].EndMs := JsonInt(Item, 'endMs');
+      Events[I].Kind := JsonStr(Item, 'kind');
+      Events[I].Name := JsonStr(Item, 'name');
+      Events[I].Score := JsonFloat(Item, 'score');
+      Events[I].Count := Integer(JsonInt(Item, 'count'));
+      // A caixa é opcional na leitura: um evento sem ela ainda é um evento na
+      // linha do tempo, e é assim que um servidor mais velho responderia.
+      Caixa := Item.GetValue('box') as TJSONObject;
+      if Caixa <> nil then
+      begin
+        Events[I].BoxL := JsonFloat(Caixa, 'l');
+        Events[I].BoxT := JsonFloat(Caixa, 't');
+        Events[I].BoxR := JsonFloat(Caixa, 'r');
+        Events[I].BoxB := JsonFloat(Caixa, 'b');
+      end;
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
 function TVmsApiClient.FetchMedia(const Query: string; out Chunk: TApiMediaChunk): Boolean;
 var
   Headers: TStringList;
@@ -463,6 +549,29 @@ begin
     Chunk.Discontinuity := HeaderInt('X-Vms-Discontinuity', 0) <> 0;
     Chunk.Keyframe := HeaderInt('X-Vms-Keyframe', 0) <> 0;
     Chunk.Growing := HeaderInt('X-Vms-Growing', 0) <> 0;
+    Chunk.Thinned := HeaderInt('X-Vms-Thinned', 0) <> 0;
+    Result := True;
+  finally
+    Headers.Free;
+  end;
+end;
+
+function TVmsApiClient.GetThumb(const Camera: string; Ms: Int64;
+  out Data: TBytes; out ActualMs: Int64): Boolean;
+var
+  Headers: TStringList;
+  S: string;
+begin
+  Data := nil;
+  ActualMs := Ms;
+  Result := False;
+  Headers := TStringList.Create;
+  try
+    if not Get(Format('/api/thumb?camera=%s&ms=%d',
+                      [TNetEncoding.URL.Encode(Camera), Ms]), Data, Headers) then Exit;
+    if Length(Data) = 0 then Exit;
+    S := Trim(Headers.Values['X-Vms-Thumb-Ms']);
+    if (S = '') or (not TryStrToInt64(S, ActualMs)) then ActualMs := Ms;
     Result := True;
   finally
     Headers.Free;
@@ -470,14 +579,14 @@ begin
 end;
 
 function TVmsApiClient.GetMediaAt(const Camera: string; FromMs: Int64; Blocks: Integer;
-  out Chunk: TApiMediaChunk): Boolean;
+  StepMs: Int64; out Chunk: TApiMediaChunk): Boolean;
 begin
-  Result := FetchMedia(Format('/api/media?camera=%s&fromMs=%d&blocks=%d',
-    [TNetEncoding.URL.Encode(Camera), FromMs, Blocks]), Chunk);
+  Result := FetchMedia(Format('/api/media?camera=%s&fromMs=%d&blocks=%d&stepMs=%d',
+    [TNetEncoding.URL.Encode(Camera), FromMs, Blocks, StepMs]), Chunk);
 end;
 
 function TVmsApiClient.GetMediaNext(const Camera, Cursor: string; Blocks: Integer;
-  out Chunk: TApiMediaChunk): Boolean;
+  StepMs: Int64; out Chunk: TApiMediaChunk): Boolean;
 begin
   if Cursor = '' then
   begin
@@ -486,8 +595,9 @@ begin
   end;
   // A câmera vai junto porque o cursor pode ter caducado (retenção apagou o
   // arquivo que ele apontava): aí o servidor resolve pelo instante, dentro dela.
-  Result := FetchMedia(Format('/api/media?camera=%s&cursor=%s&blocks=%d',
-    [TNetEncoding.URL.Encode(Camera), TNetEncoding.URL.Encode(Cursor), Blocks]), Chunk);
+  Result := FetchMedia(Format('/api/media?camera=%s&cursor=%s&blocks=%d&stepMs=%d',
+    [TNetEncoding.URL.Encode(Camera), TNetEncoding.URL.Encode(Cursor), Blocks,
+     StepMs]), Chunk);
 end;
 
 end.

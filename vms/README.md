@@ -116,6 +116,34 @@ decide, nunca o método — `OPTIONS` existe nos dois protocolos.
 | `GET /api/media?camera=X&cursor=…` | a continuação, sem busca |
 | `GET /api/recordings?camera=X` | a lista crua, arquivo por arquivo — diagnóstico |
 | `GET /api/index?file=…` | o índice de blocos, cru — diagnóstico |
+| `GET /api/thumb?camera=…&ms=…` | a miniatura JPEG daquele instante |
+
+**Miniaturas** — o app desenha uma tira de imagens na barra do tempo, e elas vêm
+daqui. A chave é o MINUTO: o servidor arredonda o `ms` pedido para o começo do
+minuto, gera a imagem a partir do keyframe em vigor nele e guarda em
+`<câmera>/thumbs/<dia>/HHMM.jpg` (~4 KB, ~6 MB por dia por câmera). A resposta
+diz no `X-Vms-Thumb-Ms` que minuto a imagem representa. A retenção apaga as
+pastas de dia que já não têm gravação por baixo.
+
+A geração exige decodificar vídeo, o que o servidor só faz aqui: precisa das
+**DLLs do FFmpeg** ao lado do `vmsserver.exe` (as mesmas do app no Windows). Sem
+elas o servidor sobe igual, a rota responde 503 e a barra do app fica sem
+miniatura — a subida loga qual dos dois casos é.
+
+**Varredura (`stepMs`)** — `GET /api/media?camera=…&fromMs=…&stepMs=5333` entrega no
+máximo um quadro a cada `stepMs` de mídia: só keyframes, sem áudio. Serve às
+velocidades altas do player, onde o cliente não exibe nem decodifica todos os
+quadros — mandar o resto seria carregar a rede com o que vai ser descartado.
+
+Nesse modo os blocos são **reescritos**, não copiados crus: com GOP menor que o
+bloco quase todo bloco tem keyframe, então filtrar por bloco não economizaria
+nada — o desperdício está dentro do bloco, nos quadros P. A âncora de cada bloco
+reescrito passa a ser o instante do primeiro quadro escolhido, e é isso que faz o
+horário continuar certo depois de o começo do bloco ter sido descartado.
+
+O que sai continua sendo um `.vms` válido, aberto pelo mesmo leitor, com o mesmo
+cursor e o mesmo `NextMs`. A resposta traz `X-Vms-Thinned: 1`; servidor antigo
+ignora o parâmetro e manda tudo, e o cliente detecta pela ausência do cabeçalho.
 
 ```bash
 curl "http://localhost:8554/api/days?camera=isis"
@@ -236,7 +264,8 @@ O campo `transport` é uma **string separada por vírgula**: `"tcp"`, `"udp"`,
 dá para copiar as câmeras de um arquivo para o outro sem traduzir nada. Array
 (`["tcp"]`, formato antigo do gravador) não é aceito e cai no default `tcp,udp`.
 
-`logLevel` não vale para o servidor: ele grava todos os níveis (ver Logs).
+Não existe `logLevel`: o log não tem filtro, aqui nem no app. O que o código
+registra, sai — sempre (ver Logs).
 
 `tailscale: true` numa câmera faz o servidor esperar rota até ela antes de
 conectar (útil se a câmera só existe dentro da tailnet). No Windows isso é só

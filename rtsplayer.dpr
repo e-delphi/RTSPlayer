@@ -1,4 +1,4 @@
-program rtsplayer;
+﻿program rtsplayer;
 
 uses
   System.StartUpCopy,
@@ -71,11 +71,13 @@ uses
   UI.Common in 'src\UI\UI.Common.pas',
   UI.List in 'src\UI\UI.List.pas' {FrameList: TFrame},
   UI.Player in 'src\UI\UI.Player.pas' {FramePlayer: TFrame},
+  UI.Thumbs in 'src\UI\UI.Thumbs.pas',
   UI.Editor in 'src\UI\UI.Editor.pas' {FrameEditor: TFrame},
   UI.Editor.Paths in 'src\UI\UI.Editor.Paths.pas',
   UI.Import in 'src\UI\UI.Import.pas',
   UI.Days in 'src\UI\UI.Days.pas',
-  UI.Timeline in 'src\UI\UI.Timeline.pas';
+  UI.Timeline in 'src\UI\UI.Timeline.pas',
+  UI.Events in 'src\UI\UI.Events.pas';
 
 {$R *.res}
 

@@ -8,7 +8,9 @@
 // celular via Tailscale (ver bindAddress em vmsserver.json).
 //
 // As units VMS.* vêm de ..\src (compartilhadas com o app RTSPlayer); as Tx.*
-// implementam o servidor RTSP.
+// implementam o servidor RTSP. As ONNX.*/Vision.* são cópia literal do projeto
+// onnx-pascal (ver ..\vendor\onnx-pascal\README.md) e só a Vms.Analytics.Onnx
+// fala com elas.
 
 {$APPTYPE CONSOLE}
 {$R *.res}
@@ -90,8 +92,45 @@ uses
   Vms.Server.Logger in 'src\App\Vms.Server.Logger.pas',
   Vms.Server.Retention in 'src\App\Vms.Server.Retention.pas',
   Vms.Server.Repair in 'src\App\Vms.Server.Repair.pas',
+  Vms.Thumb.Intf in 'src\Thumbs\Vms.Thumb.Intf.pas',
+  Vms.Thumb.Cache in 'src\Thumbs\Vms.Thumb.Cache.pas',
+  Vms.Thumb.Keyframe in 'src\Thumbs\Vms.Thumb.Keyframe.pas',
+  Vms.Thumb.Service in 'src\Thumbs\Vms.Thumb.Service.pas',
+  Vms.Thumb.FFmpeg in 'src\Thumbs\Vms.Thumb.FFmpeg.pas',
+  Vms.Thumb.JpegVcl in 'src\Thumbs\Vms.Thumb.JpegVcl.pas',
+  FFmpegLib in '..\src\Win\FFmpegLib.pas',
+  // ---- visão computacional: cópia do onnx-pascal, não editar ----
+  ONNX.CApi in '..\vendor\onnx-pascal\ONNX.CApi.pas',
+  ONNX.Types in '..\vendor\onnx-pascal\ONNX.Types.pas',
+  ONNX.Runtime in '..\vendor\onnx-pascal\ONNX.Runtime.pas',
+  ONNX.Session in '..\vendor\onnx-pascal\ONNX.Session.pas',
+  Vision.Types in '..\vendor\onnx-pascal\Vision.Types.pas',
+  Vision.Image in '..\vendor\onnx-pascal\Vision.Image.pas',
+  Vision.Preprocess in '..\vendor\onnx-pascal\Vision.Preprocess.pas',
+  Vision.Nms in '..\vendor\onnx-pascal\Vision.Nms.pas',
+  Vision.Model in '..\vendor\onnx-pascal\Vision.Model.pas',
+  Vision.Decoder in '..\vendor\onnx-pascal\Vision.Decoder.pas',
+  // O decoder se registra sozinho no initialization: estar no uses É o que
+  // habilita a cabeça de detecção. Nenhum `case` conhece o nome dela.
+  Vision.Decoder.Detect in '..\vendor\onnx-pascal\Vision.Decoder.Detect.pas',
+  Vision.Predictor in '..\vendor\onnx-pascal\Vision.Predictor.pas',
+  // ---- análise de imagem: eventos de movimento e de objeto ----
+  Vms.Analytics.Types in 'src\Analytics\Vms.Analytics.Types.pas',
+  Vms.Analytics.Intf in 'src\Analytics\Vms.Analytics.Intf.pas',
+  Vms.Analytics.Motion in 'src\Analytics\Vms.Analytics.Motion.pas',
+  Vms.Analytics.Store in 'src\Analytics\Vms.Analytics.Store.pas',
+  Vms.Analytics.Onnx in 'src\Analytics\Vms.Analytics.Onnx.pas',
+  Vms.Analytics.Analyzer in 'src\Analytics\Vms.Analytics.Analyzer.pas',
+  Vms.Analytics.Worker in 'src\Analytics\Vms.Analytics.Worker.pas',
   Vms.Server.Config in 'src\App\Vms.Server.Config.pas',
   Vms.Server.Composition in 'src\App\Vms.Server.Composition.pas';
+
+const
+  // Tamanho máximo da miniatura, em pixels. 160 de largura enche a barra do app
+  // sem passar de ~4 KB por imagem; a proporção do vídeo é preservada dentro
+  // desta caixa, então 16:9 sai 160x90.
+  THUMB_W = 160;
+  THUMB_H = 120;
 
 var
   GStopEvent: TEvent;
@@ -140,6 +179,10 @@ var
   Hub: TLiveHub;
   ApiCfg: TApiConfig;
   Api: TApiRouter;
+  Cache: TVmsIndexCache;
+  Thumbs: IThumbSource;
+  AnalyticsCfg: TAnalyticsConfig;
+  Analytics: TAnalyticsRig;
   CameraNames: TArray<string>;
   Logger: ILogger;
   Clock: IClock;
@@ -157,6 +200,7 @@ begin
     Retention := Cfg.Retention;
     LiveCfg := Cfg.Live;
     ApiCfg := Cfg.Api;
+    AnalyticsCfg := Cfg.Analytics;
   finally
     Cfg.Free;
   end;
@@ -175,6 +219,7 @@ begin
     [FreeSpaceOf(StorageDir) / GIGABYTE, Retention.Describe]));
   Logger.Info('main', 'Ao vivo: ' + LiveCfg.Describe);
   Logger.Info('main', 'API de gravacoes: ' + ApiCfg.Describe);
+  Logger.Info('main', 'Analise de imagem: ' + AnalyticsCfg.Describe);
   if ApiCfg.Enabled and (BindAddress = '') then
     Logger.Warn('main', 'API sem autenticacao escutando em todas as interfaces: ' +
       'quem alcanca esta porta baixa gravacao. Use bindAddress para limitar ao tailnet.');
@@ -203,9 +248,28 @@ begin
     // CameraNames já está montado (a finalização acima usa a mesma lista): é
     // com ele que a API confere o nome que o cliente manda, antes de virar
     // caminho de arquivo.
+    // O cache das gravações e a fonte de miniaturas nascem aqui, e não dentro
+    // do roteador: composição é o único lugar que pode conhecer implementação
+    // concreta, e é o que deixa o roteador falar só com interfaces.
     Api := nil;
+    Cache := nil;
+    Thumbs := nil;
+    Analytics := Default(TAnalyticsRig);
     if ApiCfg.Enabled then
-      Api := TApiRouter.Create(ApiCfg, StorageDir, CameraNames, Hub, Logger);
+    begin
+      Cache := TVmsIndexCache.Create(StorageDir, Logger);
+      Thumbs := BuildThumbSource(StorageDir, Cache, THUMB_W, THUMB_H, Logger);
+      // A análise depende do MESMO cache de índices das miniaturas — é ele que
+      // faz achar o keyframe de um instante custar uma busca binária. Por isso
+      // ela sobe junto com a API, e não antes.
+      Analytics := BuildAnalytics(AnalyticsCfg, StorageDir, CameraNames, Cache,
+                                  Clock, Logger, GStopEvent);
+      Api := TApiRouter.Create(ApiCfg, CameraNames, Cache, Hub, Thumbs,
+                               Analytics.Events, Logger);
+    end
+    else if AnalyticsCfg.Enabled then
+      Logger.Warn('main', 'analise ligada mas API desligada: os eventos seriam ' +
+        'gravados e ninguem poderia le-los. Nao vai subir.');
     try
       Supervisors := BuildServerSupervisors(App, Logger, Clock, Hub);
       try
@@ -255,6 +319,11 @@ begin
     finally
       // depois do listener: são as sessões dele que consultam o roteador
       Api.Free;
+      // As threads de análise antes do cache: elas o consultam a cada quadro.
+      Analytics.Stop;
+      Analytics.Release;
+      Thumbs := nil;   // solta a interface antes do cache que ela usa
+      Cache.Free;
     end;
   finally
     Hub.Free;

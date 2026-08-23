@@ -10,7 +10,15 @@ uses
   VMS.Rec.Format,
   Tx.Server.Types;
 
-function BuildSdpForHeader(const Header: TVmsHeader; const SessionName: string): string;
+// FromLive diz se a mídia sai da câmera AGORA ou de gravação. Vai para o SDP
+// como atributo próprio: é a única resposta que o cliente recebe no instante em
+// que a fonte é escolhida, e cliente que não o conheça (VLC) descarta sem se
+// incomodar — atributo desconhecido é ignorado por contrato.
+//
+// Sem isso, câmera fora do ar era servida do arquivo e o player mostrava imagem
+// de horas atrás com cara de ao vivo. O servidor sabia; só não contava.
+function BuildSdpForHeader(const Header: TVmsHeader; const SessionName: string;
+                           FromLive: Boolean; MediaStartMs: Int64): string;
 function SplitAnnexB(const Data: TBytes): TArray<TBytes>;
 
 // Os parameter sets que estiverem DENTRO de um sample de vídeo, devolvidos em
@@ -331,7 +339,8 @@ begin
   end;
 end;
 
-function BuildSdpForHeader(const Header: TVmsHeader; const SessionName: string): string;
+function BuildSdpForHeader(const Header: TVmsHeader; const SessionName: string;
+  FromLive: Boolean; MediaStartMs: Int64): string;
 var
   Sb: TStringBuilder;
   SName: string;
@@ -346,6 +355,16 @@ begin
     Sb.Append('c=IN IP4 0.0.0.0'#13#10);
     Sb.Append('t=0 0'#13#10);
     Sb.Append('a=control:*'#13#10);
+    if FromLive then
+      Sb.Append('a=x-vms-source:live'#13#10)
+    else
+    begin
+      Sb.Append('a=x-vms-source:file'#13#10);
+      // De quando é a imagem. Sem este segundo atributo o cliente sabe que é
+      // gravação, mas não se é de um minuto ou de ontem.
+      if MediaStartMs > 0 then
+        Sb.AppendFormat('a=x-vms-media-start:%d'#13#10, [MediaStartMs]);
+    end;
     if Header.VideoPresent then
       AppendVideoSdp(Sb, Header.Video);
     if Header.AudioPresent then

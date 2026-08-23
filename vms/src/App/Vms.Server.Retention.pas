@@ -1,4 +1,4 @@
-unit Vms.Server.Retention;
+﻿unit Vms.Server.Retention;
 
 // Limpeza automática das gravações.
 //
@@ -22,6 +22,11 @@ unit Vms.Server.Retention;
 // Apagando um .vms, o `.vms.idx` dele (índice da gravação que não fechou
 // direito) vai junto: sozinho ele não serve para nada e ninguém mais o apagaria.
 //
+// As miniaturas seguem o mesmo destino, mas por outra régua: elas são por
+// minuto, não por arquivo, então o que se apaga são as pastas de DIA anteriores
+// à gravação mais antiga que sobrou. Sem isso o cache de miniaturas cresceria
+// para sempre, cobrindo dias que já não têm vídeo nenhum.
+//
 // Por que o mais antigo primeiro, e não cota por câmera: o disco é um só, e a
 // ordem por data é a que alguém consegue prever olhando a pasta. Cota por câmera
 // fica para quando fizer falta (uma câmera muito mais movimentada que as outras
@@ -38,7 +43,10 @@ uses
   System.Generics.Collections,
   System.Generics.Defaults,
   VMS.Domain.Logging,
-  VMS.Rec.Sidecar;
+  VMS.Rec.Sidecar,
+  Vms.Thumb.Cache,
+  Vms.Analytics.Intf,
+  Vms.Analytics.Store;
 
 type
   TRetentionPolicy = record
@@ -184,6 +192,72 @@ begin
   end;
 end;
 
+// Some com as miniaturas de dias que já não têm gravação. Uma passada por pasta
+// de câmera; erro em uma não impede as outras.
+procedure PruneThumbs(const Dir: string; KeepFromMs: Int64; const Logger: ILogger);
+var
+  SR: TSearchRec;
+  Base: string;
+  Cache: TThumbDiskCache;
+  N: Integer;
+begin
+  Base := IncludeTrailingPathDelimiter(Dir);
+  Cache := TThumbDiskCache.Create(Dir);
+  try
+    if FindFirst(Base + '*', faDirectory, SR) <> 0 then Exit;
+    try
+      repeat
+        if (SR.Attr and faDirectory) = 0 then Continue;
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        N := Cache.PruneOlderThan(SR.Name, KeepFromMs);
+        if (N > 0) and (Logger <> nil) then
+          Logger.Debug(TAG, Format('%s: %d dia(s) de miniatura apagados',
+            [SR.Name, N]));
+      until FindNext(SR) <> 0;
+    finally
+      System.SysUtils.FindClose(SR);
+    end;
+  finally
+    Cache.Free;
+  end;
+end;
+
+// Some com os eventos de dias que já não têm gravação. Mesma passada, mesma
+// regra e mesmo motivo das miniaturas: o que descreve um vídeo que não existe
+// mais é lixo que ninguém remove sozinho — e aqui ainda apareceria na linha do
+// tempo do app, apontando para uma gravação apagada.
+procedure PruneEvents(const Dir: string; KeepFromMs: Int64; const Logger: ILogger);
+var
+  SR: TSearchRec;
+  Base: string;
+  // A interface segura o objeto: TEventFileStore é contado por referência, e
+  // um `Free` direto com refcount vivo é a única forma de errar isto.
+  Store: IEventStore;
+  Concreto: TEventFileStore;
+  N: Integer;
+begin
+  Base := IncludeTrailingPathDelimiter(Dir);
+  Concreto := TEventFileStore.Create(Dir, Logger);
+  Store := Concreto;
+  try
+    if FindFirst(Base + '*', faDirectory, SR) <> 0 then Exit;
+    try
+      repeat
+        if (SR.Attr and faDirectory) = 0 then Continue;
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        N := Concreto.PruneOlderThan(SR.Name, KeepFromMs);
+        if (N > 0) and (Logger <> nil) then
+          Logger.Debug(TAG, Format('%s: %d dia(s) de eventos apagados',
+            [SR.Name, N]));
+      until FindNext(SR) <> 0;
+    finally
+      System.SysUtils.FindClose(SR);
+    end;
+  finally
+    Store := nil;
+  end;
+end;
+
 // Lista os .vms com tamanho e data, do mais antigo para o mais novo — que é a
 // ordem em que se apaga. Cada câmera grava na SUA pasta (ver VMS.Rec.Paths),
 // então a varredura desce um nível; a raiz ainda é lida por causa de gravação
@@ -223,6 +297,7 @@ var
   I: Integer;
   Total, Avail: Int64;
   Cutoff: TDateTime;
+  Sobrou: Int64;
   Res: TRetentionResult;
 
   // True se apagou agora. Mantém Total/Avail em dia para as regras seguintes.
@@ -310,12 +385,23 @@ begin
   end;
 
   // Ficou no disco tudo que não foi apagado — inclusive o que estava em uso.
+  Sobrou := 0;
   for I := 0 to High(Files) do
     if not Files[I].Deleted then
     begin
       Inc(Res.KeptFiles);
       Inc(Res.KeptBytes, Files[I].Size);
+      if Sobrou = 0 then
+        Sobrou := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Files[I].Written),
+                                 True) * 1000;
     end;
+  // Files está em ordem de data, então o primeiro que sobrou é o mais antigo:
+  // miniatura de dia anterior a ele não tem mais vídeo por baixo.
+  if (Sobrou > 0) and (Res.Deleted > 0) then
+  begin
+    PruneThumbs(Dir, Sobrou, Logger);
+    PruneEvents(Dir, Sobrou, Logger);
+  end;
   Result := Res;
 end;
 

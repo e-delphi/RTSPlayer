@@ -1,4 +1,4 @@
-unit Vms.Server.Api;
+﻿unit Vms.Server.Api;
 
 // As rotas HTTP do servidor, na MESMA porta do RTSP (ver Tx.Server.Listener: o
 // desvio é pela versão da linha do pedido, `HTTP/1.1` em vez de `RTSP/1.0`).
@@ -13,6 +13,7 @@ unit Vms.Server.Api;
 //   GET /api/recordings?camera=X&...      a lista crua, arquivo por arquivo
 //   GET /api/index?file=…                 o índice de blocos, cru
 //                                         (as duas últimas são diagnóstico)
+//   GET /api/events?camera=X&fromMs=…     o que a análise viu naquela janela
 //
 // Regra de ouro destas rotas: **o cliente não sabe que existem arquivos**. Ele
 // pede instante e recebe faixa; que a câmera tenha gerado 37 .vms naquele dia
@@ -42,6 +43,9 @@ uses
   VMS.Rec.Format,
   Vms.Server.LiveHub,
   Vms.Server.IndexCache,
+  Vms.Thumb.Intf,
+  Vms.Analytics.Types,
+  Vms.Analytics.Intf,
   Vms.Server.Media;
 
 const
@@ -77,6 +81,15 @@ type
     FHub: TLiveHub;
     FCache: TVmsIndexCache;
     FMedia: TMediaBuilder;
+    // A miniatura entra por uma interface, e não pela implementação: é o que
+    // mantém FFmpeg e VCL fora desta camada, que só deveria falar HTTP. Sem
+    // decodificador na máquina, a composição liga a fonte nula e a rota
+    // responde "não tenho" — o servidor sobe igual.
+    FThumbs: IThumbSource;
+    // Os eventos entram pela mesma porta que as miniaturas: uma interface, e
+    // não a implementação. É o que mantém o onnxruntime fora desta camada, que
+    // só deveria falar HTTP. Nil = servidor sem análise, e a rota responde 503.
+    FEvents: IEventSource;
     FLogger: ILogger;
     function KnownCamera(const Name: string; out Canonical: string): Boolean;
     function IsLive(const Camera: string): Boolean;
@@ -86,9 +99,15 @@ type
     function HandleRecordings(const Query: string): TApiResponse;
     function HandleMedia(const Query: string): TApiResponse;
     function HandleIndex(const Query: string): TApiResponse;
+    function HandleThumb(const Query: string): TApiResponse;
+    function HandleEvents(const Query: string): TApiResponse;
   public
-    constructor Create(const AConfig: TApiConfig; const AStorageDir: string;
-                       const ACameras: TArray<string>; AHub: TLiveHub;
+    // O cache e a fonte de miniaturas vêm de fora, e o roteador não é dono de
+    // nenhum dos dois: quem os cria é a composição, que é o único lugar que
+    // pode conhecer as implementações concretas.
+    constructor Create(const AConfig: TApiConfig; const ACameras: TArray<string>;
+                       ACache: TVmsIndexCache; AHub: TLiveHub;
+                       const AThumbs: IThumbSource; const AEvents: IEventSource;
                        const ALogger: ILogger);
     destructor Destroy; override;
     // Method e Uri como vieram da linha do pedido. Nunca levanta exceção: erro
@@ -289,24 +308,28 @@ end;
 
 { TApiRouter }
 
-constructor TApiRouter.Create(const AConfig: TApiConfig; const AStorageDir: string;
-  const ACameras: TArray<string>; AHub: TLiveHub; const ALogger: ILogger);
+constructor TApiRouter.Create(const AConfig: TApiConfig;
+  const ACameras: TArray<string>; ACache: TVmsIndexCache; AHub: TLiveHub;
+  const AThumbs: IThumbSource; const AEvents: IEventSource;
+  const ALogger: ILogger);
 begin
   inherited Create;
+  FThumbs := AThumbs;
+  FEvents := AEvents;
   FConfig := AConfig;
   if FConfig.MaxBlocksPerRequest <= 0 then
     FConfig.MaxBlocksPerRequest := API_DEFAULT_MAX_BLOCKS;
   FCameras := Copy(ACameras);
   FHub := AHub;
   FLogger := ALogger;
-  FCache := TVmsIndexCache.Create(AStorageDir, ALogger);
+  FCache := ACache;
   FMedia := TMediaBuilder.Create(FCache, FConfig.MaxBlocksPerRequest, ALogger);
 end;
 
 destructor TApiRouter.Destroy;
 begin
+  // O cache não é nosso: quem criou destrói.
   FMedia.Free;
-  FCache.Free;
   inherited;
 end;
 
@@ -369,6 +392,10 @@ begin
       Result := HandleRecordings(Query)
     else if SameText(Path, API_PREFIX + 'index') then
       Result := HandleIndex(Query)
+    else if SameText(Path, API_PREFIX + 'thumb') then
+      Result := HandleThumb(Query)
+    else if SameText(Path, API_PREFIX + 'events') then
+      Result := HandleEvents(Query)
     else
       Result := TApiResponse.Error(404, 'rota desconhecida: ' + Path);
   except
@@ -379,6 +406,119 @@ begin
       Result := TApiResponse.Error(500, E.Message);
     end;
   end;
+end;
+
+// O que a análise viu numa janela de tempo.
+//
+//   GET /api/events?camera=frente&fromMs=…&toMs=…
+//                  [&kind=motion|object] [&name=person] [&minScore=0.5]
+//                  [&limit=500]
+//
+// A janela é obrigatória e limitada a uma semana: sem teto, um cliente com um
+// erro de fuso pediria "de 1970 até agora" e o servidor leria todos os arquivos
+// de evento que existem para montar a resposta.
+//
+// Entra o evento que SE SOBREPÕE à janela, não só o que começa dentro dela —
+// quem abre a barra às 14h quer ver a passagem que começou às 13h58 e ainda
+// estava acontecendo. Ver IEventSource.Query.
+function TApiRouter.HandleEvents(const Query: string): TApiResponse;
+var
+  Camera, Nome: string;
+  FromMs, ToMs: Int64;
+  KindFiltro, Limite, I: Integer;
+  MinScore: Double;
+  Kind: TEventKind;
+  Eventos: TVmsEventArray;
+  Root, Item, Caixa: TJSONObject;
+  Arr: TJSONArray;
+begin
+  if not KnownCamera(QueryValue(Query, 'camera'), Camera) then
+    Exit(TApiResponse.Error(404, 'camera desconhecida'));
+  if (FEvents = nil) or (not FEvents.Available) then
+    Exit(TApiResponse.Error(503, 'servidor sem analise de imagem'));
+
+  FromMs := QueryInt(Query, 'fromMs', 0);
+  ToMs := QueryInt(Query, 'toMs', 0);
+  if (FromMs <= 0) or (ToMs <= FromMs) then
+    Exit(TApiResponse.Error(400, 'informe fromMs e toMs'));
+  if (ToMs - FromMs) > (7 * MS_PER_DAY) then
+    Exit(TApiResponse.Error(400, 'janela maior que 7 dias'));
+
+  KindFiltro := -1;
+  Nome := Trim(QueryValue(Query, 'kind'));
+  if Nome <> '' then
+  begin
+    if not StrToEventKind(Nome, Kind) then
+      Exit(TApiResponse.Error(400, 'kind invalido: use motion ou object'));
+    KindFiltro := Ord(Kind);
+  end;
+
+  Nome := LowerCase(Trim(QueryValue(Query, 'name')));
+  MinScore := QueryInt(Query, 'minScorePct', 0) / 100;
+  Limite := Integer(QueryInt(Query, 'limit', 0));
+
+  Eventos := FEvents.Query(Camera, FromMs, ToMs, Nome, KindFiltro, MinScore, Limite);
+
+  Root := TJSONObject.Create;
+  Arr := TJSONArray.Create;
+  Root.AddPair('camera', Camera);
+  Root.AddPair('tz', UtcOffsetStr);
+  Root.AddPair('fromMs', TJSONNumber.Create(FromMs));
+  Root.AddPair('toMs', TJSONNumber.Create(ToMs));
+  Root.AddPair('count', TJSONNumber.Create(Length(Eventos)));
+  Root.AddPair('events', Arr);
+  for I := 0 to High(Eventos) do
+  begin
+    Item := TJSONObject.Create;
+    Item.AddPair('startMs', TJSONNumber.Create(Eventos[I].StartMs));
+    Item.AddPair('endMs', TJSONNumber.Create(Eventos[I].EndMs));
+    Item.AddPair('kind', EventKindToStr(Eventos[I].Kind));
+    Item.AddPair('name', Eventos[I].Name);
+    Item.AddPair('score', TJSONNumber.Create(Eventos[I].Score));
+    Item.AddPair('count', TJSONNumber.Create(Eventos[I].Count));
+    // A caixa vai normalizada 0..1: o app desenha sobre um vídeo que pode estar
+    // em qualquer resolução, e é ele quem sabe qual.
+    Caixa := TJSONObject.Create;
+    Caixa.AddPair('l', TJSONNumber.Create(Eventos[I].Box.L));
+    Caixa.AddPair('t', TJSONNumber.Create(Eventos[I].Box.T));
+    Caixa.AddPair('r', TJSONNumber.Create(Eventos[I].Box.R));
+    Caixa.AddPair('b', TJSONNumber.Create(Eventos[I].Box.B));
+    Item.AddPair('box', Caixa);
+    Arr.AddElement(Item);
+  end;
+  Result := TApiResponse.FromJson(Root);
+end;
+
+// A miniatura do instante pedido. O cliente manda o instante que quer mostrar;
+// a resposta diz, no X-Vms-Thumb-Ms, o minuto que a imagem realmente representa
+// — é por ele que o app sabe que já tem aquela imagem e não pede de novo.
+function TApiRouter.HandleThumb(const Query: string): TApiResponse;
+var
+  Camera: string;
+  Ms, ActualMs: Int64;
+  Data: TBytes;
+begin
+  if not KnownCamera(QueryValue(Query, 'camera'), Camera) then
+    Exit(TApiResponse.Error(404, 'camera desconhecida'));
+  if Trim(QueryValue(Query, 'ms')) = '' then
+    Exit(TApiResponse.Error(400, 'informe ms'));
+  Ms := QueryInt(Query, 'ms', 0);
+  if Ms <= 0 then
+    Exit(TApiResponse.Error(400, 'ms invalido'));
+
+  if (FThumbs = nil) or (not FThumbs.Available) then
+    Exit(TApiResponse.Error(503, 'servidor sem gerador de miniaturas'));
+  if not FThumbs.Get(Camera, Ms, Data, ActualMs) then
+    Exit(TApiResponse.Error(404, 'sem imagem para este instante'));
+
+  Result.Status := 200;
+  Result.ContentType := FThumbs.ContentType;
+  Result.Body := Data;
+  Result.Extra := TArray<string>.Create(
+    Format('X-Vms-Thumb-Ms: %d', [ActualMs]),
+    // Miniatura de minuto passado não muda nunca mais: deixa o cliente e
+    // qualquer proxy no caminho guardarem à vontade.
+    'Cache-Control: max-age=86400');
 end;
 
 function TApiRouter.HandleCameras: TApiResponse;
@@ -392,6 +532,11 @@ begin
   Root := TJSONObject.Create;
   Arr := TJSONArray.Create;
   Root.AddPair('tz', UtcOffsetStr);
+  // Duas capacidades do SERVIDOR, e não da câmera: o app usa para não oferecer
+  // uma tela de eventos que nunca teria conteúdo, nem pedir miniatura a quem
+  // não sabe gerar. Cliente antigo simplesmente ignora os dois campos.
+  Root.AddPair('events', TJSONBool.Create((FEvents <> nil) and FEvents.Available));
+  Root.AddPair('thumbs', TJSONBool.Create((FThumbs <> nil) and FThumbs.Available));
   Root.AddPair('cameras', Arr);
   for I := 0 to High(FCameras) do
   begin
@@ -566,6 +711,11 @@ begin
     Req.HasFromBlock := True;
   end;
   Req.Blocks := Integer(QueryInt(Query, 'blocks', MEDIA_DEFAULT_BLOCKS));
+  // Varredura: um quadro a cada stepMs de mídia, só keyframe e sem áudio. É o
+  // cliente que decide o valor, porque é ele que sabe a velocidade e quantos
+  // quadros por segundo vai conseguir mostrar.
+  Req.StepMs := QueryInt(Query, 'stepMs', 0);
+  if Req.StepMs < 0 then Req.StepMs := 0;
 
   Frag := FMedia.Fetch(Req);
   if not Frag.Ok then
@@ -583,7 +733,8 @@ begin
     Format('X-Vms-Gap-Ms: %d', [Frag.GapMs]),
     Format('X-Vms-Discontinuity: %d', [Ord(Frag.Discontinuity)]),
     Format('X-Vms-Keyframe: %d', [Ord(Frag.Keyframe)]),
-    Format('X-Vms-Growing: %d', [Ord(Frag.Growing)]));
+    Format('X-Vms-Growing: %d', [Ord(Frag.Growing)]),
+    Format('X-Vms-Thinned: %d', [Ord(Frag.Thinned)]));
 end;
 
 // Diagnóstico: as entradas do índice, cruas, no mesmo layout do chunk VIDX

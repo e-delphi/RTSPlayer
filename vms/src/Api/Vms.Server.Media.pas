@@ -10,6 +10,14 @@ unit Vms.Server.Media;
 // .vms aquilo cai, por qual keyframe começar, e o que vem depois. Nome de
 // arquivo só aparece no parâmetro de diagnóstico.
 //
+// **Varredura (stepMs)**: em 8x, 16x, 64x o cliente não exibe nem consegue
+// decodificar todos os quadros — e mandar o que ele vai jogar fora é desperdício
+// de rede, que é justamente o que dói num acesso remoto. Com `stepMs`, o
+// servidor entrega no máximo um quadro a cada `stepMs` de mídia, só keyframes e
+// sem áudio. Aí os blocos são REESCRITOS em vez de copiados crus: filtrar por
+// bloco não adiantaria nada, porque com GOP menor que o bloco quase todo bloco
+// tem keyframe — o desperdício está DENTRO do bloco, nos quadros P.
+//
 // Uma resposta nunca atravessa arquivo: termina no fim do .vms corrente, e a
 // seguinte começa no próximo com Discontinuity — porque header e base de PTS
 // mudam ali, e o cliente precisa saber para reanunciar formato e re-ancorar o
@@ -27,6 +35,7 @@ uses
   VMS.Domain.Logging,
   VMS.Rec.Format,
   VMS.Rec.Reader,
+  VMS.Rec.Writer,
   Vms.Server.IndexCache;
 
 const
@@ -61,6 +70,8 @@ type
     FromBlock: Integer;
     Cursor: TMediaCursor;
     Blocks: Integer;
+    // > 0: varredura. Um quadro a cada StepMs de mídia, só keyframe, sem áudio.
+    StepMs: Int64;
   end;
 
   TMediaFragment = record
@@ -78,6 +89,7 @@ type
     Discontinuity: Boolean;
     Keyframe: Boolean;
     Growing: Boolean;
+    Thinned: Boolean;      // veio decimado: é varredura, não reprodução
     Cursor: string;
   end;
 
@@ -136,6 +148,81 @@ begin
   C.FileName := Copy(S, P3 + 1, MaxInt);
   if C.FileName = '' then Exit;
   C.Valid := True;
+  Result := True;
+end;
+
+// Reescreve um bloco com só os quadros que o cliente vai exibir.
+//
+// O instante de parede de um sample é `âncora + (pts - primeiro pts do bloco)`,
+// e o "primeiro pts do bloco" muda quando se joga fora o começo dele. Por isso a
+// âncora do bloco novo passa a ser o instante do PRIMEIRO QUADRO ESCOLHIDO: aí a
+// conta que o cliente faz continua dando o horário certo, sem ele saber que o
+// bloco foi mexido.
+//
+// LastMs entra e sai: é o instante do último quadro entregue, e é o que faz o
+// espaçamento valer ATRAVÉS dos blocos, não só dentro de cada um.
+function ThinBlock(const Src: TVmsBlock; Timescale: Cardinal; StepMs: Int64;
+  var LastMs: Int64; out Dst: TVmsBlock): Boolean;
+var
+  I, N, PayloadLen: Integer;
+  SrcAnchor, FirstVideoPts, WallMs, FirstKeptMs: Int64;
+  HaveFirstVideo: Boolean;
+  Keep: TArray<Integer>;
+  E: TVmsSampleEntry;
+begin
+  Result := False;
+  Dst := Default(TVmsBlock);
+  if Timescale = 0 then Timescale := 90000;
+  // Mesma regra do cliente: sem âncora de vídeo, vale o começo do bloco.
+  SrcAnchor := Src.VideoAnchorMs;
+  if SrcAnchor = 0 then SrcAnchor := Src.StartUnixMs;
+
+  FirstVideoPts := 0;
+  HaveFirstVideo := False;
+  FirstKeptMs := 0;
+  N := 0;
+  SetLength(Keep, Length(Src.Samples));
+  for I := 0 to High(Src.Samples) do
+  begin
+    if Src.Samples[I].TrackId <> 0 then Continue;   // áudio não vai em varredura
+    if not HaveFirstVideo then
+    begin
+      FirstVideoPts := Src.Samples[I].Pts;
+      HaveFirstVideo := True;
+    end;
+    // Só keyframe: quadro P depende de referência que não vai junto.
+    if (Src.Samples[I].FlagsByte and VMS_IDX_FLAG_KEYFRAME) = 0 then Continue;
+    WallMs := SrcAnchor +
+              ((Src.Samples[I].Pts - FirstVideoPts) * 1000) div Int64(Timescale);
+    if (LastMs > 0) and (WallMs - LastMs < StepMs) then Continue;
+    if N = 0 then FirstKeptMs := WallMs;
+    Keep[N] := I;
+    Inc(N);
+    LastMs := WallMs;
+  end;
+  if N = 0 then Exit;
+
+  SetLength(Dst.Samples, N);
+  PayloadLen := 0;
+  for I := 0 to N - 1 do
+    Inc(PayloadLen, Integer(Src.Samples[Keep[I]].PayloadSize));
+  SetLength(Dst.Payload, PayloadLen);
+
+  PayloadLen := 0;
+  for I := 0 to N - 1 do
+  begin
+    E := Src.Samples[Keep[I]];
+    if E.PayloadSize > 0 then
+      Move(Src.Payload[E.PayloadOffset], Dst.Payload[PayloadLen], E.PayloadSize);
+    E.PayloadOffset := Cardinal(PayloadLen);
+    Dst.Samples[I] := E;
+    Inc(PayloadLen, Integer(E.PayloadSize));
+  end;
+
+  Dst.BlockSeq := Src.BlockSeq;
+  Dst.StartUnixMs := FirstKeptMs;
+  Dst.VideoAnchorMs := FirstKeptMs;
+  Dst.AudioAnchorMs := 0;
   Result := True;
 end;
 
@@ -241,15 +328,19 @@ var
   Reader: TVmsReader;
   HeaderBytes, BodyBytes: TBytes;
   First, Last, Count, KeyIdx, I: Integer;
-  Offset, LastOffset, LastSize, SpanBytes: Int64;
+  Offset, LastOffset, LastSize, SpanBytes, LastKeptMs: Int64;
+  BodyLen: Integer;
+  Block, Thin: TVmsBlock;
+  Piece: TBytes;
   BlockSize: Cardinal;
   Wanted: Integer;
   CameraOfFile: string;
-  UsedCursorHint: Boolean;
+  UsedCursorHint, Thinned: Boolean;
   Cursor: TMediaCursor;
   FromMs: Int64;
 begin
   Info := Default(TVmsFileInfo);
+  Result := Default(TMediaFragment);
   UsedCursorHint := False;
 
   // 1. Que arquivo. Três entradas: continuação (cursor), diagnóstico (file) e
@@ -346,8 +437,11 @@ begin
     begin
       if not Reader.BlockRange(I, Offset, BlockSize) then Break;
       // Pelo menos um bloco sempre sai, mesmo se sozinho já estourar o teto:
-      // resposta vazia deixaria o cliente sem por onde continuar.
-      if (Count > 0) and (SpanBytes + Int64(BlockSize) > MEDIA_MAX_FRAGMENT_BYTES) then Break;
+      // resposta vazia deixaria o cliente sem por onde continuar. Em varredura o
+      // teto é folgado de propósito: o que sai são keyframes esparsos, e cortar
+      // pelo tamanho do bloco ORIGINAL faria a varredura andar devagar à toa.
+      if (Count > 0) and (Req.StepMs <= 0) and
+         (SpanBytes + Int64(BlockSize) > MEDIA_MAX_FRAGMENT_BYTES) then Break;
       Inc(SpanBytes, Int64(BlockSize));
       // LastSize acompanha o último bloco INCLUÍDO. Reaproveitar o BlockSize do
       // laço daria o tamanho do bloco que ficou de fora quando o teto corta.
@@ -360,7 +454,34 @@ begin
     if Count = 0 then
       Exit(Fail(416, 'nada para ler a partir deste bloco'));
 
-    if not Reader.ReadRaw(Index[First].Offset,
+    if Req.StepMs > 0 then
+    begin
+      // Varredura: em vez de copiar os bytes crus, lê cada bloco e reescreve só
+      // com os quadros que serão exibidos.
+      LastKeptMs := 0;
+      BodyLen := 0;
+      SetLength(BodyBytes, 0);
+      for I := First to Last do
+      begin
+        // Bloco sem keyframe não tem nada a entregar em varredura, e o índice já
+        // sabe disso: nem vale a leitura do disco. Só ajuda quando o GOP é maior
+        // que o bloco — com GOP curto, todo bloco tem keyframe.
+        if not Index[I].HasKeyframe then Continue;
+        if not Reader.SeekToBlock(I) then Break;
+        if not Reader.ReadNextBlock(Block) then Continue;  // bloco ruim: pula
+        if not ThinBlock(Block, Reader.Header.Video.Timescale, Req.StepMs,
+                         LastKeptMs, Thin) then Continue;
+        Piece := BuildBlockBytes(Thin);
+        if Length(Piece) = 0 then Continue;
+        SetLength(BodyBytes, BodyLen + Length(Piece));
+        Move(Piece[0], BodyBytes[BodyLen], Length(Piece));
+        Inc(BodyLen, Length(Piece));
+      end;
+      // Nenhum quadro no intervalo: não é erro, é um trecho sem keyframe novo.
+      // O cliente segue pelo cursor e pede o próximo.
+      Result.Thinned := True;
+    end
+    else if not Reader.ReadRaw(Index[First].Offset,
                           (LastOffset + LastSize) - Index[First].Offset,
                           BodyBytes) then
       Exit(Fail(500, 'falha ao ler os blocos'));
@@ -368,10 +489,12 @@ begin
     Reader.Free;
   end;
 
+  Thinned := Result.Thinned;   // o FillChar abaixo zera tudo
   FillChar(Result, SizeOf(Result), 0);
   Result.FileName := '';
   Result.Error := '';
   Result.Cursor := '';
+  Result.Thinned := Thinned;
   Result.Ok := True;
   Result.Status := 200;
   Result.FileName := Info.Name;

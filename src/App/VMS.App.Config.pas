@@ -61,7 +61,6 @@ type
   TAppConfig = record
     StorageDir: string;
     LogDir: string;
-    LogLevel: TLogLevel;
     TransportFallbackTimeoutMs: Cardinal;
     KeepAliveMethod: TRtspKeepAliveMethod;
     MaxBlockSamples: Integer;
@@ -343,8 +342,6 @@ var
   Arr: TJSONArray;
   I, RotateMin: Integer;
   V: TJSONValue;
-  LevelStr: string;
-  Level: TLogLevel;
   KaStr: string;
 begin
   if not TFile.Exists(FilePath) then
@@ -362,11 +359,8 @@ begin
     FConfig.StorageDir := GetJsonStr(Obj, 'storageDir', '');
     FConfig.LogDir := GetJsonStr(Obj, 'logDir', '');
 
-    LevelStr := GetJsonStr(Obj, 'logLevel', 'info');
-    if ParseLogLevel(LevelStr, Level) then
-      FConfig.LogLevel := Level
-    else
-      FConfig.LogLevel := llInfo;
+    // `logLevel` não existe mais: o log não tem filtro. Chave antiga no json é
+    // simplesmente ignorada, como qualquer outra desconhecida.
 
     FConfig.TransportFallbackTimeoutMs := Cardinal(GetJsonInt(Obj, 'transportFallbackTimeoutMs', 5000));
 

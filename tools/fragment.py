@@ -13,6 +13,7 @@ import struct
 import sys
 
 import apimodel
+import genvms
 import vmslib
 
 ASSUMED_BLOCK_MS = 2000
@@ -39,6 +40,7 @@ def scan(folder, camera):
         if not entries:
             continue
         out.append(dict(name=os.path.basename(path), data=data, header=header,
+                        blocks=list(vmslib.iter_blocks(data, header)),
                         index=entries, closed=footer is not None,
                         start=entries[0].start_unix_ms,
                         end=entries[-1].start_unix_ms + ASSUMED_BLOCK_MS))
@@ -59,7 +61,39 @@ def index_at_time(entries, ms):
     return best
 
 
-def fetch(files, from_ms=None, cursor=None, blocks=4):
+def _wall_of(block, sample, timescale):
+    """O instante de parede de um sample, exatamente como o cliente calcula:
+    âncora do bloco + distância em PTS até o primeiro sample de vídeo dele."""
+    anchor = block.video_anchor_ms or block.start_unix_ms
+    first = next(s.pts for s in block.samples if s.is_video)
+    return anchor + (sample.pts - first) * 1000 // timescale
+
+
+def thin_block(block, timescale, step_ms, last_ms):
+    """Reescreve um bloco com só os quadros que serão exibidos, como o
+    ThinBlock do Vms.Server.Media. Devolve (samples, payload, anchor, last_ms)
+    ou None quando nada foi selecionado.
+
+    A âncora do bloco novo é o instante do PRIMEIRO quadro escolhido: é isso que
+    faz a conta do cliente continuar dando o horário certo depois de o começo do
+    bloco ter sido jogado fora."""
+    keep, first_kept = [], None
+    for smp in block.samples:
+        if not smp.is_video or not smp.keyframe:
+            continue
+        wall = _wall_of(block, smp, timescale)
+        if last_ms is not None and wall - last_ms < step_ms:
+            continue
+        if first_kept is None:
+            first_kept = wall
+        keep.append(smp)
+        last_ms = wall
+    if not keep:
+        return None
+    return keep, first_kept, last_ms
+
+
+def fetch(files, from_ms=None, cursor=None, blocks=4, step_ms=0):
     # 1. arquivo
     if cursor:
         next_ms, blk, newfile, name = cursor.split('-', 3)
@@ -97,7 +131,22 @@ def fetch(files, from_ms=None, cursor=None, blocks=4):
             break
 
     head = cur['data'][:cur['header'].size]
-    body = cur['data'][idx[first].offset: idx[last].offset + last_size]
+    if step_ms > 0:
+        # Varredura: bloco reescrito, não copiado cru.
+        ts = cur['header'].video.timescale or 90000
+        body, last_kept = b'', None
+        for blk in cur['blocks'][first:last + 1]:
+            got = thin_block(blk, ts, step_ms, last_kept)
+            if got is None:
+                continue
+            keep, anchor, last_kept = got
+            # o gerador serializa igual ao BuildBlockBytes do Delphi
+            body += genvms.build_block(
+                blk.seq, anchor,
+                [(s.track_id, s.flags, s.pts, s.data) for s in keep],
+                (anchor, 0))
+    else:
+        body = cur['data'][idx[first].offset: idx[last].offset + last_size]
 
     end_ms = (idx[last + 1].start_unix_ms if last + 1 < len(idx)
               else idx[last].start_unix_ms + ASSUMED_BLOCK_MS)

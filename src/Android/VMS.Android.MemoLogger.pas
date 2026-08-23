@@ -17,11 +17,10 @@ type
   strict private
     FLock: TCriticalSection;
     FBuffer: TStringList;
-    FMinLevel: TLogLevel;
     FMaxBuffered: Integer;
     procedure Emit(Level: TLogLevel; const Tag, Msg: string);
   public
-    constructor Create(AMinLevel: TLogLevel = llDebug);
+    constructor Create;
     destructor Destroy; override;
     function Drain: TArray<string>;
     { ILogger }
@@ -30,18 +29,15 @@ type
     procedure Info(const Tag, Msg: string);
     procedure Warn(const Tag, Msg: string);
     procedure Error(const Tag, Msg: string);
-    function MinLevel: TLogLevel;
-    procedure SetMinLevel(Level: TLogLevel);
   end;
 
 implementation
 
-constructor TMemoLogger.Create(AMinLevel: TLogLevel);
+constructor TMemoLogger.Create;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
   FBuffer := TStringList.Create;
-  FMinLevel := AMinLevel;
   FMaxBuffered := 2000;
 end;
 
@@ -56,7 +52,6 @@ procedure TMemoLogger.Emit(Level: TLogLevel; const Tag, Msg: string);
 var
   Line: string;
 begin
-  if Level < FMinLevel then Exit;
   Line := Format('%s %s: %s', [LogLevelToStr(Level), Tag, Msg]);
   FLock.Enter;
   try
@@ -85,7 +80,5 @@ procedure TMemoLogger.Info(const Tag, Msg: string);  begin Emit(llInfo,  Tag, Ms
 procedure TMemoLogger.Warn(const Tag, Msg: string);  begin Emit(llWarn,  Tag, Msg); end;
 procedure TMemoLogger.Error(const Tag, Msg: string); begin Emit(llError, Tag, Msg); end;
 
-function TMemoLogger.MinLevel: TLogLevel; begin Result := FMinLevel; end;
-procedure TMemoLogger.SetMinLevel(Level: TLogLevel); begin FMinLevel := Level; end;
 
 end.

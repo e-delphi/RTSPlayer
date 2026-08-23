@@ -1,4 +1,16 @@
-﻿unit VMS.App.Logger;
+unit VMS.App.Logger;
+
+// Destinos de log: console, arquivo e o composto que escreve nos dois.
+//
+// **Não há filtro de nível.** O que o código resolveu registrar, sai — sempre,
+// em todo destino. O nível continua no texto da linha, porque dizer se algo é
+// aviso ou erro é informação; mas ele não decide mais o que é escrito.
+//
+// A razão é prática: o defeito que interessa é sempre o que já aconteceu, na
+// máquina de quem estava usando, e um log que só grava depois de alguém ligar
+// uma opção nunca tem a linha do instante em que o problema apareceu. O custo de
+// gravar tudo é uma escrita por evento; o custo de não ter a linha é pedir para
+// o usuário reproduzir.
 
 interface
 
@@ -13,43 +25,36 @@ type
   TConsoleLogger = class(TInterfacedObject, ILogger)
   strict private
     FLock: TCriticalSection;
-    FMinLevel: TLogLevel;
   public
-    constructor Create(AMinLevel: TLogLevel = llInfo);
+    constructor Create;
     destructor Destroy; override;
     procedure Log(Level: TLogLevel; const Tag, Msg: string);
     procedure Debug(const Tag, Msg: string);
     procedure Info(const Tag, Msg: string);
     procedure Warn(const Tag, Msg: string);
     procedure Error(const Tag, Msg: string);
-    function MinLevel: TLogLevel;
-    procedure SetMinLevel(Level: TLogLevel);
   end;
 
   TFileLogger = class(TInterfacedObject, ILogger)
   strict private
     FLock: TCriticalSection;
     FStream: TFileStream;
-    FMinLevel: TLogLevel;
     FFilePath: string;
     procedure WriteLine(const S: string);
   public
-    constructor Create(const AFilePath: string; AMinLevel: TLogLevel = llInfo);
+    constructor Create(const AFilePath: string);
     destructor Destroy; override;
     procedure Log(Level: TLogLevel; const Tag, Msg: string);
     procedure Debug(const Tag, Msg: string);
     procedure Info(const Tag, Msg: string);
     procedure Warn(const Tag, Msg: string);
     procedure Error(const Tag, Msg: string);
-    function MinLevel: TLogLevel;
-    procedure SetMinLevel(Level: TLogLevel);
     property FilePath: string read FFilePath;
   end;
 
   TCompositeLogger = class(TInterfacedObject, ILogger)
   strict private
     FChildren: TList<ILogger>;
-    FMinLevel: TLogLevel;
   public
     constructor Create;
     destructor Destroy; override;
@@ -59,8 +64,6 @@ type
     procedure Info(const Tag, Msg: string);
     procedure Warn(const Tag, Msg: string);
     procedure Error(const Tag, Msg: string);
-    function MinLevel: TLogLevel;
-    procedure SetMinLevel(Level: TLogLevel);
   end;
 
 implementation
@@ -79,11 +82,10 @@ end;
 
 { TConsoleLogger }
 
-constructor TConsoleLogger.Create(AMinLevel: TLogLevel);
+constructor TConsoleLogger.Create;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
-  FMinLevel := AMinLevel;
 end;
 
 destructor TConsoleLogger.Destroy;
@@ -94,7 +96,6 @@ end;
 
 procedure TConsoleLogger.Log(Level: TLogLevel; const Tag, Msg: string);
 begin
-  if Level < FMinLevel then Exit;
   FLock.Enter;
   try
     Writeln(FormatLine(Level, Tag, Msg));
@@ -108,26 +109,15 @@ procedure TConsoleLogger.Info(const Tag, Msg: string);  begin Log(llInfo,  Tag, 
 procedure TConsoleLogger.Warn(const Tag, Msg: string);  begin Log(llWarn,  Tag, Msg); end;
 procedure TConsoleLogger.Error(const Tag, Msg: string); begin Log(llError, Tag, Msg); end;
 
-function TConsoleLogger.MinLevel: TLogLevel;
-begin
-  Result := FMinLevel;
-end;
-
-procedure TConsoleLogger.SetMinLevel(Level: TLogLevel);
-begin
-  FMinLevel := Level;
-end;
-
 { TFileLogger }
 
-constructor TFileLogger.Create(const AFilePath: string; AMinLevel: TLogLevel);
+constructor TFileLogger.Create(const AFilePath: string);
 var
   Dir: string;
   Mode: Word;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
-  FMinLevel := AMinLevel;
   FFilePath := AFilePath;
   Dir := ExtractFilePath(AFilePath);
   if (Dir <> '') and (not DirectoryExists(Dir)) then
@@ -162,7 +152,6 @@ end;
 
 procedure TFileLogger.Log(Level: TLogLevel; const Tag, Msg: string);
 begin
-  if Level < FMinLevel then Exit;
   FLock.Enter;
   try
     WriteLine(FormatLine(Level, Tag, Msg));
@@ -176,23 +165,12 @@ procedure TFileLogger.Info(const Tag, Msg: string);  begin Log(llInfo,  Tag, Msg
 procedure TFileLogger.Warn(const Tag, Msg: string);  begin Log(llWarn,  Tag, Msg); end;
 procedure TFileLogger.Error(const Tag, Msg: string); begin Log(llError, Tag, Msg); end;
 
-function TFileLogger.MinLevel: TLogLevel;
-begin
-  Result := FMinLevel;
-end;
-
-procedure TFileLogger.SetMinLevel(Level: TLogLevel);
-begin
-  FMinLevel := Level;
-end;
-
 { TCompositeLogger }
 
 constructor TCompositeLogger.Create;
 begin
   inherited Create;
   FChildren := TList<ILogger>.Create;
-  FMinLevel := llDebug;
 end;
 
 destructor TCompositeLogger.Destroy;
@@ -211,7 +189,6 @@ procedure TCompositeLogger.Log(Level: TLogLevel; const Tag, Msg: string);
 var
   I: Integer;
 begin
-  if Level < FMinLevel then Exit;
   for I := 0 to FChildren.Count - 1 do
     FChildren[I].Log(Level, Tag, Msg);
 end;
@@ -220,15 +197,5 @@ procedure TCompositeLogger.Debug(const Tag, Msg: string); begin Log(llDebug, Tag
 procedure TCompositeLogger.Info(const Tag, Msg: string);  begin Log(llInfo,  Tag, Msg); end;
 procedure TCompositeLogger.Warn(const Tag, Msg: string);  begin Log(llWarn,  Tag, Msg); end;
 procedure TCompositeLogger.Error(const Tag, Msg: string); begin Log(llError, Tag, Msg); end;
-
-function TCompositeLogger.MinLevel: TLogLevel;
-begin
-  Result := FMinLevel;
-end;
-
-procedure TCompositeLogger.SetMinLevel(Level: TLogLevel);
-begin
-  FMinLevel := Level;
-end;
 
 end.

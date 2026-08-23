@@ -115,6 +115,9 @@ type
     // decodificador fica sem por onde começar. Não depende do índice, então
     // funciona com o arquivo ainda sendo gravado.
     function SeekToLastKeyframe: Boolean;
+    // O instante de parede do último keyframe do arquivo — a idade da imagem
+    // que o SeekToLastKeyframe vai entregar. 0 = não há keyframe nenhum.
+    function LastKeyframeMs: Int64;
     function CurrentBlockOffset: Int64;
     property Header: TVmsHeader read FHeader;
     property Index: TVmsIndex read FIndex;
@@ -475,6 +478,17 @@ end;
 function TVmsReader.IsLiveMode: Boolean;
 begin
   Result := FLiveMode;
+end;
+
+function TVmsReader.LastKeyframeMs: Int64;
+var
+  I: Integer;
+begin
+  Result := 0;
+  EnsureIndex;
+  for I := FIndexCount - 1 downto 0 do
+    if FIndex[I].HasKeyframe then
+      Exit(FIndex[I].StartUnixMs);
 end;
 
 function TVmsReader.CurrentBlockOffset: Int64;

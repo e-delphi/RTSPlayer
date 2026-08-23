@@ -45,8 +45,10 @@ uses
   UI.List,
   UI.Import,
   UI.Player,
+  UI.Thumbs,
   UI.Editor,
   UI.Days,
+  UI.Events,
   UI.Timeline;
 
 type
@@ -64,8 +66,9 @@ type
     FFrameList: TFrameList;
     FFramePlayer: TFramePlayer;
     FFrameEditor: TFrameEditor;
-    // Estas duas não são TFrame: montadas em código, sem .fmx (ver as units).
+    // Estas três não são TFrame: montadas em código, sem .fmx (ver as units).
     FFrameDays: TFrameDays;
+    FFrameEvents: TFrameEvents;
     FFrameImport: TFrameImport;
     FTimeline: TFrameTimeline;
     FActive: TControl;
@@ -77,10 +80,25 @@ type
     // mídia até o renderer (o mesmo do ao vivo)
     FApi: TVmsApiClient;
     FPlayback: TPlaybackEngine;
+    // Miniaturas da barra do tempo. A barra recebe a interface e não sabe que
+    // existe HTTP por trás (ver UI.Thumbs).
+    FThumbs: IThumbProvider;
     FPlaybackOn: Boolean;
     FPlaybackCam: string;   // nome da câmera COMO O SERVIDOR a conhece
     FPlaybackBase: string;  // http://host:porta do caminho que respondeu
     FPlaybackDay: string;   // 'YYYY-MM-DD' do dia aberto
+    // Limites do dia aberto, no fuso do SERVIDOR. Guardados porque a tela de
+    // eventos volta para a gravação e precisa refazer a régua com a mesma
+    // janela — recalculá-la aqui daria outro dia com o app em outro fuso.
+    FEventsFromMs: Int64;
+    FEventsToMs: Int64;
+    // Token PRÓPRIO da consulta de eventos. Ela e a das faixas saem juntas do
+    // mesmo clique: com um contador só, o Inc da segunda faria a resposta da
+    // primeira ser descartada na volta, e a barra ficaria sem as faixas do dia.
+    FEventsToken: Integer;
+    // Onde a reprodução estava ao abrir a lista de eventos, para voltar no
+    // mesmo ponto em vez de no fim do dia.
+    FEventsResumeMs: Int64;
     // Cada consulta assíncrona leva um número; resposta de consulta velha (o
     // usuário já trocou de câmera ou de dia) é descartada na volta.
     FLoadToken: Integer;
@@ -102,8 +120,20 @@ type
     procedure ShowPlayer;
     procedure ShowEditor(Index: Integer);
     procedure ShowDays(Index: Integer);
+    procedure ShowEvents;
     procedure LoadDaysAsync(Index: Integer);
     procedure LoadSegmentsAsync(const Camera, Day: string);
+    // Os eventos do dia aberto. Alimentam DUAS telas com uma requisição só: a
+    // faixa de marcas na barra e a lista da tela de eventos.
+    procedure LoadEventsAsync(const Camera: string; FromMs, ToMs: Int64);
+    procedure ResumeAt(UnixMs: Int64);
+    procedure EventsBack(Sender: TObject);
+    procedure EventsPick(Sender: TObject; UnixMs: Int64);
+    procedure TimelineEvents(Sender: TObject);
+    // Uma miniatura nova chegou. O provedor é compartilhado e só aceita um
+    // assinante, então quem o assina é este formulário e repassa para quem está
+    // na tela — ver TFrameTimeline.ThumbsArrived.
+    procedure ThumbsArrived;
     procedure DaysBack(Sender: TObject);
     procedure DaysPickDay(Sender: TObject; const Day: string; StartMs, EndMs: Int64);
     procedure TimelineSeek(Sender: TObject; UnixMs: Int64);
@@ -151,6 +181,11 @@ implementation
 
 {$R *.fmx}
 
+const
+  // Quanto o histórico recua ao abrir um dia. No dia de hoje isso é "10 minutos
+  // atrás"; num dia passado, os últimos 10 minutos gravados dele.
+  OPEN_BACK_MS = Int64(10 * 60 * 1000);
+
 { TForm1 }
 
 procedure TForm1.FormCreate(Sender: TObject);
@@ -169,7 +204,7 @@ begin
 
   FClock := BuildClock;
   DefaultAppCfg;
-  FMemoLog := TMemoLogger.Create(llDebug);
+  FMemoLog := TMemoLogger.Create;
   FLogger := FMemoLog;
   FRenderer := TMediaRenderer.Create(FLogger);
   LoadCameras;
@@ -210,6 +245,13 @@ begin
   FFrameDays.OnBack := DaysBack;
   FFrameDays.OnPickDay := DaysPickDay;
 
+  FFrameEvents := TFrameEvents.Create(Self);
+  FFrameEvents.Parent := Self;
+  FFrameEvents.Align := TAlignLayout.Contents;
+  FFrameEvents.Visible := False;
+  FFrameEvents.OnBack := EventsBack;
+  FFrameEvents.OnPickEvent := EventsPick;
+
   FFrameImport := TFrameImport.Create(Self);
   FFrameImport.Parent := Self;
   FFrameImport.Align := TAlignLayout.Contents;
@@ -226,6 +268,7 @@ begin
   FTimeline.OnTogglePlay := TimelineTogglePlay;
   FTimeline.OnSpeedChange := TimelineSpeed;
   FTimeline.OnLive := TimelineLive;
+  FTimeline.OnEvents := TimelineEvents;
 
   FFrameEditor := TFrameEditor.Create(Self);
   FFrameEditor.Parent := Self;
@@ -281,7 +324,6 @@ procedure TForm1.DefaultAppCfg;
 begin
   FAppCfg.StorageDir := '';
   FAppCfg.LogDir := '';
-  FAppCfg.LogLevel := llInfo;
   FAppCfg.TransportFallbackTimeoutMs := 5000;
   FAppCfg.KeepAliveMethod := kamGetParameter;
   FAppCfg.MaxBlockSamples := 256;
@@ -352,6 +394,8 @@ begin
   FFrameEditor.Visible := F = FFrameEditor;
   if FFrameDays <> nil then
     FFrameDays.Visible := F = FFrameDays;
+  if FFrameEvents <> nil then
+    FFrameEvents.Visible := F = FFrameEvents;
   if FFrameImport <> nil then
     FFrameImport.Visible := F = FFrameImport;
   FActive := F;
@@ -414,6 +458,18 @@ begin
   SetKeepScreenOn(FPlaying);
   FFramePlayer.SetPlaying(FPlaying);
   FFramePlayer.ShowControls;
+end;
+
+// "Câmera offline" mais a hora da imagem que está na tela. Sem a hora, o texto
+// diria que algo está errado sem dizer o que se está vendo — e é justamente a
+// idade da imagem que muda o que a pessoa faz a seguir.
+function OfflineStatusText(MediaStartMs: Int64): string;
+begin
+  if MediaStartMs <= 0 then
+    Exit('C'#$E2'mera offline; gravac'#$E3'o');
+  Result := 'C'#$E2'mera offline; imagem de ' +
+    FormatDateTime('dd/mm hh:nn',
+      TTimeZone.Local.ToLocalTime(UnixToDateTime(MediaStartMs div 1000, True)));
 end;
 
 // Botão do relógio na barra do player: abre a tela de dias com gravação. Em
@@ -603,14 +659,139 @@ begin
 end;
 
 procedure TForm1.DaysPickDay(Sender: TObject; const Day: string; StartMs, EndMs: Int64);
+var
+  Target: Int64;
 begin
   FPlaybackDay := Day;
   ShowPlayer;
-  // Começa no primeiro instante gravado do dia; a barra chega logo depois, e o
-  // usuário arrasta dali.
-  StartPlayback(FCurrentIndex, StartMs);
+  // Começa perto do FIM do que foi gravado no dia, não no começo. Abrindo o dia
+  // de hoje isso é "10 minutos atrás", que é o que quase sempre se quer ver;
+  // num dia passado, são os últimos 10 minutos daquele dia. Começar às 0h fazia
+  // o usuário arrastar a barra o dia inteiro antes de chegar em qualquer coisa.
+  Target := EndMs - OPEN_BACK_MS;
+  if Target < StartMs then Target := StartMs;
+  if Target > EndMs then Target := EndMs;
+  StartPlayback(FCurrentIndex, Target);
+  // A barra precisa saber a posição ANTES do SetDay: é ela que decide onde a
+  // janela vai ficar centrada.
+  FTimeline.SetPosition(Target);
   FTimeline.SetDay(StartMs, EndMs, nil); // régua provisória até as faixas virem
+  // Dia novo: o que estava desenhado é de outro dia, e some agora — senão as
+  // marcas antigas ficariam na barra até a resposta chegar.
+  FTimeline.SetEvents(nil);
+  FTimeline.SetHasEvents(False);
   LoadSegmentsAsync(FPlaybackCam, Day);
+  LoadEventsAsync(FPlaybackCam, StartMs, EndMs);
+end;
+
+// Uma requisição, duas telas. A lista do dia inteiro cabe folgada na memória
+// (são registros pequenos), e é o que permite trocar a aba do filtro sem
+// voltar ao servidor.
+procedure TForm1.LoadEventsAsync(const Camera: string; FromMs, ToMs: Int64);
+var
+  Token: Integer;
+  Api: TVmsApiClient;
+begin
+  Api := FApi;
+  if Api = nil then Exit;
+  Inc(FEventsToken);
+  Token := FEventsToken;
+  FEventsFromMs := FromMs;
+  FEventsToMs := ToMs;
+  FFrameEvents.SetLoading;
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Evs: TArray<TApiEvent>;
+      Ok: Boolean;
+      Status: Integer;
+      Err: string;
+    begin
+      Ok := Api.GetEvents(Camera, FromMs, ToMs, '', Evs);
+      Status := Api.LastStatus;
+      Err := Api.LastError;
+      TThread.Queue(nil,
+        procedure
+        begin
+          if FClosing or (Token <> FEventsToken) then Exit;
+          // Sucesso, ainda que com zero eventos, é o que diz que o servidor TEM
+          // análise. 503 é o servidor dizendo que não tem, e aí o botão nem
+          // aparece: uma tela que só poderia mostrar "nada aqui" é pior que
+          // botão nenhum.
+          FTimeline.SetHasEvents(Ok);
+          if Ok then
+          begin
+            FTimeline.SetEvents(Evs);
+            FFrameEvents.SetEvents(Evs);
+          end
+          else if Status = 503 then
+            FFrameEvents.SetError('Este servidor n'#$E3'o tem an'#$E1'lise de imagem.')
+          else
+            FFrameEvents.SetError('N'#$E3'o consegui carregar os eventos.' +
+              sLineBreak + Err);
+        end);
+    end).Start;
+end;
+
+procedure TForm1.ShowEvents;
+begin
+  FFrameEvents.SetTitle(Format('Eventos - %s',
+    [FormatDayLabel(FPlaybackDay)]));
+  ShowFrame(FFrameEvents);
+end;
+
+procedure TForm1.TimelineEvents(Sender: TObject);
+begin
+  // Onde se estava, para o voltar não jogar o usuário para o fim do dia. É
+  // preciso ler ANTES do ShowFrame: sair da tela do player para a lista encerra
+  // a engine (ver ShowFrame), e depois disso a posição já não existe.
+  FEventsResumeMs := 0;
+  if (FPlayback <> nil) and FPlaybackOn then
+    FEventsResumeMs := FPlayback.PositionMs;
+  ShowEvents;
+end;
+
+// Retoma a gravação do dia num instante. É o caminho de saída da lista de
+// eventos, tanto pelo voltar (onde se estava) quanto por um item (onde o evento
+// começou).
+procedure TForm1.ResumeAt(UnixMs: Int64);
+begin
+  if FEventsToMs <= FEventsFromMs then Exit;
+  if UnixMs < FEventsFromMs then UnixMs := FEventsFromMs;
+  if UnixMs > FEventsToMs then UnixMs := FEventsToMs;
+  ShowPlayer;
+  StartPlayback(FCurrentIndex, UnixMs);
+  // A barra precisa da posição ANTES do SetDay: é ela que decide onde a janela
+  // fica centrada (mesma ordem do DaysPickDay).
+  FTimeline.SetPosition(UnixMs);
+  FTimeline.SetDay(FEventsFromMs, FEventsToMs, nil);
+  LoadSegmentsAsync(FPlaybackCam, FPlaybackDay);
+  LoadEventsAsync(FPlaybackCam, FEventsFromMs, FEventsToMs);
+end;
+
+procedure TForm1.EventsBack(Sender: TObject);
+var
+  Alvo: Int64;
+begin
+  Alvo := FEventsResumeMs;
+  // Sem posição guardada (a lista foi aberta sem reprodução em curso): cai na
+  // mesma regra do histórico, perto do fim do dia.
+  if Alvo <= 0 then Alvo := FEventsToMs - OPEN_BACK_MS;
+  ResumeAt(Alvo);
+end;
+
+procedure TForm1.EventsPick(Sender: TObject; UnixMs: Int64);
+begin
+  ResumeAt(UnixMs);
+end;
+
+procedure TForm1.ThumbsArrived;
+begin
+  if FClosing then Exit;
+  if (FActive = FFrameEvents) and (FFrameEvents <> nil) then
+    FFrameEvents.ThumbsArrived
+  else if (FActive = FFramePlayer) and (FTimeline <> nil) then
+    FTimeline.ThumbsArrived;
 end;
 
 procedure TForm1.TimelineSeek(Sender: TObject; UnixMs: Int64);
@@ -698,6 +879,16 @@ begin
     FApi.BaseUrl := Base;
   if FPlayback = nil then
     FPlayback := TPlaybackEngine.Create(FRenderer, FApi, FLogger, FClock);
+  // O provedor de miniaturas nasce aqui, e não no FormCreate, porque depende do
+  // cliente de API — que só existe quando se sabe qual servidor respondeu. Como
+  // o cliente é reusado (só troca a base da URL), um provedor basta.
+  if FThumbs = nil then
+  begin
+    FThumbs := TApiThumbProvider.Create(FApi, FLogger);
+    FTimeline.SetThumbProvider(FThumbs);
+    FFrameEvents.SetThumbProvider(FThumbs);
+    FThumbs.SetOnArrived(ThumbsArrived);
+  end;
 
   FLogger.Info('ui', Format('playback "%s" (camera "%s" no servidor %s) a partir de %d',
     [FCameras[Index].Name, ServerCam, Base, FromMs]));
@@ -711,6 +902,9 @@ begin
   // cair para 1x; aqui é o único ponto que significa "outra gravação".
   FTimeline.SetSpeedLabel(1);
   FPlayback.SetSpeed(1);
+  // As miniaturas são da câmera que se vai assistir: trocar aqui descarta as da
+  // anterior, que não dizem nada sobre esta.
+  if FThumbs <> nil then FThumbs.SetCamera(ServerCam);
   FFramePlayer.SetPlaying(True);
   FFramePlayer.SetSpinner(True);
   FFramePlayer.SetStatus(STAT_YELLOW, 'Carregando');
@@ -844,7 +1038,16 @@ begin
     svConnecting:
       begin FFramePlayer.SetStatus(STAT_YELLOW, 'Conectando'); FFramePlayer.SetSpinner(True); end;
     svStreaming:
-      begin FFramePlayer.SetStatus(STAT_GREEN, 'Ao vivo'); FFramePlayer.SetSpinner(False); end;
+      begin
+        // Chegando mídia, mas do ARQUIVO: a câmera está fora do ar e o servidor
+        // está servindo a última gravação dela. Verde aqui era a pílula dizendo
+        // "ao vivo" sobre uma imagem de horas atrás.
+        if not FSupervisor.Metrics.SourceIsLive then
+          FFramePlayer.SetStatus(COLOR_DANGER, OfflineStatusText(FSupervisor.Metrics.MediaStartMs))
+        else
+          FFramePlayer.SetStatus(STAT_GREEN, 'Ao vivo');
+        FFramePlayer.SetSpinner(False);
+      end;
     svDraining, svBackoff:
       begin FFramePlayer.SetStatus(STAT_ORANGE, 'Reconectando'); FFramePlayer.SetSpinner(True); end;
     svStopping:

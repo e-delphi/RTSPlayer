@@ -35,6 +35,11 @@ uses
   VMS.Net.Tailscale;
 
 type
+  // Avisa de onde a mídia está vindo, assim que o SDP responde. Existe porque
+  // quem sabe disso é a sessão, e quem precisa mostrar é a tela — sem um canal,
+  // o app exibiria gravação antiga com a pílula verde de "ao vivo".
+  TSourceKnownEvent = procedure(IsLive: Boolean; MediaStartMs: Int64) of object;
+
   TCameraSessionConfig = record
     Name: string;
     Url: string;
@@ -97,6 +102,7 @@ type
     // O header do arquivo em gravação, guardado para a rotação poder reabrir
     // outro igual sem voltar ao SDP.
     FRecHeader: TVmsHeader;
+    FOnSourceKnown: TSourceKnownEvent;
     FFileStartedMs: Int64;   // monotônico, de quando o arquivo corrente abriu
     FMediaSink: IMediaSink;
     FFormatNotified: Boolean;  // o sink já soube do formato desta sessão
@@ -122,6 +128,7 @@ type
     function ValidateFirstRtp(TimeoutMs: Cardinal): Boolean;
     procedure CleanupTransportAttempt;
     procedure SetupDepacketizers;
+    procedure NoteSdpSource;
     procedure WriteHeaderFromSdp;
     function RotateDue(const Block: TVmsBlock): Boolean;
     procedure RotateWriter;
@@ -145,6 +152,7 @@ type
     destructor Destroy; override;
     procedure Run;
     function CurrentOutputPath: string;
+    property OnSourceKnown: TSourceKnownEvent read FOnSourceKnown write FOnSourceKnown;
     // True se a conexão chegou a receber RTP (stream funcionou de fato).
     function StreamedOk: Boolean;
     // Handshake de teste (OPTIONS+DESCRIBE+SETUP, sem PLAY). Não renderiza.
@@ -277,6 +285,7 @@ begin
     end;
 
     FSdp := ParseSdp(Sdp);
+    NoteSdpSource;
     FVideoTrack := FSdp.FindFirst(smkVideo);
     FAudioTrack := FSdp.FindFirst(smkAudio);
     if (FVideoTrack = nil) and (FAudioTrack = nil) then
@@ -589,6 +598,7 @@ begin
   end;
 
   FSdp := ParseSdp(Sdp);
+  NoteSdpSource;
   FVideoTrack := FSdp.FindFirst(smkVideo);
   FAudioTrack := FSdp.FindFirst(smkAudio);
 
@@ -792,6 +802,17 @@ begin
         FDemux.RegisterRoute(tkAudio, Byte(FAudioTrack.PayloadType), -1, HandleAudioRtp);
     end;
   end;
+end;
+
+// Chamada logo depois de o SDP ser lido, nos dois caminhos de handshake.
+procedure TCameraSession.NoteSdpSource;
+begin
+  if FSdp = nil then Exit;
+  if not FSdp.SourceIsLive then
+    FLogger.Warn('session.' + FConfig.Name,
+      'o servidor esta entregando GRAVACAO, nao a camera ao vivo');
+  if Assigned(FOnSourceKnown) then
+    FOnSourceKnown(FSdp.SourceIsLive, FSdp.MediaStartMs);
 end;
 
 procedure TCameraSession.WriteHeaderFromSdp;

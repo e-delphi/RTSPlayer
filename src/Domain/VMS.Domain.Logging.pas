@@ -5,8 +5,9 @@ interface
 type
   TLogLevel = (llDebug, llInfo, llWarn, llError);
 
-  // Só escrita. Filtrar por nível é decisão de cada implementação (e nem toda
-  // tem: o log do servidor grava tudo), então não faz parte do contrato.
+  // Só escrita, e sem filtro em lugar nenhum: nenhuma implementação decide o
+  // que sai. O nível entra na linha para quem LÊ saber o peso do evento, não
+  // para o programa escolher se registra — ver VMS.App.Logger.
   ILogger = interface
     ['{B8B0F8C0-7C0A-4F1E-9F1A-3A6C7F5C2E10}']
     procedure Log(Level: TLogLevel; const Tag, Msg: string);
@@ -17,12 +18,8 @@ type
   end;
 
 function LogLevelToStr(Level: TLogLevel): string;
-function ParseLogLevel(const S: string; out Level: TLogLevel): Boolean;
 
 implementation
-
-uses
-  System.SysUtils;
 
 function LogLevelToStr(Level: TLogLevel): string;
 begin
@@ -34,18 +31,6 @@ begin
   else
     Result := '?    ';
   end;
-end;
-
-function ParseLogLevel(const S: string; out Level: TLogLevel): Boolean;
-var
-  L: string;
-begin
-  L := LowerCase(Trim(S));
-  if (L = 'debug') then begin Level := llDebug; Exit(True); end;
-  if (L = 'info')  then begin Level := llInfo;  Exit(True); end;
-  if (L = 'warn') or (L = 'warning') then begin Level := llWarn; Exit(True); end;
-  if (L = 'error') then begin Level := llError; Exit(True); end;
-  Result := False;
 end;
 
 end.

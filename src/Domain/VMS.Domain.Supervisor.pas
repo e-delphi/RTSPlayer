@@ -22,6 +22,10 @@ type
     LastDisconnectedAtMs: Int64;
     TotalReconnects: Cardinal;
     CurrentFile: string;
+    // O que o servidor respondeu no SDP. SourceIsLive False = a câmera está
+    // fora do ar e o que chega é gravação; MediaStartMs diz de quando.
+    SourceIsLive: Boolean;
+    MediaStartMs: Int64;
   end;
 
   TCameraSupervisor = class(TThread)
@@ -37,6 +41,9 @@ type
     FMetrics: TSupervisorMetrics;
     FCurrentSession: TCameraSession;
     procedure SetState(NewState: TSupervisorState);
+    // Roda na thread do supervisor: é ela que chama Session.Run, e é de lá que a
+    // sessão avisa. Por isso escrever em FMetrics aqui não corre com ninguém.
+    procedure SourceKnown(IsLive: Boolean; MediaStartMs: Int64);
     procedure SleepResponsive(Ms: Cardinal);
     // Config desta tentativa: igual à da câmera, com o endpoint que respondeu.
     function ConfigForAttempt: TCameraSessionConfig;
@@ -125,6 +132,8 @@ begin
   FState := svIdle;
   FillChar(FMetrics, SizeOf(FMetrics), 0);
   FMetrics.State := svIdle;
+  // Até o SDP dizer o contrário, o que se espera é a câmera ao vivo.
+  FMetrics.SourceIsLive := True;
 end;
 
 destructor TCameraSupervisor.Destroy;
@@ -153,6 +162,12 @@ end;
 function TCameraSupervisor.State: TSupervisorState;
 begin
   Result := FState;
+end;
+
+procedure TCameraSupervisor.SourceKnown(IsLive: Boolean; MediaStartMs: Int64);
+begin
+  FMetrics.SourceIsLive := IsLive;
+  FMetrics.MediaStartMs := MediaStartMs;
 end;
 
 function TCameraSupervisor.Metrics: TSupervisorMetrics;
@@ -198,6 +213,12 @@ begin
         else
         begin
           Session := TCameraSession.Create(Attempt, FLogger, FClock, FDepkFactory, FStopEvent, FMediaSink);
+          Session.OnSourceKnown := SourceKnown;
+          // Tentativa nova: até o SDP responder, volta a valer a expectativa de
+          // ao vivo. Sem isto, uma reconexão bem-sucedida herdaria o "é
+          // gravação" da tentativa anterior.
+          FMetrics.SourceIsLive := True;
+          FMetrics.MediaStartMs := 0;
           FCurrentSession := Session;
           SetState(svStreaming);
           Session.Run;

@@ -114,7 +114,13 @@ begin
   else
   begin
     if SameText(Key, 'control') then
-      Session.SessionControl := Rest;
+      Session.SessionControl := Rest
+    // Extensões do vmsserver: dizem se o que vem é a câmera ou o arquivo dela.
+    // Câmera comum não manda nada disto, e o padrão de TSdpSession cobre isso.
+    else if SameText(Key, 'x-vms-source') then
+      Session.SourceIsLive := not SameText(Trim(Rest), 'file')
+    else if SameText(Key, 'x-vms-media-start') then
+      Session.MediaStartMs := StrToInt64Def(Trim(Rest), 0);
   end;
 end;
 

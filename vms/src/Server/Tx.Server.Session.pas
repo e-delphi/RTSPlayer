@@ -21,6 +21,7 @@ uses
   System.StrUtils,
   System.Classes,
   System.SyncObjs,
+  System.DateUtils,
   System.IOUtils,
   IdContext,
   IdGlobal,
@@ -88,6 +89,7 @@ type
     FTxIdb: TIdBytes;
     FUdpIdb: TIdBytes;
     FVmsFile: string;
+    FMediaStartMs: Int64;   // instante da 1a imagem, quando a fonte é arquivo
     FReader: TVmsReader;
     // Formatos que o SDP desta sessão descreve. Vêm do header do arquivo ou dos
     // formatos correntes do hub; o SETUP responde a partir daqui, para não
@@ -596,8 +598,13 @@ begin
     end;
     FHeader := FReader.Header;
     SdpName := ExtractFileName(VmsPath);
+    // Que horas é a imagem que vai sair daqui. O modo ao vivo entra pelo último
+    // keyframe, então é ele que datará a primeira imagem na tela do cliente.
+    FMediaStartMs := FReader.LastKeyframeMs;
     if FLiveMode then
-      Log(llInfo, 'ao vivo pelo arquivo (camera sem publicacao na memoria)');
+      Log(llInfo, Format('ao vivo pelo arquivo (camera sem publicacao na ' +
+        'memoria); imagem de %s', [FormatDateTime('dd/mm hh:nn:ss',
+        TTimeZone.Local.ToLocalTime(UnixToDateTime(FMediaStartMs div 1000, True)))]));
   end
   else
   begin
@@ -608,7 +615,10 @@ begin
   // Antes de montar o SDP: o extradata que veio do header pode não descrever o
   // que a câmera realmente transmite. Ver PreferInbandParameterSets.
   PreferInbandParameterSets;
-  Sdp := BuildSdpForHeader(FHeader, SdpName);
+  // O cliente precisa saber se está vendo a câmera ou o arquivo dela. Pedido de
+  // /live/ atendido pelo arquivo é o caso que mentia: FLive nil em modo ao vivo
+  // significa câmera fora do ar.
+  Sdp := BuildSdpForHeader(FHeader, SdpName, FLive <> nil, FMediaStartMs);
   Body := TEncoding.UTF8.GetBytes(Sdp);
   Resp := TRtspResponse.Create;
   try

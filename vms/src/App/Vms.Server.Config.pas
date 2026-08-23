@@ -1,4 +1,4 @@
-unit Vms.Server.Config;
+﻿unit Vms.Server.Config;
 
 // Config do servidor = a config padrão do VMS (storageDir, block, cameras,
 // logs — lida pelo TAppConfigLoader compartilhado com o RTSPlayer) MAIS os
@@ -11,6 +11,8 @@ unit Vms.Server.Config;
 //                  reler o .vms que está sendo gravado (ver Vms.Server.LiveHub).
 //   "api":         rotas HTTP das gravações, na MESMA porta do RTSP (ver
 //                  Vms.Server.Api).
+//   "analytics":   detecção de movimento e de objetos sobre a gravação, e os
+//                  eventos que ela produz (ver Vms.Analytics.*).
 //
 // A leitura da parte comum não é reimplementada aqui: só o gancho LoadExtra é
 // sobrescrito, e ele recebe a raiz do mesmo JSON que a base já carregou.
@@ -19,11 +21,14 @@ interface
 
 uses
   System.SysUtils,
+  System.IOUtils,
   System.JSON,
+  System.Generics.Collections,
   VMS.App.Config,
   Vms.Server.Retention,
   Vms.Server.LiveHub,
-  Vms.Server.Api;
+  Vms.Server.Api,
+  Vms.Analytics.Types;
 
 type
   TVmsServerConfig = class(TAppConfigLoader)
@@ -33,6 +38,7 @@ type
     FRetention: TRetentionPolicy;
     FLive: TLiveConfig;
     FApi: TApiConfig;
+    FAnalytics: TAnalyticsConfig;
   protected
     procedure LoadExtra(Root: TJSONObject); override;
   public
@@ -41,9 +47,34 @@ type
     property Retention: TRetentionPolicy read FRetention;
     property Live: TLiveConfig read FLive;
     property Api: TApiConfig read FApi;
+    property Analytics: TAnalyticsConfig read FAnalytics;
   end;
 
 implementation
+
+// A lista de rótulos que interessam ("classes": ["person","car"]). Ausente ou
+// vazia = todos os que o modelo conhecer, que é o padrão sensato: quem não
+// escreveu nada não quer filtrar nada.
+function LerClasses(Obj: TJSONObject): TArray<string>;
+var
+  Arr: TJSONArray;
+  V: TJSONValue;
+  I, N: Integer;
+begin
+  Result := nil;
+  V := Obj.GetValue('classes');
+  if not (V is TJSONArray) then Exit;
+  Arr := TJSONArray(V);
+  SetLength(Result, Arr.Count);
+  N := 0;
+  for I := 0 to Arr.Count - 1 do
+    if Trim(Arr.Items[I].Value) <> '' then
+    begin
+      Result[N] := LowerCase(Trim(Arr.Items[I].Value));
+      Inc(N);
+    end;
+  SetLength(Result, N);
+end;
 
 procedure TVmsServerConfig.LoadExtra(Root: TJSONObject);
 var
@@ -102,6 +133,40 @@ begin
     FApi.Enabled := GetJsonBool(Obj, 'enabled', True);
     FApi.MaxBlocksPerRequest := GetJsonInt(Obj, 'maxBlocksPerRequest', API_DEFAULT_MAX_BLOCKS);
     if FApi.MaxBlocksPerRequest < 1 then FApi.MaxBlocksPerRequest := 1;
+  end;
+
+  // A análise vem DESLIGADA por omissão, ao contrário do ao vivo e da API. Ela é
+  // a única coisa aqui que consome CPU continuamente numa máquina que também
+  // está gravando: quem a quer, escreve o bloco e assume o custo.
+  //
+  // Sem "modelPath", ela liga só com detecção de movimento — que é aritmética e
+  // custa quase nada. É um regime útil por si só, e é o que roda quando o
+  // onnxruntime.dll ou o .onnx não estão no disco.
+  FAnalytics := TAnalyticsConfig.Default;
+  V := Root.GetValue('analytics');
+  if V is TJSONObject then
+  begin
+    Obj := TJSONObject(V);
+    FAnalytics.Enabled := GetJsonBool(Obj, 'enabled', True);
+    FAnalytics.StepMs := GetJsonInt(Obj, 'stepMs', 2000);
+    FAnalytics.MotionThreshold := GetJsonDouble(Obj, 'motionThreshold', 0.012);
+    FAnalytics.SceneChangeThreshold := GetJsonDouble(Obj, 'sceneChangeThreshold', 0.55);
+    FAnalytics.ObjectMinIntervalMs := GetJsonInt(Obj, 'objectIntervalMs', 5000);
+    FAnalytics.ObjectThreshold := GetJsonDouble(Obj, 'objectThreshold', 0.35);
+    FAnalytics.MergeGapMs := GetJsonInt(Obj, 'mergeGapMs', 8000);
+    FAnalytics.BackfillMs := Int64(GetJsonInt(Obj, 'backfillHours', 6)) * 3600 * 1000;
+    FAnalytics.LagMs := GetJsonInt(Obj, 'lagMs', 30000);
+    FAnalytics.ModelPath := Trim(GetJsonStr(Obj, 'modelPath', ''));
+    FAnalytics.OnnxDllPath := Trim(GetJsonStr(Obj, 'onnxDll', 'onnxruntime.dll'));
+    FAnalytics.Classes := LerClasses(Obj);
+    // Caminho relativo é relativo ao EXECUTÁVEL, não ao diretório de trabalho:
+    // o servidor costuma subir como serviço, e aí o cwd é C:\Windows\System32.
+    if (FAnalytics.ModelPath <> '') and (not TPath.IsPathRooted(FAnalytics.ModelPath)) then
+      FAnalytics.ModelPath := ExtractFilePath(ParamStr(0)) + FAnalytics.ModelPath;
+    // Passo abaixo de meio segundo não melhora a detecção (a gravação nem tem
+    // keyframe tão denso) e multiplica o custo por nada.
+    if FAnalytics.StepMs < 500 then FAnalytics.StepMs := 500;
+    if FAnalytics.LagMs < 5000 then FAnalytics.LagMs := 5000;
   end;
 end;
 

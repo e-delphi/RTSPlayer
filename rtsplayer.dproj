@@ -5,11 +5,10 @@
         <FrameworkType>FMX</FrameworkType>
         <Base>True</Base>
         <Config Condition="'$(Config)'==''">Release</Config>
-        <Platform Condition="'$(Platform)'==''">Win64</Platform>
+        <Platform Condition="'$(Platform)'==''">Android64</Platform>
         <TargetedPlatforms>32786</TargetedPlatforms>
         <AppType>Application</AppType>
         <MainSource>rtsplayer.dpr</MainSource>
-        <ProjectName Condition="'$(ProjectName)'==''">rtsplayer</ProjectName>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
         <Base>true</Base>
@@ -303,10 +302,10 @@
             <FormType>fmx</FormType>
         </DCCReference>
         <DCCReference Include="src\Android\VMS.Android.JNIUtil.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.VideoDecoder.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.AudioDecoder.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.MediaRenderer.pas"/>
         <DCCReference Include="src\Win\FFmpegLib.pas"/>
-        <DCCReference Include="src\Win\VMS.Win.VideoDecoder.pas"/>
-        <DCCReference Include="src\Win\VMS.Win.AudioDecoder.pas"/>
-        <DCCReference Include="src\Win\VMS.Win.MediaRenderer.pas"/>
         <DCCReference Include="src\Media\VMS.Media.Renderer.pas"/>
         <DCCReference Include="src\Android\VMS.Android.MemoLogger.pas"/>
         <DCCReference Include="src\Dvrip\VMS.Dvrip.Protocol.pas"/>
@@ -370,6 +369,7 @@
             <FormType>fmx</FormType>
             <DesignClass>TFrame</DesignClass>
         </DCCReference>
+        <DCCReference Include="src\UI\UI.Thumbs.pas"/>
         <DCCReference Include="src\UI\UI.Editor.pas">
             <Form>FrameEditor</Form>
             <FormType>fmx</FormType>
@@ -379,6 +379,7 @@
         <DCCReference Include="src\UI\UI.Import.pas"/>
         <DCCReference Include="src\UI\UI.Days.pas"/>
         <DCCReference Include="src\UI\UI.Timeline.pas"/>
+        <DCCReference Include="src\UI\UI.Events.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

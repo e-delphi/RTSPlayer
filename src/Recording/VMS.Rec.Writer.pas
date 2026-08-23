@@ -64,6 +64,10 @@ function BuildIndexChunk(const Index: TVmsIndex; Count: Integer): TBytes;
 function BuildFooter(TotalBlocks: Cardinal; DurationMs: Int64;
                      LastBlockOffset, IndexOffset: UInt64;
                      IndexCount: Cardinal): TBytes;
+// Os bytes de um bloco. Além do gravador, quem monta bloco é o servidor, quando
+// entrega uma varredura: ali ele reescreve o bloco com só os quadros que o
+// cliente vai exibir (ver Vms.Server.Media).
+function BuildBlockBytes(const Block: TVmsBlock): TBytes;
 
 implementation
 
@@ -304,18 +308,11 @@ begin
   FSidecar.WriteBatch(FIndex, FIndexCount, FBytes);
 end;
 
-procedure TFileRecordingWriter.WriteBlock(const Block: TVmsBlock);
+function BuildBlockBytes(const Block: TVmsBlock): TBytes;
 var
-  Buf: TBytes;
-  Offset, IndexSize, PayloadSize, TotalSize: Integer;
-  I: Integer;
-  Crc: Cardinal;
-  StartOffset: UInt64;
+  Offset, IndexSize, PayloadSize, TotalSize, I: Integer;
   HasAnchor: Boolean;
 begin
-  if not FHeaderDone then
-    raise EVmsIoError.Create('Header must be written before blocks');
-
   // A âncora A/V entra DENTRO da área de índice, depois das entradas de sample:
   // leitor que não a conhece percorre só `sampleCount` entradas e acha o payload
   // por `indexSize`, então ignora estes bytes sem sair do lugar (ver
@@ -336,40 +333,49 @@ begin
     PayloadSize +
     4;               // crc32
 
-  SetLength(Buf, TotalSize);
+  SetLength(Result, TotalSize);
   Offset := 0;
-  Move(VMS_MAGIC_BLOCK[0], Buf[Offset], 4); Inc(Offset, 4);
-  WriteU32ToBytes(Buf, Offset, Cardinal(TotalSize));
-  WriteU32ToBytes(Buf, Offset, Block.BlockSeq);
-  WriteI64ToBytes(Buf, Offset, Block.StartUnixMs);
-  WriteU32ToBytes(Buf, Offset, Cardinal(Length(Block.Samples)));
-  WriteU32ToBytes(Buf, Offset, Cardinal(IndexSize));
+  Move(VMS_MAGIC_BLOCK[0], Result[Offset], 4); Inc(Offset, 4);
+  WriteU32ToBytes(Result, Offset, Cardinal(TotalSize));
+  WriteU32ToBytes(Result, Offset, Block.BlockSeq);
+  WriteI64ToBytes(Result, Offset, Block.StartUnixMs);
+  WriteU32ToBytes(Result, Offset, Cardinal(Length(Block.Samples)));
+  WriteU32ToBytes(Result, Offset, Cardinal(IndexSize));
 
   for I := 0 to High(Block.Samples) do
   begin
-    Buf[Offset] := Block.Samples[I].TrackId; Inc(Offset);
-    Buf[Offset] := Block.Samples[I].FlagsByte; Inc(Offset);
-    WriteI64ToBytes(Buf, Offset, Block.Samples[I].Pts);
-    WriteU32ToBytes(Buf, Offset, Block.Samples[I].PayloadOffset);
-    WriteU32ToBytes(Buf, Offset, Block.Samples[I].PayloadSize);
+    Result[Offset] := Block.Samples[I].TrackId; Inc(Offset);
+    Result[Offset] := Block.Samples[I].FlagsByte; Inc(Offset);
+    WriteI64ToBytes(Result, Offset, Block.Samples[I].Pts);
+    WriteU32ToBytes(Result, Offset, Block.Samples[I].PayloadOffset);
+    WriteU32ToBytes(Result, Offset, Block.Samples[I].PayloadSize);
   end;
 
   if HasAnchor then
   begin
-    Move(VMS_MAGIC_ANCHOR[0], Buf[Offset], 4); Inc(Offset, 4);
-    WriteI64ToBytes(Buf, Offset, Block.VideoAnchorMs);
-    WriteI64ToBytes(Buf, Offset, Block.AudioAnchorMs);
+    Move(VMS_MAGIC_ANCHOR[0], Result[Offset], 4); Inc(Offset, 4);
+    WriteI64ToBytes(Result, Offset, Block.VideoAnchorMs);
+    WriteI64ToBytes(Result, Offset, Block.AudioAnchorMs);
   end;
 
   if PayloadSize > 0 then
   begin
-    Move(Block.Payload[0], Buf[Offset], PayloadSize);
+    Move(Block.Payload[0], Result[Offset], PayloadSize);
     Inc(Offset, PayloadSize);
   end;
 
-  Crc := Crc32Update(0, Buf, 0, Offset);
-  WriteU32ToBytes(Buf, Offset, Crc);
+  WriteU32ToBytes(Result, Offset, Crc32Update(0, Result, 0, Offset));
+end;
 
+procedure TFileRecordingWriter.WriteBlock(const Block: TVmsBlock);
+var
+  Buf: TBytes;
+  StartOffset: UInt64;
+begin
+  if not FHeaderDone then
+    raise EVmsIoError.Create('Header must be written before blocks');
+
+  Buf := BuildBlockBytes(Block);
   StartOffset := UInt64(FBytes);
   FStream.WriteBuffer(Buf[0], Length(Buf));
   Inc(FBytes, Length(Buf));

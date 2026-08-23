@@ -12,7 +12,7 @@ unit Vms.Server.Logger;
 // geral. O console continua recebendo tudo, para acompanhar ao vivo.
 //
 // Não há corte por nível: debug/info/warn/error são todos gravados. O
-// `logLevel` do JSON não é usado aqui.
+// Não há filtro de nível em lugar nenhum: o que o código registra, sai.
 
 interface
 
@@ -116,7 +116,7 @@ begin
   FByCamera := TDictionary<string, ILogger>.Create;
 
   if AConsole then
-    FConsole := TConsoleLogger.Create(llDebug);
+    FConsole := TConsoleLogger.Create;
 
   if Trim(ALogDir) = '' then Exit; // só console
 
@@ -125,7 +125,7 @@ begin
     ForceDirectories(Dir);
   Stamp := FormatDateTime('yyyy-mm-dd', Now);
 
-  FGeneral := TFileLogger.Create(Dir + 'vmsserver_' + Stamp + '.log', llDebug);
+  FGeneral := TFileLogger.Create(Dir + 'vmsserver_' + Stamp + '.log');
 
   for I := 0 to High(ACameras) do
   begin
@@ -133,7 +133,7 @@ begin
     Key := LowerCase(Trim(ACameras[I].Name));
     if (Key = '') or FByCamera.ContainsKey(Key) then Continue;
     Path := Dir + SanitizeForFilename(ACameras[I].Name) + '_' + Stamp + '.log';
-    FByCamera.Add(Key, TFileLogger.Create(Path, llDebug));
+    FByCamera.Add(Key, TFileLogger.Create(Path));
   end;
 end;
 

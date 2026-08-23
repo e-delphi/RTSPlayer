@@ -42,6 +42,8 @@ type
     FSessionName: string;
     FConnectionAddress: string;
     FSessionControl: string;
+    FSourceIsLive: Boolean;
+    FMediaStartMs: Int64;
     FMedia: TObjectList<TSdpMedia>;
   public
     constructor Create;
@@ -52,6 +54,12 @@ type
     property SessionName: string read FSessionName write FSessionName;
     property ConnectionAddress: string read FConnectionAddress write FConnectionAddress;
     property SessionControl: string read FSessionControl write FSessionControl;
+    // A mídia vem da câmera agora, ou de gravação? Só o vmsserver responde isto
+    // (a=x-vms-source); câmera de verdade não diz nada, e aí o padrão é True —
+    // quem fala RTSP direto com a câmera está sempre vendo o agora.
+    property SourceIsLive: Boolean read FSourceIsLive write FSourceIsLive;
+    // Sendo gravação, de quando é a primeira imagem. 0 = não informado.
+    property MediaStartMs: Int64 read FMediaStartMs write FMediaStartMs;
     property Media: TObjectList<TSdpMedia> read FMedia;
   end;
 
@@ -77,6 +85,8 @@ end;
 constructor TSdpSession.Create;
 begin
   inherited Create;
+  FSourceIsLive := True;   // ver o comentário da propriedade: o padrão é "agora"
+  FMediaStartMs := 0;
   FMedia := TObjectList<TSdpMedia>.Create(True);
 end;
 

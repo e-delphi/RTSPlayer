@@ -36,6 +36,7 @@ uses
   FMX.StdCtrls,
   FMX.Graphics,
   VMS.Api.Client,
+  UI.Thumbs,
   UI.Common;
 
 type
@@ -53,6 +54,7 @@ type
     FPathPlay: TPath;
     FLblSpeed: TLabel;
     FSegments: TArray<TApiSegment>;
+    FEvents: TArray<TApiEvent>;
     FDayStartMs: Int64;
     FDayEndMs: Int64;
     FViewStartMs: Int64;         // janela visível: é ela que a barra desenha
@@ -61,12 +63,18 @@ type
     FPositionMs: Int64;
     FFollow: Boolean;            // a janela acompanha a reprodução?
     // Reservas de controles reaproveitados entre redesenhos. Ver TakeSeg.
+    FThumbs: IThumbProvider;
+    FThumbPool: TArray<TImage>;
+    FThumbUsed: Integer;
     FSegPool: TArray<TRectangle>;
     FSegUsed: Integer;
+    FEvPool: TArray<TRectangle>;
+    FEvUsed: Integer;
     FTickPool: TArray<TRectangle>;
     FTickUsed: Integer;
     FLblPool: TArray<TLabel>;
     FLblUsed: Integer;
+    FWheelX: Single;   // último X sob o ponteiro: a roda não traz posição
     FPanActive: Boolean;
     FPanMoved: Boolean;
     FPanStartX: Single;
@@ -77,12 +85,20 @@ type
     FOnTogglePlay: TNotifyEvent;
     FOnSpeedChange: TTimelineSeekEvent; // UnixMs carrega a velocidade x1000
     FOnLive: TNotifyEvent;
+    FOnEvents: TNotifyEvent;
+    FLblEventos: TLabel;
     function XToMs(X: Single): Int64;
     function MsToX(Ms: Int64): Single;
     function ViewSpanMs: Int64;
     procedure PanToStart(NewStartMs: Int64);
     // Um controle da reserva, criando mais um só quando a reserva acaba.
     function TakeSeg: TRectangle;
+    function TakeEvent: TRectangle;
+    // Desenha as marcas de evento que caem na janela atual.
+    procedure RedrawEvents;
+    function TakeThumb: TImage;
+    // Desenha as miniaturas que cabem na janela atual e pede as que faltam.
+    procedure RedrawThumbs;
     function TakeTick: TRectangle;
     function TakeLabel: TLabel;
     procedure HideUnusedPools;
@@ -90,11 +106,16 @@ type
     procedure TrackMouseDown(Sender: TObject; Button: TMouseButton;
       Shift: TShiftState; X, Y: Single);
     procedure TrackMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
+    procedure TrackMouseWheel(Sender: TObject; Shift: TShiftState;
+                              WheelDelta: Integer; var Handled: Boolean);
+    // Troca o nível de zoom mantendo parado o instante que está sob AtX.
+    procedure ZoomAtX(NewZoom: Integer; AtX: Single);
     procedure TrackMouseUp(Sender: TObject; Button: TMouseButton;
       Shift: TShiftState; X, Y: Single);
     procedure PlayClick(Sender: TObject);
     procedure SpeedClick(Sender: TObject);
     procedure LiveClick(Sender: TObject);
+    procedure EventsClick(Sender: TObject);
     procedure ZoomInClick(Sender: TObject);
     procedure ZoomOutClick(Sender: TObject);
     procedure CenterView(OnMs: Int64);
@@ -113,7 +134,22 @@ type
   public
     constructor Create(AOwner: TComponent); override;
     // Desenha o dia: limites (fuso do servidor) e as faixas com gravação.
+    // Quem fornece as miniaturas. A barra não sabe de onde elas vêm — só pede
+    // por minuto e desenha o que chegou (ver UI.Thumbs).
+    procedure SetThumbProvider(const Provider: IThumbProvider);
+    // Chamado quando alguma miniatura nova chegou. Quem assina o aviso do
+    // provedor é o formulário, não esta barra: o provedor é compartilhado com a
+    // tela de eventos, tem UM assinante só, e a última chamada a SetOnArrived
+    // apagaria a anterior — a barra pararia de se atualizar no dia em que a
+    // outra tela fosse aberta.
+    procedure ThumbsArrived;
     procedure SetDay(DayStartMs, DayEndMs: Int64; const Segments: TArray<TApiSegment>);
+    // O que a análise do servidor viu neste dia. Vazio = a faixa de eventos
+    // simplesmente não aparece, e a barra fica como sempre foi.
+    procedure SetEvents(const Events: TArray<TApiEvent>);
+    // O servidor deste playback tem análise de imagem? Só isso decide se o
+    // botão de eventos existe na barra.
+    procedure SetHasEvents(Value: Boolean);
     procedure SetPosition(UnixMs: Int64);
     procedure SetPlaying(Value: Boolean);
     procedure SetSpeedLabel(Value: Double);
@@ -121,12 +157,33 @@ type
     property OnTogglePlay: TNotifyEvent read FOnTogglePlay write FOnTogglePlay;
     property OnSpeedChange: TTimelineSeekEvent read FOnSpeedChange write FOnSpeedChange;
     property OnLive: TNotifyEvent read FOnLive write FOnLive;
+    // Abrir a lista de eventos do dia. Sem handler, o botão nem aparece: um
+    // servidor sem análise não deve oferecer uma tela que ficaria vazia.
+    property OnEvents: TNotifyEvent read FOnEvents write FOnEvents;
   end;
 
 implementation
 
 const
-  BAR_HEIGHT = 28;
+  // A barra ficou alta o bastante para caber miniatura: é ela que ocupa o fundo
+  // da faixa, e o traço colorido da gravação virou uma tira fina no rodapé.
+  BAR_HEIGHT = 64;
+  // Altura da tira colorida que marca onde há gravação, dentro da barra.
+  SEG_HEIGHT = 6;
+  // A faixa de eventos fica LOGO ACIMA da tira de gravação, no rodapé da barra:
+  // as duas se leem juntas (houve gravação aqui; aconteceu algo aqui) sem
+  // roubar o miolo, que é das miniaturas.
+  EV_HEIGHT = 5;
+  // Largura mínima da marca. Um evento de 2 s numa janela de 4 h daria menos de
+  // meio pixel e sumiria — que é justamente o evento que se está procurando.
+  EV_MIN_W = 3;
+  // Movimento é o pano de fundo (acontece o tempo todo); objeto reconhecido é o
+  // que interessa. Duas cores, e a de objeto vem por cima.
+  EV_MOTION_COLOR = TAlphaColor($FFB8860B);
+  EV_OBJECT_COLOR = TAlphaColor($FFE53935);
+  // Largura de cada miniatura. Nenhuma outra é desenhada mais perto que isto:
+  // é o que faz o zoom decidir quantas cabem, sem nenhuma conta a mais.
+  THUMB_W = 86;
   // Maior velocidade do ciclo do botão. O engine aceita até isto (SetSpeed).
   MAX_SPEED = 64;
   // marca cheia (6) + rótulo: apertar mais corta o texto embaixo
@@ -244,6 +301,7 @@ begin
   FTrack.OnMouseDown := TrackMouseDown;
   FTrack.OnMouseMove := TrackMouseMove;
   FTrack.OnMouseUp := TrackMouseUp;
+  FTrack.OnMouseWheel := TrackMouseWheel;
 
   FCursor := TRectangle.Create(Self);
   FCursor.Parent := FTrack;
@@ -291,6 +349,12 @@ begin
   MakeTextButton(FRow, 40, TAlignLayout.Left, '+', COLOR_TEXT, ZoomInClick);
 
   MakeTextButton(FRow, 84, TAlignLayout.Right, 'ao vivo', STAT_GREEN, LiveClick);
+
+  // Só aparece quando o servidor tem análise: quem liga isto é o formulário, ao
+  // descobrir na resposta de /api/cameras (ver SetHasEvents).
+  FLblEventos := MakeTextButton(FRow, 76, TAlignLayout.Right, 'eventos',
+                                COLOR_DIM, EventsClick);
+  FLblEventos.Visible := False;
 
   FLblTime := TLabel.Create(Self);
   FLblTime.Parent := FRow;
@@ -398,16 +462,34 @@ begin
     for I := High(ZOOM_SPANS) downto 1 do
       if ZOOM_SPANS[I] >= Covered then
         FZoom := I;
-    // Centra na gravação, não na cabeça de leitura: mover a cabeça aqui seria
-    // mentir sobre onde o playback está.
+    // Centra onde a reprodução está, quando ela cai dentro do gravado — que é o
+    // caso normal desde que o histórico passou a abrir perto do fim do dia.
+    // Fora dele (posição de outro dia, ou dia sem gravação por perto), centra no
+    // meio do que existe: melhor mostrar gravação que mostrar vazio.
     if FZoom > 0 then
-      CenterOn := Segments[0].StartMs + Covered div 2;
+      if (FPositionMs >= Segments[0].StartMs) and
+         (FPositionMs <= Segments[High(Segments)].EndMs) then
+        CenterOn := FPositionMs
+      else
+        CenterOn := Segments[0].StartMs + Covered div 2;
   end;
 
   CenterView(CenterOn);
   RedrawTrack;
   UpdateCursor;
   UpdateZoomLabel;
+end;
+
+procedure TFrameTimeline.SetEvents(const Events: TArray<TApiEvent>);
+begin
+  FEvents := Events;
+  RedrawTrack;
+end;
+
+procedure TFrameTimeline.SetHasEvents(Value: Boolean);
+begin
+  if FLblEventos <> nil then
+    FLblEventos.Visible := Value and Assigned(FOnEvents);
 end;
 
 // De quanto em quanto tempo marcar a régua, para os rótulos ficarem legíveis em
@@ -468,6 +550,84 @@ begin
   Inc(FSegUsed);
 end;
 
+// As miniaturas ficam ATRÁS de tudo dentro da barra: são o fundo sobre o qual a
+// tira de gravação e o cursor são desenhados.
+function TFrameTimeline.TakeEvent: TRectangle;
+begin
+  if FEvUsed < Length(FEvPool) then
+    Result := FEvPool[FEvUsed]
+  else
+  begin
+    Result := TRectangle.Create(Self);
+    Result.Parent := FTrack;
+    Result.Align := TAlignLayout.None;
+    Result.HitTest := False;   // o toque continua sendo da barra
+    Result.Stroke.Kind := TBrushKind.None;
+    SetLength(FEvPool, FEvUsed + 1);
+    FEvPool[FEvUsed] := Result;
+    if FCursor <> nil then FCursor.BringToFront;
+  end;
+  Result.Visible := True;
+  Inc(FEvUsed);
+end;
+
+// As marcas de evento, logo acima da tira de gravação.
+//
+// Objeto reconhecido é desenhado DEPOIS de movimento, e por isso por cima: onde
+// os dois coincidem — que é quase sempre, já que a rede só roda com movimento —
+// o que se vê é o vermelho, que é a informação mais específica das duas.
+procedure TFrameTimeline.RedrawEvents;
+var
+  I, Passe: Integer;
+  Marca: TRectangle;
+  X1, X2, Y: Single;
+  Objeto: Boolean;
+begin
+  FEvUsed := 0;
+  if (FTrack = nil) or (Length(FEvents) = 0) then Exit;
+  Y := FTrack.Height - SEG_HEIGHT - EV_HEIGHT - 1;
+  if Y < 0 then Exit;
+  for Passe := 0 to 1 do
+    for I := 0 to High(FEvents) do
+    begin
+      Objeto := not FEvents[I].IsMotion;
+      if Objeto <> (Passe = 1) then Continue;
+      if FEvents[I].EndMs < FViewStartMs then Continue;
+      if FEvents[I].StartMs > FViewEndMs then Continue;
+      X1 := MsToX(FEvents[I].StartMs);
+      X2 := MsToX(FEvents[I].EndMs);
+      Marca := TakeEvent;
+      Marca.Height := EV_HEIGHT;
+      Marca.Position.Y := Y;
+      Marca.Position.X := X1;
+      Marca.Width := X2 - X1;
+      if Marca.Width < EV_MIN_W then Marca.Width := EV_MIN_W;
+      if Objeto then
+        Marca.Fill.Color := EV_OBJECT_COLOR
+      else
+        Marca.Fill.Color := EV_MOTION_COLOR;
+    end;
+end;
+
+function TFrameTimeline.TakeThumb: TImage;
+begin
+  if FThumbUsed < Length(FThumbPool) then
+    Result := FThumbPool[FThumbUsed]
+  else
+  begin
+    Result := TImage.Create(Self);
+    Result.Parent := FTrack;
+    Result.Align := TAlignLayout.None;
+    Result.HitTest := False;
+    Result.WrapMode := TImageWrapMode.Stretch;
+    SetLength(FThumbPool, FThumbUsed + 1);
+    FThumbPool[FThumbUsed] := Result;
+    Result.SendToBack;
+  end;
+  Result.Visible := True;
+  Inc(FThumbUsed);
+end;
+
 function TFrameTimeline.TakeTick: TRectangle;
 begin
   if FTickUsed < Length(FTickPool) then
@@ -515,7 +675,9 @@ procedure TFrameTimeline.HideUnusedPools;
 var
   I: Integer;
 begin
+  for I := FThumbUsed to High(FThumbPool) do FThumbPool[I].Visible := False;
   for I := FSegUsed to High(FSegPool) do FSegPool[I].Visible := False;
+  for I := FEvUsed to High(FEvPool) do FEvPool[I].Visible := False;
   for I := FTickUsed to High(FTickPool) do FTickPool[I].Visible := False;
   for I := FLblUsed to High(FLblPool) do FLblPool[I].Visible := False;
 end;
@@ -541,17 +703,85 @@ begin
       X1 := MsToX(FSegments[I].StartMs);
       X2 := MsToX(FSegments[I].EndMs);
       Seg := TakeSeg;
-      Seg.Height := FTrack.Height;
+      // Tira fina no rodapé da barra: o miolo agora é das miniaturas.
+      Seg.Height := SEG_HEIGHT;
+      Seg.Position.Y := FTrack.Height - SEG_HEIGHT;
       Seg.Position.X := X1;
       Seg.Width := X2 - X1;
       if Seg.Width < 2 then Seg.Width := 2; // trecho curto ainda precisa aparecer
     end;
+    RedrawEvents;
   finally
     FTrack.EndUpdate;
   end;
 
+  RedrawThumbs;
   RedrawRuler;
   HideUnusedPools;
+end;
+
+// Uma miniatura a cada THUMB_W pixels, alinhada ao minuto. O zoom entra na conta
+// sozinho: quanto mais estreita a janela, menos minutos cabem entre dois pontos
+// de THUMB_W, e mais perto no tempo elas ficam.
+procedure TFrameTimeline.RedrawThumbs;
+var
+  Span, PassoMs, T, PrimeiroMs: Int64;
+  W: Single;
+  Img: TImage;
+  Bmp: TBitmap;
+  Faltando: Integer;
+begin
+  if (FThumbs = nil) or (FTrack = nil) then Exit;
+  FThumbUsed := 0;
+  W := FTrack.Width;
+  Span := ViewSpanMs;
+  if (W <= 0) or (Span <= 0) then Exit;
+
+  // Quantos minutos de gravação ocupam THUMB_W pixels nesta escala, arredondado
+  // para cima: nunca desenha duas mais perto que a largura de uma.
+  PassoMs := Round(Span * (THUMB_W / W));
+  PassoMs := ((PassoMs + ONE_MIN_MS - 1) div ONE_MIN_MS) * ONE_MIN_MS;
+  if PassoMs < ONE_MIN_MS then PassoMs := ONE_MIN_MS;
+
+  // Ancorado na meia-noite, e não na borda da janela: assim as miniaturas não
+  // escorregam de lugar enquanto se arrasta a barra.
+  PrimeiroMs := FDayStartMs +
+    ((FViewStartMs - FDayStartMs) div PassoMs) * PassoMs;
+
+  Faltando := 0;
+  T := PrimeiroMs;
+  while T <= FViewEndMs do
+  begin
+    if T >= FDayStartMs then
+      if FThumbs.TryGet(T, Bmp) then
+      begin
+        Img := TakeThumb;
+        Img.Bitmap := Bmp;
+        Img.Position.X := MsToX(T);
+        Img.Position.Y := 0;
+        Img.Width := THUMB_W;
+        Img.Height := FTrack.Height - SEG_HEIGHT;
+      end
+      else if Faltando < 24 then
+      begin
+        // Pede as que faltam, mas com teto: arrastar sobre o dia inteiro não
+        // pode virar uma enxurrada de pedidos que ninguém vai ver.
+        FThumbs.Request(T);
+        Inc(Faltando);
+      end;
+    Inc(T, PassoMs);
+  end;
+end;
+
+procedure TFrameTimeline.SetThumbProvider(const Provider: IThumbProvider);
+begin
+  FThumbs := Provider;
+end;
+
+// Imagem que chega depois só aparece se alguém redesenhar.
+procedure TFrameTimeline.ThumbsArrived;
+begin
+  RedrawTrack;
 end;
 
 // Marcas e horários sob a barra: sem isso não dá para saber que horas são as
@@ -706,6 +936,62 @@ begin
   FLblSpeed.Text := Format('%gx', [Value]);
 end;
 
+// Zoom com a roda, ancorado no ponteiro: o instante que está sob o cursor
+// continua sob o cursor depois de trocar de escala. É o que faz a roda parecer
+// uma lupa — com os botões, que ancoram no cursor de reprodução, ampliar perto
+// da borda joga o que se estava olhando para fora da tela.
+procedure TFrameTimeline.ZoomAtX(NewZoom: Integer; AtX: Single);
+var
+  W: Single;
+  Frac: Double;
+  AtMs, Span: Int64;
+begin
+  if (NewZoom < 0) or (NewZoom > High(ZOOM_SPANS)) then Exit;
+  if NewZoom = FZoom then Exit;
+  W := FTrack.Width;
+  if W <= 0 then Exit;
+  AtMs := XToMs(AtX);
+  Frac := AtX / W;
+  if Frac < 0 then Frac := 0;
+  if Frac > 1 then Frac := 1;
+
+  FZoom := NewZoom;
+  // A escala nova vem da TABELA, não do ViewSpanMs: este último é derivado da
+  // janela atual (FViewEndMs - FViewStartMs), então logo depois de mexer no
+  // FZoom ele ainda devolve o span ANTIGO. Era isso que fazia a roda arrastar a
+  // barra em vez de ampliar — o rótulo mudava e o desenho não.
+  Span := ZOOM_SPANS[FZoom];
+  FFollow := False;
+  if (Span <= 0) or (Span >= FDayEndMs - FDayStartMs) then
+  begin
+    // Nível "dia": a janela é o dia inteiro, e não há o que ancorar.
+    FViewStartMs := FDayStartMs;
+    FViewEndMs := FDayEndMs;
+  end
+  else
+  begin
+    // Põe AtMs na mesma fração da largura em que ele estava, e depois encaixa a
+    // janela dentro do dia.
+    FViewStartMs := AtMs - Round(Span * Frac);
+    if FViewStartMs + Span > FDayEndMs then FViewStartMs := FDayEndMs - Span;
+    if FViewStartMs < FDayStartMs then FViewStartMs := FDayStartMs;
+    FViewEndMs := FViewStartMs + Span;
+  end;
+  RedrawTrack;
+  UpdateCursor;
+  UpdateZoomLabel;
+end;
+
+procedure TFrameTimeline.TrackMouseWheel(Sender: TObject; Shift: TShiftState;
+  WheelDelta: Integer; var Handled: Boolean);
+begin
+  if WheelDelta > 0 then
+    ZoomAtX(FZoom + 1, FWheelX)
+  else
+    ZoomAtX(FZoom - 1, FWheelX);
+  Handled := True;
+end;
+
 procedure TFrameTimeline.ZoomInClick(Sender: TObject);
 begin
   if FZoom >= High(ZOOM_SPANS) then Exit;
@@ -752,6 +1038,7 @@ var
   DeltaPx: Single;
   DeltaMs: Int64;
 begin
+  FWheelX := X;
   if not FPanActive then Exit;
   // O botão já está solto e o MouseUp nunca chegou — a captura se perdeu no
   // caminho (ver AutoCapture, na construção). Sem esta saída a barra continua
@@ -810,6 +1097,11 @@ begin
   SetSpeedLabel(FSpeed);
   if Assigned(FOnSpeedChange) then
     FOnSpeedChange(Self, Round(FSpeed * 1000));
+end;
+
+procedure TFrameTimeline.EventsClick(Sender: TObject);
+begin
+  if Assigned(FOnEvents) then FOnEvents(Self);
 end;
 
 procedure TFrameTimeline.LiveClick(Sender: TObject);

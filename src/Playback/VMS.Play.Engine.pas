@@ -58,6 +58,13 @@ const
   // regra o player não fica rápido, fica ATRASADO — o pacer re-ancora sem parar
   // e a posição anda a uma fração da velocidade pedida.
   PLAY_ALLFRAMES_MAX_SPEED = 4;
+  // Quadros por segundo de TELA durante a varredura. É daqui que sai o stepMs
+  // pedido ao servidor: a 64x, 12 quadros na tela por segundo são um quadro a
+  // cada 5,3 s de mídia — e é só isso que precisa atravessar a rede.
+  PLAY_SCAN_FPS = 12;
+  // Em varredura cabe pedir mais blocos por requisição: cada um rende pouca
+  // coisa (um keyframe ou nenhum), e o teto de bytes não é mais o que limita.
+  PLAY_MAX_BLOCKS_SCAN = 32;
   // Teto absoluto da fila, em ms de mídia. O alvo cresce com a velocidade (ver
   // AdaptPrefetch) porque a 64x a fila esvazia 64 vezes mais rápido, e a conta
   // quem paga é a memória do celular. Estes 4 minutos só são alcançáveis em
@@ -130,6 +137,7 @@ type
     FTargetBufferMs: Int64;
     FLastRatio: Int64;          // razão busca/mídia do pedido anterior
     FSlowLinkLogged: Boolean;
+    FScanWarned: Boolean;       // já avisei que o servidor não decima?
     // buraco na gravação que a UI ainda não mostrou (consumido uma vez só)
     FGapNoticeMs: Int64;
     // só a thread de ritmo mexe nestes: âncora corrente do relógio de saída
@@ -149,6 +157,9 @@ type
     procedure AnnounceFormats(const Header: TVmsHeader);
     procedure NotifyPosition(UnixMs: Int64);
     procedure AdaptPrefetch(FetchMs, MediaMs: Int64);
+    // Espaçamento pedido ao servidor, em ms de mídia. 0 = reprodução normal,
+    // manda tudo.
+    function ScanStepMs: Int64;
   private
     // chamados pelas threads desta unit (private, não strict: em Delphi o
     // strict fecharia o acesso até para quem mora no mesmo arquivo)
@@ -383,7 +394,11 @@ end;
 
 procedure TPlaybackEngine.Pause;
 begin
-  if State = pbPlaying then
+  // pbBuffering conta como tocando: a reprodução alterna entre os dois o tempo
+  // todo (o pacer marca pbBuffering sempre que a fila seca por um instante), e
+  // aceitar só pbPlaying fazia a pausa não pegar — sem aviso nenhum, porque a
+  // UI já tinha trocado o ícone.
+  if (State = pbPlaying) or (State = pbBuffering) then
     SetState(pbPaused);
 end;
 
@@ -600,6 +615,19 @@ end;
 // fila seca (o vídeo trava de tempos em tempos). Se custa 0,2 s, dá para pedir
 // menos por vez, e o seek passa a responder mais rápido — é a mesma requisição
 // que o usuário espera quando arrasta a barra.
+function TPlaybackEngine.ScanStepMs: Int64;
+var
+  Spd: Double;
+begin
+  Spd := FSpeed;
+  if Spd <= PLAY_ALLFRAMES_MAX_SPEED then Exit(0);
+  // Um quadro a cada Spd/PLAY_SCAN_FPS segundos de mídia é exatamente o que
+  // rende PLAY_SCAN_FPS quadros por segundo na tela naquela velocidade. Pedir
+  // mais que isso é baixar o que vai ser descartado.
+  Result := Round(1000 * Spd / PLAY_SCAN_FPS);
+  if Result < 1 then Result := 1;
+end;
+
 procedure TPlaybackEngine.AdaptPrefetch(FetchMs, MediaMs: Int64);
 var
   Antes: Integer;
@@ -630,7 +658,13 @@ begin
     Dec(FBlocksPerFetch);                      // sobra folga: pede menos
   FLastRatio := Razao;
   if FBlocksPerFetch < PLAY_MIN_BLOCKS then FBlocksPerFetch := PLAY_MIN_BLOCKS;
-  if FBlocksPerFetch > PLAY_MAX_BLOCKS then FBlocksPerFetch := PLAY_MAX_BLOCKS;
+  if ScanStepMs > 0 then
+  begin
+    if FBlocksPerFetch > PLAY_MAX_BLOCKS_SCAN then
+      FBlocksPerFetch := PLAY_MAX_BLOCKS_SCAN;
+  end
+  else if FBlocksPerFetch > PLAY_MAX_BLOCKS then
+    FBlocksPerFetch := PLAY_MAX_BLOCKS;
 
   // A fila cobre quatro buscas: tempo de reagir a uma oscilação sem virar
   // atraso de seek.
@@ -671,7 +705,7 @@ procedure TPlaybackEngine.FetchOnce;
 var
   Gen: Integer;
   Camera, Cursor: string;
-  SeekMs, Started: Int64;
+  SeekMs, Started, Step: Int64;
   Chunk: TApiMediaChunk;
   NeedMore, Ok: Boolean;
 begin
@@ -706,10 +740,11 @@ begin
   end;
 
   Started := FClock.MonotonicMs;
+  Step := ScanStepMs;
   if SeekMs >= 0 then
-    Ok := FClient.GetMediaAt(Camera, SeekMs, FBlocksPerFetch, Chunk)
+    Ok := FClient.GetMediaAt(Camera, SeekMs, FBlocksPerFetch, Step, Chunk)
   else
-    Ok := FClient.GetMediaNext(Camera, Cursor, FBlocksPerFetch, Chunk);
+    Ok := FClient.GetMediaNext(Camera, Cursor, FBlocksPerFetch, Step, Chunk);
 
   if not Ok then
   begin
@@ -735,6 +770,15 @@ begin
     Exit;
   end;
   FFetchFails := 0;
+  // Servidor antigo ignora o stepMs e manda o stream inteiro. Continua tocando
+  // (o descarte local ainda existe), mas a rede carrega tudo — e é isso que
+  // explica varredura lenta num acesso remoto.
+  if (Step > 0) and (not Chunk.Thinned) and (not FScanWarned) then
+  begin
+    FScanWarned := True;
+    Log(llWarn, 'o servidor nao decima a varredura (stepMs); a rede vai carregar ' +
+                'o stream inteiro nas velocidades altas');
+  end;
   AdaptPrefetch(FClock.MonotonicMs - Started, Chunk.EndMs - Chunk.StartMs);
 
   FLock.Enter;
