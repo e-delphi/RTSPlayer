@@ -99,6 +99,7 @@ uses
   Vms.Thumb.Service in 'src\Thumbs\Vms.Thumb.Service.pas',
   Vms.Thumb.FFmpeg in 'src\Thumbs\Vms.Thumb.FFmpeg.pas',
   Vms.Thumb.JpegVcl in 'src\Thumbs\Vms.Thumb.JpegVcl.pas',
+  Vms.Thumb.IndexDb in 'src\Thumbs\Vms.Thumb.IndexDb.pas',
   FFmpegLib in '..\src\Win\FFmpegLib.pas',
   // ---- visão computacional: cópia do onnx-pascal, não editar ----
   ONNX.CApi in '..\vendor\onnx-pascal\ONNX.CApi.pas',
@@ -318,7 +319,7 @@ begin
     if ApiCfg.Enabled then
     begin
       Cache := TVmsIndexCache.Create(StorageDir, Db, Logger);
-      Thumbs := BuildThumbSource(Cache, THUMB_W, THUMB_H, Logger);
+      Thumbs := BuildThumbSource(Cache, Db, Clock, THUMB_W, THUMB_H, Logger);
       // A análise depende do MESMO cache de índices das miniaturas — é ele que
       // faz achar o keyframe de um instante custar uma busca binária. Por isso
       // ela sobe junto com a API, e não antes.

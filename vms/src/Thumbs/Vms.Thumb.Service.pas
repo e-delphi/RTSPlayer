@@ -35,6 +35,9 @@ type
     FGrabber: IFrameGrabber;
     FEncoder: IImageEncoder;
     FCache: TThumbDiskCache;
+    // Pode ser nil: sem ele o servico funciona igual, so nao lembra de nada
+    // entre reinicios.
+    FIndex: IThumbIndex;
     FLogger: ILogger;
     FWidth, FHeight: Integer;
     FLock: TCriticalSection;
@@ -45,13 +48,14 @@ type
     function RecentMiss(const Key: string): Boolean;
     procedure NoteMiss(const Key: string);
     function Generate(const Camera: string; MinuteMs: Int64;
-                      out Data: TBytes; out ActualMs: Int64): Boolean;
+                      out Data: TBytes; out ActualMs: Int64;
+                      out W, H: Integer): Boolean;
   public
     // AWidth/AHeight são o teto da imagem; a proporção do vídeo é preservada.
     constructor Create(const AKeyframes: IKeyframeSource;
                        const AGrabber: IFrameGrabber;
                        const AEncoder: IImageEncoder;
-                       ACache: TThumbDiskCache;
+                       ACache: TThumbDiskCache; const AIndex: IThumbIndex;
                        AWidth, AHeight: Integer; const ALogger: ILogger);
     destructor Destroy; override;
     { IThumbSource }
@@ -103,13 +107,15 @@ end;
 
 constructor TThumbService.Create(const AKeyframes: IKeyframeSource;
   const AGrabber: IFrameGrabber; const AEncoder: IImageEncoder;
-  ACache: TThumbDiskCache; AWidth, AHeight: Integer; const ALogger: ILogger);
+  ACache: TThumbDiskCache; const AIndex: IThumbIndex;
+  AWidth, AHeight: Integer; const ALogger: ILogger);
 begin
   inherited Create;
   FKeyframes := AKeyframes;
   FGrabber := AGrabber;
   FEncoder := AEncoder;
   FCache := ACache;
+  FIndex := AIndex;
   FWidth := AWidth;
   FHeight := AHeight;
   FLogger := ALogger;
@@ -182,7 +188,7 @@ begin
 end;
 
 function TThumbService.Generate(const Camera: string; MinuteMs: Int64;
-  out Data: TBytes; out ActualMs: Int64): Boolean;
+  out Data: TBytes; out ActualMs: Int64; out W, H: Integer): Boolean;
 var
   AU, Extra: TBytes;
   Codec: TVideoCodec;
@@ -191,6 +197,8 @@ begin
   Result := False;
   Data := nil;
   ActualMs := 0;
+  W := 0;
+  H := 0;
   if not FKeyframes.Grab(Camera, MinuteMs, AU, Extra, Codec, ActualMs) then
   begin
     Passo(Camera, MinuteMs, 'sem keyframe na gravacao para este instante');
@@ -213,6 +221,11 @@ begin
     Exit;
   end;
   Result := FEncoder.Encode(Img, Data) and (Length(Data) > 0);
+  if Result then
+  begin
+    W := Img.Width;
+    H := Img.Height;
+  end;
   if not Result then
     Passo(Camera, MinuteMs, Format('encode falhou (%dx%d)', [Img.Width, Img.Height]))
   else
@@ -225,6 +238,7 @@ function TThumbService.Get(const Camera: string; Ms: Int64; out Data: TBytes;
 var
   MinuteMs: Int64;
   Key: string;
+  W, H: Integer;
 begin
   Data := nil;
   MinuteMs := TThumbDiskCache.MinuteOf(Ms);
@@ -238,6 +252,14 @@ begin
 
   Key := MissKey(Camera, MinuteMs);
   if RecentMiss(Key) then Exit;
+  // 1b. Ja se olhou este minuto numa execucao ANTERIOR e nao havia imagem.
+  //     Sem isto, arrastar a barra sobre um trecho sem gravacao volta a custar
+  //     uma decodificacao fracassada por minuto a cada reinicio do servidor.
+  if (FIndex <> nil) and FIndex.KnownMissing(Camera, MinuteMs) then
+  begin
+    NoteMiss(Key);        // segura tambem em memoria, para nao reconsultar
+    Exit;
+  end;
 
   // 2. Uma geração por vez. Duas conexões pedindo o mesmo minuto: a segunda
   //    espera e acha pronto no disco.
@@ -245,7 +267,7 @@ begin
   try
     if FCache.TryRead(Camera, MinuteMs, Data) then Exit(True);
     try
-      Result := Generate(Camera, MinuteMs, Data, ActualMs);
+      Result := Generate(Camera, MinuteMs, Data, ActualMs, W, H);
     except
       on E: Exception do
       begin
@@ -259,10 +281,17 @@ begin
   end;
 
   if Result then
-    FCache.Write(Camera, MinuteMs, Data)
+  begin
+    FCache.Write(Camera, MinuteMs, Data);
+    if FIndex <> nil then
+      FIndex.NoteHit(Camera, MinuteMs, FCache.PathOf(Camera, MinuteMs),
+                     Length(Data), W, H);
+  end
   else
   begin
     NoteMiss(Key);
+    if FIndex <> nil then
+      FIndex.NoteMissing(Camera, MinuteMs);
     ActualMs := MinuteMs;
   end;
 end;

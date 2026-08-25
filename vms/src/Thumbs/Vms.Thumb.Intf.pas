@@ -68,6 +68,22 @@ type
     function ContentType: string;
   end;
 
+  // Onde fica registrado o que ja se sabe de cada minuto: se tem imagem, e
+  // onde ela esta; ou que NAO tem, e ai nem vale tentar de novo.
+  //
+  // Fronteira propria porque e outra natureza: o TThumbDiskCache guarda BYTES,
+  // isto guarda o que se sabe SOBRE eles. Nil = servico funciona igual, so
+  // perde a memoria entre reinicios.
+  IThumbIndex = interface
+    ['{5C9A2E64-3B71-4D08-96F2-8E0D1A7B4C35}']
+    procedure NoteHit(const Camera: string; MinuteMs: Int64;
+                      const Path: string; Bytes, W, H: Integer);
+    // Pode ser ignorado para minuto recente demais — a gravacao ainda pode
+    // chegar nele. Quem decide isso e a implementacao.
+    procedure NoteMissing(const Camera: string; MinuteMs: Int64);
+    function KnownMissing(const Camera: string; MinuteMs: Int64): Boolean;
+  end;
+
   // O que a API enxerga. Uma pergunta só: a miniatura deste instante.
   IThumbSource = interface
     ['{6B8E9D27-70C2-4C3A-8D1E-5F0A2B7C4D63}']

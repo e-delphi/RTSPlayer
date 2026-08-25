@@ -240,6 +240,7 @@
         <DCCReference Include="src\Thumbs\Vms.Thumb.Service.pas"/>
         <DCCReference Include="src\Thumbs\Vms.Thumb.FFmpeg.pas"/>
         <DCCReference Include="src\Thumbs\Vms.Thumb.JpegVcl.pas"/>
+        <DCCReference Include="src\Thumbs\Vms.Thumb.IndexDb.pas"/>
         <DCCReference Include="..\src\Win\FFmpegLib.pas"/>
         <DCCReference Include="..\vendor\onnx-pascal\ONNX.CApi.pas"/>
         <DCCReference Include="..\vendor\onnx-pascal\ONNX.Types.pas"/>

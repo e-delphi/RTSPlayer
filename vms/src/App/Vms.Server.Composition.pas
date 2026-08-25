@@ -50,7 +50,8 @@ function IsDvripUrl(const Url: string): Boolean;
 // de comportamento.
 // StorageDir nao entra mais: as miniaturas moram em DefaultCacheDir, ao lado
 // do executavel. Ver o cabecalho do Vms.Thumb.Cache.
-function BuildThumbSource(Cache: TVmsIndexCache;
+function BuildThumbSource(Cache: TVmsIndexCache; const Db: IDbQueue;
+                          const Clock: IClock;
                           ThumbWidth, ThumbHeight: Integer;
                           const Logger: ILogger): IThumbSource;
 
@@ -101,15 +102,18 @@ uses
 {$IFDEF MSWINDOWS}
   Vms.Thumb.FFmpeg,
   Vms.Thumb.JpegVcl,
+  Vms.Thumb.IndexDb,
   Vms.Analytics.Onnx,
 {$ENDIF}
   Vms.Server.RecSink;
 
-function BuildThumbSource(Cache: TVmsIndexCache;
-  ThumbWidth, ThumbHeight: Integer; const Logger: ILogger): IThumbSource;
+function BuildThumbSource(Cache: TVmsIndexCache; const Db: IDbQueue;
+  const Clock: IClock; ThumbWidth, ThumbHeight: Integer;
+  const Logger: ILogger): IThumbSource;
 {$IFDEF MSWINDOWS}
 var
   Grabber: IFrameGrabber;
+  Indice: IThumbIndex;
 {$ENDIF}
 begin
 {$IFDEF MSWINDOWS}
@@ -118,11 +122,18 @@ begin
   // como decodificar, e é melhor a barra ficar sem miniatura do que cada
   // requisição descobrir isso de novo.
   if Grabber.Available then
+  begin
+    // Sem banco o serviço funciona igual, só não lembra entre reinícios.
+    Indice := nil;
+    if (Db <> nil) and Db.IsOpen then
+      Indice := TSqliteThumbIndex.Create(Db, Clock, Logger);
     Exit(TThumbService.Create(TVmsKeyframeSource.Create(Cache, Logger),
                               Grabber,
                               TVclJpegEncoder.Create,
                               TThumbDiskCache.Create(DefaultCacheDir),
+                              Indice,
                               ThumbWidth, ThumbHeight, Logger));
+  end;
 {$ENDIF}
   Result := TNullThumbSource.Create;
 end;
