@@ -74,6 +74,14 @@ type
     // mesmo evento. Sem isso, uma pessoa parada na cena viraria um evento por
     // quadro analisado.
     MergeGapMs: Int64;
+    // Teto de duracao de UM evento. Passando disto, ele fecha e comeca outro.
+    //
+    // Serve a dois donos. Na tela: movimento continuo numa rua manteria o
+    // evento aberto por horas, e uma tarja de quatro horas na linha do tempo
+    // nao diz nada. No banco: a consulta por sobreposicao so tem piso porque
+    // este teto existe (ver Vms.Analytics.StoreDb) — sem ele, procurar os
+    // eventos das 14h obrigaria a considerar tudo desde o comeco do banco.
+    MaxEventMs: Int64;
     // Quanto tempo de gravacao passada analisar na primeira subida. 0 = tudo o
     // que houver no disco.
     BackfillMs: Int64;
@@ -155,6 +163,7 @@ begin
   Result.ObjectMinIntervalMs := 5000;
   Result.ObjectThreshold := 0.35;
   Result.MergeGapMs := 8000;
+  Result.MaxEventMs := 300000;
   Result.BackfillMs := Int64(6) * 3600 * 1000;
   Result.LagMs := 30000;
   Result.ModelPath := '';

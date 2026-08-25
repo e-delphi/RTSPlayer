@@ -61,6 +61,15 @@ const
   AV_LOG_WARNING      = 24;
   AV_LOG_INFO         = 32;
 
+  // err_detect: o que o decodificador faz ao achar erro no bitstream. Por
+  // omissao ele CONCEALA — devolve um quadro com os macroblocos ruins
+  // remendados — e quem chama nao fica sabendo. Com EXPLODE ele falha, e ai
+  // `avcodec_receive_frame` devolve erro em vez de um quadro com lixo dentro.
+  AV_EF_CRCCHECK       = 1;
+  AV_EF_BITSTREAM      = 2;
+  AV_EF_BUFFER         = 4;
+  AV_EF_EXPLODE        = 8;
+
 type
   // Ponteiros opacos pra structs grandes/instaveis. Nao acessamos
   // campos via offset — usamos accessors quando precisamos.

@@ -27,6 +27,13 @@ unit Vms.Analytics.Analyzer;
 // o presente. ObjectMinIntervalMs e o teto: entre duas passadas da rede o
 // movimento continua sendo registrado normalmente.
 //
+// ## O teto de duracao
+//
+// Um evento nao pode crescer para sempre. Movimento continuo numa rua manteria
+// 'movimento' aberto por horas; ao passar de MaxEventMs ele fecha e um novo
+// comeca no mesmo instante, sem perder nada — o que era uma tarja unica vira
+// uma sequencia, que e o que de fato aconteceu.
+//
 // ## O que NAO e evento
 //
 // Cena que muda inteira (luz, IR, camera movida) e descartada pelo detector de
@@ -164,18 +171,32 @@ var
 begin
   if FOpen.TryGetValue(Name, Aberto) then
   begin
-    Aberto.Ev.EndMs := Ms;
-    Aberto.LastSeenMs := Ms;
-    // Pico, nao media nem uniao: e o quadro de pico que descreve melhor o que
-    // aconteceu, e e nele que a miniatura do evento vai cair.
-    if Score > Aberto.Ev.Score then
+    // Estourou o teto: fecha o que estava aberto e deixa o caminho de baixo
+    // abrir outro comecando agora. Nada se perde — o que era uma tarja unica
+    // vira uma sequencia, que e o que de fato aconteceu.
+    if (FCfg.MaxEventMs > 0) and
+       ((Ms - Aberto.Ev.StartMs) >= FCfg.MaxEventMs) then
     begin
-      Aberto.Ev.Score := Score;
-      Aberto.Ev.Box := Box;
+      if FStore <> nil then
+        FStore.Append(FCamera, Aberto.Ev);
+      Inc(FCount);
+      FOpen.Remove(Name);
+    end
+    else
+    begin
+      Aberto.Ev.EndMs := Ms;
+      Aberto.LastSeenMs := Ms;
+      // Pico, nao media nem uniao: e o quadro de pico que descreve melhor o
+      // que aconteceu, e e nele que a miniatura do evento vai cair.
+      if Score > Aberto.Ev.Score then
+      begin
+        Aberto.Ev.Score := Score;
+        Aberto.Ev.Box := Box;
+      end;
+      if Count > Aberto.Ev.Count then Aberto.Ev.Count := Count;
+      FOpen.AddOrSetValue(Name, Aberto);
+      Exit;
     end;
-    if Count > Aberto.Ev.Count then Aberto.Ev.Count := Count;
-    FOpen.AddOrSetValue(Name, Aberto);
-    Exit;
   end;
 
   Aberto.Ev.StartMs := Ms;

@@ -53,7 +53,8 @@ uses
   VMS.Domain.Logging,
   VMS.Rec.Format,
   VMS.Rec.Paths,
-  VMS.Rec.Reader;
+  VMS.Rec.Reader,
+  Vms.Db.Intf;
 
 type
   TVmsFileInfo = record
@@ -113,6 +114,7 @@ type
     // Alguma gravação fechada foi (re)lida do disco desde a última gravação do
     // json? É isso, e não a contagem de arquivos, que diz se vale regravá-lo.
     FDiskDirty: Boolean;
+    FDb: IDbQueue;
     function KeyOf(const Path: string): string;
     function ReadInfo(const Path: string; out Info: TVmsFileInfo): Boolean;
     // Como o GetInfo, mas com os carimbos já em mãos. A listagem os obtém de uma
@@ -120,18 +122,24 @@ type
     function GetInfoStamped(const Path: string; Size, WrittenMs: Int64;
                             out Info: TVmsFileInfo): Boolean;
     // ---- resumo em disco, por câmera -------------------------------------
-    function DiskCachePath(const Camera: string): string;
     // Carrega o `_index.json` da câmera para o cache de memória, uma vez por
     // execução. Arquivo ausente, ilegível ou de outro formato: começa do zero.
     procedure LoadDiskCache(const Camera: string);
     // Regrava o `_index.json` com o que se sabe das gravações FECHADAS.
     procedure SaveDiskCache(const Camera: string);
+  public
+    // Tira do inventario as gravacoes cujo arquivo ja nao existe.
+    function ForgetMissing(const Camera: string): Integer;
+  strict private
     // Solta o índice dos arquivos que não são os MAX_CACHED_INDEXES mais
     // recentes. Chamada sob FLock.
     procedure TrimIndexes;
     procedure Log(Level: TLogLevel; const Msg: string);
   public
-    constructor Create(const AStorageDir: string; const ALogger: ILogger);
+    // O banco entra pela interface: este cache nao sabe que existe FireDAC,
+    // e continua funcionando com Db nil (so perde a persistencia do resumo).
+    constructor Create(const AStorageDir: string; const ADb: IDbQueue;
+                       const ALogger: ILogger);
     destructor Destroy; override;
     // Resumo de um arquivo, do cache ou do disco. False = não é um .vms legível.
     function GetInfo(const Path: string; out Info: TVmsFileInfo): Boolean;
@@ -167,10 +175,8 @@ const
   // exatamente no início do último bloco.
   ASSUMED_LAST_BLOCK_MS = 2000;
 
-  // Nome do resumo em disco, dentro da pasta da câmera. Começa com '_' para
-  // nunca ser confundido com gravação: IsSafeVmsName exige extensão .vms.
-  DISK_CACHE_NAME = '_index.json';
-  DISK_CACHE_VERSION = 1;
+  // (O resumo em disco era o `_index.json`; agora é a tabela `recording`.
+  //  Ver LoadDiskCache/SaveDiskCache — os nomes ficaram, a persistência mudou.)
 
   // Quantos índices ficam em memória ao mesmo tempo. Um índice de arquivo de 2 h
   // são ~90 KB; guardar o de todos os arquivos da retenção seriam dezenas de MB
@@ -180,7 +186,8 @@ const
 
 { TVmsIndexCache }
 
-constructor TVmsIndexCache.Create(const AStorageDir: string; const ALogger: ILogger);
+constructor TVmsIndexCache.Create(const AStorageDir: string;
+  const ADb: IDbQueue; const ALogger: ILogger);
 begin
   inherited Create;
   FStorageDir := ExcludeTrailingPathDelimiter(ExpandFileName(AStorageDir));
@@ -190,6 +197,7 @@ begin
   FDiskLoaded := TDictionary<string, Boolean>.Create;
   FDiskDirty := False;
   FUseTick := 0;
+  FDb := ADb;
 end;
 
 destructor TVmsIndexCache.Destroy;
@@ -339,11 +347,6 @@ begin
   end;
 end;
 
-function TVmsIndexCache.DiskCachePath(const Camera: string): string;
-begin
-  Result := TPath.Combine(CameraDir(FStorageDir, Camera), DISK_CACHE_NAME);
-end;
-
 // A data de escrita vai como unix ms para o json não depender do formato de
 // data local — o mesmo arquivo tem de valer numa máquina configurada em pt-BR e
 // noutra em en-US.
@@ -352,15 +355,12 @@ begin
   Result := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(DT), True) * 1000;
 end;
 
+// Traz da tabela `recording` o resumo das gravacoes FECHADAS desta camera, uma
+// vez por execucao. Substitui a leitura do _index.json; o resto do cache nao
+// mudou.
 procedure TVmsIndexCache.LoadDiskCache(const Camera: string);
 var
-  Root: TJSONValue;
-  Arr: TJSONArray;
-  Obj: TJSONObject;
-  I: Integer;
-  Entry: TCachedFile;
-  Key, Name, Text: string;
-  Info: TVmsFileInfo;
+  Pasta: string;
 begin
   FLock.Enter;
   try
@@ -369,137 +369,182 @@ begin
   finally
     FLock.Leave;
   end;
+  if (FDb = nil) or (not FDb.IsOpen) then Exit;
+
+  // A camera do resumo e o nome da PASTA, que e o que o ReadInfo deriva.
+  // Guardar o nome cru faria as duas origens discordarem quando o nome tem
+  // caractere que o CameraFolderName troca.
+  Pasta := ExtractFileName(ExcludeTrailingPathDelimiter(
+             CameraDir(FStorageDir, Camera)));
 
   try
-    if not TFile.Exists(DiskCachePath(Camera)) then Exit;
-    Text := TFile.ReadAllText(DiskCachePath(Camera), TEncoding.UTF8);
-  except
-    Exit;
-  end;
+    FDb.Read(
+      'SELECT r.name, r.start_ms, r.end_ms, r.bytes, r.blocks, r.has_video, ' +
+      '       r.video_codec, r.width, r.height, r.has_audio, r.audio_codec, ' +
+      '       r.sample_rate, r.channels, r.stamp_size, r.stamp_mtime_ms ' +
+      '  FROM recording r JOIN camera c ON c.id = r.camera_id ' +
+      ' WHERE c.name = ? AND r.closed = 1', [Camera],
+      procedure(const Row: IDbRow)
+      var
+        Info: TVmsFileInfo;
+        Entry: TCachedFile;
+        Nome, Chave: string;
+      begin
+        Nome := Row.AsString('name');
+        // O nome vem do banco, mas ainda vira caminho de arquivo: a mesma
+        // checagem que se faz com o que chega pela rede vale aqui.
+        if (Nome = '') or (not IsSafeVmsName(Nome)) then Exit;
 
-  Root := nil;
-  try
-    Root := TJSONObject.ParseJSONValue(Text);
-    if not (Root is TJSONObject) then Exit;
-    if TJSONObject(Root).GetValue<Integer>('version', 0) <> DISK_CACHE_VERSION then Exit;
-    Arr := TJSONObject(Root).GetValue('files') as TJSONArray;
-    if Arr = nil then Exit;
-    for I := 0 to Arr.Count - 1 do
-    begin
-      if not (Arr.Items[I] is TJSONObject) then Continue;
-      Obj := TJSONObject(Arr.Items[I]);
-      Name := Obj.GetValue<string>('name', '');
-      if (Name = '') or (not IsSafeVmsName(Name)) then Continue;
+        FillChar(Info, SizeOf(Info), 0);
+        Info.Path := ''; Info.Name := ''; Info.Camera := '';
+        Info.Name := Nome;
+        Info.Camera := Pasta;
+        Info.Path := TPath.Combine(CameraDir(FStorageDir, Camera), Nome);
+        Info.StartMs := Row.AsInt64('start_ms');
+        Info.EndMs := Row.AsInt64('end_ms');
+        Info.DurationMs := Info.EndMs - Info.StartMs;
+        Info.Bytes := Row.AsInt64('bytes');
+        Info.Blocks := Row.AsInt('blocks');
+        Info.Closed := True;      // a consulta ja filtrou
+        Info.Indexed := True;
+        Info.HasVideo := Row.AsBool('has_video');
+        Info.VideoCodec := TVideoCodec(Row.AsInt('video_codec'));
+        Info.Width := Row.AsInt('width');
+        Info.Height := Row.AsInt('height');
+        Info.HasAudio := Row.AsBool('has_audio');
+        Info.AudioCodec := TAudioCodec(Row.AsInt('audio_codec'));
+        Info.SampleRate := Row.AsInt('sample_rate');
+        Info.Channels := Row.AsInt('channels');
+        if (Info.StartMs <= 0) or (Info.EndMs <= Info.StartMs) then Exit;
 
-      FillChar(Info, SizeOf(Info), 0);
-      Info.Path := ''; Info.Name := ''; Info.Camera := '';
-      Info.Name := Name;
-      // A câmera do resumo é o nome da PASTA, que é o que o ReadInfo deriva.
-      // Guardar o nome cru faria as duas origens discordarem quando o nome tem
-      // caractere que o CameraFolderName troca.
-      Info.Camera := ExtractFileName(ExcludeTrailingPathDelimiter(
-                       CameraDir(FStorageDir, Camera)));
-      Info.Path := TPath.Combine(CameraDir(FStorageDir, Camera), Name);
-      Info.StartMs := Obj.GetValue<Int64>('startMs', 0);
-      Info.EndMs := Obj.GetValue<Int64>('endMs', 0);
-      Info.DurationMs := Info.EndMs - Info.StartMs;
-      Info.Bytes := Obj.GetValue<Int64>('bytes', 0);
-      Info.Blocks := Obj.GetValue<Integer>('blocks', 0);
-      Info.Closed := True;    // só gravação fechada entra no json
-      Info.Indexed := True;
-      Info.HasVideo := Obj.GetValue<Boolean>('hasVideo', False);
-      Info.VideoCodec := TVideoCodec(Obj.GetValue<Integer>('vcodec', 0));
-      Info.Width := Obj.GetValue<Integer>('w', 0);
-      Info.Height := Obj.GetValue<Integer>('h', 0);
-      Info.HasAudio := Obj.GetValue<Boolean>('hasAudio', False);
-      Info.AudioCodec := TAudioCodec(Obj.GetValue<Integer>('acodec', 0));
-      Info.SampleRate := Obj.GetValue<Integer>('rate', 0);
-      Info.Channels := Obj.GetValue<Integer>('ch', 0);
-      if (Info.StartMs <= 0) or (Info.EndMs <= Info.StartMs) then Continue;
-
-      Key := KeyOf(Info.Path);
-      FLock.Enter;
-      try
-        if not FFiles.TryGetValue(Key, Entry) then
-        begin
-          Entry := TCachedFile.Create;
-          FFiles.Add(Key, Entry);
+        Chave := KeyOf(Info.Path);
+        FLock.Enter;
+        try
+          if not FFiles.TryGetValue(Chave, Entry) then
+          begin
+            Entry := TCachedFile.Create;
+            FFiles.Add(Chave, Entry);
+          end;
+          Entry.Info := Info;
+          Entry.StampSize := Row.AsInt64('stamp_size');
+          Entry.StampWriteMs := Row.AsInt64('stamp_mtime_ms');
+        finally
+          FLock.Leave;
         end;
-        Entry.Info := Info;
-        Entry.StampSize := Obj.GetValue<Int64>('size', -1);
-        Entry.StampWriteMs := Obj.GetValue<Int64>('mtime', -1);
-      finally
-        FLock.Leave;
-      end;
-    end;
+      end);
   except
-    // json torto não pode derrubar a listagem: sem ele, relê os arquivos
+    on E: Exception do
+      // Consulta que falha nao pode derrubar a listagem: sem o resumo, releem-se
+      // os arquivos, que e o comportamento de quem nunca teve cache.
+      Log(llDebug, 'inventario nao pode ser lido do banco: ' + E.Message);
   end;
-  Root.Free;
 end;
 
+// Grava na tabela `recording` o que se sabe das gravacoes FECHADAS. Substitui a
+// reescrita do _index.json.
+//
+// Uma linha por arquivo, por Post (assincrono): quem chama isto e a varredura
+// da listagem, e ela nao pode parar para esperar disco. O ON CONFLICT deixa
+// reexecutar sem duplicar.
 procedure TVmsIndexCache.SaveDiskCache(const Camera: string);
 var
-  Root, Obj: TJSONObject;
-  Arr: TJSONArray;
   Pair: TPair<string, TCachedFile>;
-  Dir, Tmp, Final: string;
+  Pasta: string;
+  Copias: TArray<TCachedFile>;
+  Carimbos: TArray<TPair<Int64, Int64>>;
+  N, I: Integer;
 begin
-  Root := TJSONObject.Create;
-  Arr := TJSONArray.Create;
-  Root.AddPair('version', TJSONNumber.Create(DISK_CACHE_VERSION));
-  Root.AddPair('files', Arr);
+  if (FDb = nil) or (not FDb.IsOpen) then Exit;
+  Pasta := ExtractFileName(ExcludeTrailingPathDelimiter(
+             CameraDir(FStorageDir, Camera)));
+
+  // Copia sob o lock e grava fora dele: manter a secao critica presa durante
+  // dezenas de Post seguraria toda a API, que tambem consulta este cache.
+  SetLength(Copias, 0);
+  SetLength(Carimbos, 0);
   FLock.Enter;
   try
+    N := 0;
+    SetLength(Copias, FFiles.Count);
+    SetLength(Carimbos, FFiles.Count);
     for Pair in FFiles do
     begin
-      // Só gravação fechada: a que ainda grava muda de resumo a cada minuto, e
-      // guardá-la faria o json ser reescrito o tempo todo para nada.
+      // So gravacao fechada: a que ainda grava muda de resumo a cada minuto.
       if not Pair.Value.Info.Closed then Continue;
-      if not SameText(Pair.Value.Info.Camera,
-                      ExtractFileName(ExcludeTrailingPathDelimiter(
-                        CameraDir(FStorageDir, Camera)))) then Continue;
+      if not SameText(Pair.Value.Info.Camera, Pasta) then Continue;
       if Pair.Value.StampSize <= 0 then Continue;
-      // Apagada pela retenção: sai do json em vez de ficar engordando um cache
-      // de arquivos que não existem mais.
-      if not TFile.Exists(Pair.Value.Info.Path) then Continue;
-      Obj := TJSONObject.Create;
-      Obj.AddPair('name', Pair.Value.Info.Name);
-      Obj.AddPair('size', TJSONNumber.Create(Pair.Value.StampSize));
-      Obj.AddPair('mtime', TJSONNumber.Create(Pair.Value.StampWriteMs));
-      Obj.AddPair('startMs', TJSONNumber.Create(Pair.Value.Info.StartMs));
-      Obj.AddPair('endMs', TJSONNumber.Create(Pair.Value.Info.EndMs));
-      Obj.AddPair('bytes', TJSONNumber.Create(Pair.Value.Info.Bytes));
-      Obj.AddPair('blocks', TJSONNumber.Create(Pair.Value.Info.Blocks));
-      Obj.AddPair('hasVideo', TJSONBool.Create(Pair.Value.Info.HasVideo));
-      Obj.AddPair('vcodec', TJSONNumber.Create(Ord(Pair.Value.Info.VideoCodec)));
-      Obj.AddPair('w', TJSONNumber.Create(Pair.Value.Info.Width));
-      Obj.AddPair('h', TJSONNumber.Create(Pair.Value.Info.Height));
-      Obj.AddPair('hasAudio', TJSONBool.Create(Pair.Value.Info.HasAudio));
-      Obj.AddPair('acodec', TJSONNumber.Create(Ord(Pair.Value.Info.AudioCodec)));
-      Obj.AddPair('rate', TJSONNumber.Create(Pair.Value.Info.SampleRate));
-      Obj.AddPair('ch', TJSONNumber.Create(Pair.Value.Info.Channels));
-      Arr.AddElement(Obj);
+      Copias[N] := Pair.Value;
+      Carimbos[N] := TPair<Int64, Int64>.Create(Pair.Value.StampSize,
+                                                Pair.Value.StampWriteMs);
+      Inc(N);
     end;
+    SetLength(Copias, N);
+    SetLength(Carimbos, N);
   finally
     FLock.Leave;
   end;
 
-  Final := DiskCachePath(Camera);
-  Tmp := Final + '.tmp';
+  for I := 0 to High(Copias) do
+  begin
+    // Apagada pela retencao: nao entra. A linha velha sai na limpeza abaixo.
+    if not TFile.Exists(Copias[I].Info.Path) then Continue;
+    FDb.Post(
+      'INSERT INTO recording (camera_id, name, start_ms, end_ms, duration_ms, ' +
+      '    bytes, blocks, closed, indexed, has_video, video_codec, width, ' +
+      '    height, has_audio, audio_codec, sample_rate, channels, ' +
+      '    stamp_size, stamp_mtime_ms) ' +
+      '  VALUES ((SELECT id FROM camera WHERE name = ?), ?, ?, ?, ?, ?, ?, 1, 1, ' +
+      '          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+      '  ON CONFLICT(camera_id, name) DO UPDATE SET ' +
+      '    start_ms = excluded.start_ms, end_ms = excluded.end_ms, ' +
+      '    duration_ms = excluded.duration_ms, bytes = excluded.bytes, ' +
+      '    blocks = excluded.blocks, closed = 1, indexed = 1, ' +
+      '    has_video = excluded.has_video, video_codec = excluded.video_codec, ' +
+      '    width = excluded.width, height = excluded.height, ' +
+      '    has_audio = excluded.has_audio, audio_codec = excluded.audio_codec, ' +
+      '    sample_rate = excluded.sample_rate, channels = excluded.channels, ' +
+      '    stamp_size = excluded.stamp_size, ' +
+      '    stamp_mtime_ms = excluded.stamp_mtime_ms',
+      [Camera, Copias[I].Info.Name, Copias[I].Info.StartMs, Copias[I].Info.EndMs,
+       Copias[I].Info.DurationMs, Copias[I].Info.Bytes, Copias[I].Info.Blocks,
+       Copias[I].Info.HasVideo, Ord(Copias[I].Info.VideoCodec),
+       Copias[I].Info.Width, Copias[I].Info.Height,
+       Copias[I].Info.HasAudio, Ord(Copias[I].Info.AudioCodec),
+       Int64(Copias[I].Info.SampleRate), Copias[I].Info.Channels,
+       Carimbos[I].Key, Carimbos[I].Value]);
+  end;
+end;
+
+// Tira do inventario as linhas cujo .vms nao existe mais. Chamada pela
+// retencao, depois de apagar os arquivos.
+function TVmsIndexCache.ForgetMissing(const Camera: string): Integer;
+var
+  Sumidos: TArray<string>;
+  I: Integer;
+begin
+  Result := 0;
+  if (FDb = nil) or (not FDb.IsOpen) then Exit;
+  SetLength(Sumidos, 0);
   try
-    Dir := ExtractFilePath(Final);
-    if not TDirectory.Exists(Dir) then Exit;
-    // Grava fora do lugar e move por cima: quem estiver lendo o json vê a versão
-    // velha inteira ou a nova inteira, nunca meia.
-    TFile.WriteAllText(Tmp, Root.ToJSON, TEncoding.UTF8);
-    if TFile.Exists(Final) then TFile.Delete(Final);
-    TFile.Move(Tmp, Final);
+    FDb.Read(
+      'SELECT r.name FROM recording r JOIN camera c ON c.id = r.camera_id ' +
+      ' WHERE c.name = ?', [Camera],
+      procedure(const Row: IDbRow)
+      begin
+        SetLength(Sumidos, Length(Sumidos) + 1);
+        Sumidos[High(Sumidos)] := Row.AsString('name');
+      end);
+    for I := 0 to High(Sumidos) do
+      if not TFile.Exists(TPath.Combine(CameraDir(FStorageDir, Camera), Sumidos[I])) then
+      begin
+        FDb.Post('DELETE FROM recording WHERE name = ? AND camera_id = ' +
+                 '(SELECT id FROM camera WHERE name = ?)', [Sumidos[I], Camera]);
+        Inc(Result);
+      end;
   except
     on E: Exception do
-      Log(llDebug, Format('nao deu para gravar %s: %s', [DISK_CACHE_NAME, E.Message]));
+      Log(llDebug, 'limpeza do inventario falhou: ' + E.Message);
   end;
-  Root.Free;
 end;
 
 function TVmsIndexCache.GetInfo(const Path: string; out Info: TVmsFileInfo): Boolean;

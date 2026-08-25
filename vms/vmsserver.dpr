@@ -90,6 +90,7 @@ uses
   Vms.Server.Api in 'src\Api\Vms.Server.Api.pas',
   Vms.Server.RecSink in 'src\Recording\Vms.Server.RecSink.pas',
   Vms.Server.Logger in 'src\App\Vms.Server.Logger.pas',
+  Vms.Server.LoggerDb in 'src\App\Vms.Server.LoggerDb.pas',
   Vms.Server.Retention in 'src\App\Vms.Server.Retention.pas',
   Vms.Server.Repair in 'src\App\Vms.Server.Repair.pas',
   Vms.Thumb.Intf in 'src\Thumbs\Vms.Thumb.Intf.pas',
@@ -122,6 +123,13 @@ uses
   Vms.Analytics.Onnx in 'src\Analytics\Vms.Analytics.Onnx.pas',
   Vms.Analytics.Analyzer in 'src\Analytics\Vms.Analytics.Analyzer.pas',
   Vms.Analytics.Worker in 'src\Analytics\Vms.Analytics.Worker.pas',
+  // ---- banco: uma thread dona da conexao, as outras enfileiram ----
+  Vms.Db.Intf in 'src\Db\Vms.Db.Intf.pas',
+  Vms.Db.Schema.Sql in 'src\Db\Vms.Db.Schema.Sql.pas',
+  Vms.Db.Queue in 'src\Db\Vms.Db.Queue.pas',
+  Vms.Db.Schema in 'src\Db\Vms.Db.Schema.pas',
+  Vms.Db.Config in 'src\Db\Vms.Db.Config.pas',
+  Vms.Analytics.StoreDb in 'src\Analytics\Vms.Analytics.StoreDb.pas',
   Vms.Server.Config in 'src\App\Vms.Server.Config.pas',
   Vms.Server.Composition in 'src\App\Vms.Server.Composition.pas';
 
@@ -183,8 +191,13 @@ var
   Thumbs: IThumbSource;
   AnalyticsCfg: TAnalyticsConfig;
   Analytics: TAnalyticsRig;
+  Db: IDbQueue;
   CameraNames: TArray<string>;
   Logger: ILogger;
+  // Console. Comeca sozinho (antes de o banco existir, nao ha onde mais
+  // escrever) e depois vira a metade "console" do TSqliteLogger.
+  Boot: ILogger;
+  DbCfg: TDbConfig;
   Clock: IClock;
   Supervisors: TAppSupervisorList;
   Listener: TTxServerListener;
@@ -205,9 +218,54 @@ begin
     Cfg.Free;
   end;
 
-  // um arquivo de log por câmera (+ o geral), gravando todos os níveis
-  Logger := TPerCameraLogger.Create(App.LogDir, App.Cameras);
   Clock := BuildClock;
+
+  // O banco precisa subir ANTES do logger, porque agora é dele que sai a
+  // configuração — inclusive o logDir e a lista de câmeras que o logger usa.
+  // Até aqui só existe console: o TPerCameraLogger ainda não tem como saber
+  // onde gravar.
+  Boot := TConsoleLogger.Create;
+  // Lugar fixo, ao lado do executavel: o caminho do banco nao pode morar na
+  // configuracao que esta dentro dele.
+  Db := TDbQueue.Create(DefaultDbPath);
+  EnsureSchema(Db, Clock, Boot);
+
+  // Uma vez, e só uma: o que estava no vmsserver.json vai para as tabelas.
+  // Marcado em db_meta; o arquivo NÃO é renomeado, porque ele continua sendo
+  // quem guarda o dbPath — que por definição não pode morar dentro do banco
+  // que ele localiza.
+  if not ConfigImported(Db) then
+    ImportConfig(Db, App, RtspPort, BindAddress, Retention, LiveCfg, ApiCfg,
+                 AnalyticsCfg, Clock, Boot);
+
+  // Daqui em diante a verdade é o banco. Editar o json não muda mais nada
+  // exceto o caminho do próprio banco.
+  DbCfg := TDbConfig.Create(Db, Boot);
+  try
+    DbCfg.Load;
+    App := DbCfg.Config;
+    RtspPort := DbCfg.RtspPort;
+    BindAddress := DbCfg.BindAddress;
+    Retention := DbCfg.Retention;
+    LiveCfg := DbCfg.Live;
+    ApiCfg := DbCfg.Api;
+    AnalyticsCfg := DbCfg.Analytics;
+  finally
+    DbCfg.Free;
+  end;
+
+  // Câmera acrescentada depois precisa da LINHA em `camera`, senão os eventos e
+  // o inventário dela caem na chave estrangeira e não gravam — em silêncio, no
+  // log de emergência da fila. Barato o bastante para rodar toda subida.
+  EnsureCameras(Db, App.Cameras, Clock);
+
+  // O log vai para a tabela `log`, e sai no console ao mesmo tempo. Nada é
+  // descartado por nível: `level` é coluna, nunca filtro (ver LoggerDb).
+  //
+  // O `logDir` da configuração deixa de ser usado; fica lá porque o
+  // TPerCameraLogger continua no repositório, e voltar a ele é trocar esta
+  // linha por `TPerCameraLogger.Create(App.LogDir, App.Cameras)`.
+  Logger := TSqliteLogger.Create(Db, Clock, Boot);
 
   StorageDir := ExpandFileName(App.StorageDir);
   if not DirectoryExists(StorageDir) then
@@ -223,6 +281,8 @@ begin
   if ApiCfg.Enabled and (BindAddress = '') then
     Logger.Warn('main', 'API sem autenticacao escutando em todas as interfaces: ' +
       'quem alcanca esta porta baixa gravacao. Use bindAddress para limitar ao tailnet.');
+
+  Logger.Info('main', 'Banco: ' + DescribeDb(Db));
 
   // Uma varredura antes de começar a gravar: se o disco já está no limite, é
   // agora que se abre espaço, não cinco minutos depois.
@@ -257,12 +317,12 @@ begin
     Analytics := Default(TAnalyticsRig);
     if ApiCfg.Enabled then
     begin
-      Cache := TVmsIndexCache.Create(StorageDir, Logger);
-      Thumbs := BuildThumbSource(StorageDir, Cache, THUMB_W, THUMB_H, Logger);
+      Cache := TVmsIndexCache.Create(StorageDir, Db, Logger);
+      Thumbs := BuildThumbSource(Cache, THUMB_W, THUMB_H, Logger);
       // A análise depende do MESMO cache de índices das miniaturas — é ele que
       // faz achar o keyframe de um instante custar uma busca binária. Por isso
       // ela sobe junto com a API, e não antes.
-      Analytics := BuildAnalytics(AnalyticsCfg, StorageDir, CameraNames, Cache,
+      Analytics := BuildAnalytics(AnalyticsCfg, Db, CameraNames, Cache,
                                   Clock, Logger, GStopEvent);
       Api := TApiRouter.Create(ApiCfg, CameraNames, Cache, Hub, Thumbs,
                                Analytics.Events, Logger);
@@ -281,6 +341,14 @@ begin
           Sweeper := TRetentionThread.Create(StorageDir, Retention, Logger, GStopEvent);
           Sweeper.Start;
         end;
+
+        // Log e evento tambem envelhecem. Sem isto a tabela cresce para sempre,
+        // que e o unico jeito de um log em banco ficar pior que um em arquivo.
+        // Uma passada na subida; a periodica entra quando a retencao souber do
+        // banco (ver docs/banco-de-dados.md).
+        if (Retention.Enabled) and (Retention.MaxDays > 0) then
+          Logger.Info('main', Format('Banco: %d linha(s) de log antiga(s) apagada(s)',
+            [PruneLog(Db, Clock.NowUtcMs - Int64(Retention.MaxDays) * 86400000)]));
 
         // loop=False: modo ao vivo nunca reinicia a gravação do começo. Com o
         // hub, o /live/ sai da memória; sem ele (ou com a câmera fora do ar), do
@@ -327,6 +395,15 @@ begin
     end;
   finally
     Hub.Free;
+  end;
+  // Solta a interface: o destrutor drena a fila, fecha o lote aberto, roda o
+  // PRAGMA optimize e fecha a conexao.
+  if Db <> nil then
+  begin
+    if Db.Pending > 0 then
+      Logger.Info('main', Format('Banco: %d escrita(s) na fila ao fechar',
+        [Db.Pending]));
+    Db := nil;
   end;
   Logger.Info('main', 'Parado.');
 end;

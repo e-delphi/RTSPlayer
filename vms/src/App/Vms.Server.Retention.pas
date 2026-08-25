@@ -399,7 +399,9 @@ begin
   // miniatura de dia anterior a ele não tem mais vídeo por baixo.
   if (Sobrou > 0) and (Res.Deleted > 0) then
   begin
-    PruneThumbs(Dir, Sobrou, Logger);
+    // O cache nao esta em Dir: ele mora ao lado do executavel (ver
+    // Vms.Thumb.Cache). Podar Dir aqui nao acharia miniatura nenhuma.
+    PruneThumbs(DefaultCacheDir, Sobrou, Logger);
     PruneEvents(Dir, Sobrou, Logger);
   end;
   Result := Res;

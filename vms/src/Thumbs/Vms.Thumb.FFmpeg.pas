@@ -40,11 +40,25 @@ type
   TFFmpegFrameGrabber = class(TInterfacedObject, IFrameGrabber)
   strict private
     FLogger: ILogger;
+    FTag: string;
     FProbed: Boolean;
     FAvail: Boolean;
     procedure Log(const Msg: string);
   public
-    constructor Create(const ALogger: ILogger);
+    // ATag so separa quem esta decodificando no log: a mesma classe serve as
+    // miniaturas e a analise, e 'analytics' logando como 'thumb' e confusao na
+    // hora de ler o arquivo.
+    //
+    // NOTA sobre quadro corrompido: quando o bitstream tem erro, o FFmpeg
+    // REMENDA os macroblocos ruins e devolve o quadro assim mesmo, e aqui isso
+    // vira `Result := True`. Para miniatura esta certo — imagem com um
+    // retangulo sujo ainda diz que horas eram. Para a ANALISE nao: o detector
+    // de movimento compara luma celula a celula, e macrobloco remendado muda de
+    // nivel e vira "mexeu". Recusar exigiria `err_detect = AV_EF_EXPLODE`, que
+    // nesta versao do h264 tambem torna fatal o "Invalid NAL unit 0" — ou seja,
+    // podia derrubar quadros bons junto. Antes de ligar isso, ver a contagem de
+    // falhas que o TAnalyticsWorker agora escreve no log.
+    constructor Create(const ALogger: ILogger; const ATag: string = 'thumb');
     { IFrameGrabber }
     function Decode(const AU, Extra: TBytes; Codec: TVideoCodec;
                     MaxW, MaxH: Integer; out Img: TRgbImage): Boolean;
@@ -112,10 +126,13 @@ begin
   end;
 end;
 
-constructor TFFmpegFrameGrabber.Create(const ALogger: ILogger);
+constructor TFFmpegFrameGrabber.Create(const ALogger: ILogger;
+  const ATag: string);
 begin
   inherited Create;
   FLogger := ALogger;
+  FTag := ATag;
+  if FTag = '' then FTag := 'thumb';
   FProbed := False;
   FAvail := False;
 end;
@@ -123,7 +140,7 @@ end;
 procedure TFFmpegFrameGrabber.Log(const Msg: string);
 begin
   if FLogger <> nil then
-    FLogger.Info('thumb', Msg);
+    FLogger.Info(FTag, Msg);
 end;
 
 // As DLLs são de carga adiada: a primeira chamada é o que descobre se elas
@@ -137,10 +154,20 @@ begin
   except
     FAvail := False;
   end;
+  // Cala o log do PROPRIO FFmpeg. Ele escreve direto no stderr, fora do log do
+  // servidor, e fala um macrobloco por vez: analisar seis horas de gravacao de
+  // tres cameras vira dezenas de milhares de linhas que enterram o log de
+  // verdade. O que interessa saber — quantos quadros nao decodificaram e em que
+  // trecho — passa a sair no log do servidor, contado, em vez de despejado.
   if FAvail then
-    Log('FFmpeg disponivel; miniaturas ligadas')
+  begin
+    try av_log_set_level(AV_LOG_FATAL); except end;
+    Log('FFmpeg disponivel; da para decodificar video');
+  end
   else
-    Log('FFmpeg ausente; a barra do app fica sem miniaturas');
+    // Sem decodificador a barra do app fica sem miniatura e a analise nem sobe.
+    // Quem diz o que cada um faz com isso e a composicao, nao esta classe.
+    Log('FFmpeg ausente; nao ha como decodificar video nesta maquina');
   Result := FAvail;
 end;
 

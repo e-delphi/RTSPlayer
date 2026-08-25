@@ -1,4 +1,4 @@
-unit Vms.Thumb.Cache;
+﻿unit Vms.Thumb.Cache;
 
 // O cache de miniaturas em disco. Sabe de pastas e arquivos, e de mais nada:
 // não conhece codec, nem `.vms`, nem HTTP.
@@ -6,7 +6,7 @@ unit Vms.Thumb.Cache;
 // Layout, uma pasta por dia para o diretório não virar um despejo de 1.440
 // arquivos por dia acumulados para sempre:
 //
-//   <storage>/<câmera>/thumbs/2026-08-22/1437.jpg
+//   <pasta do executável>/cache/<câmera>/thumbs/2026-08-22/1437.jpg
 //
 // A chave é o MINUTO: toda consulta dentro do mesmo minuto cai no mesmo
 // arquivo. Um minuto é o passo que o player usa para preencher a barra, e é
@@ -15,6 +15,12 @@ unit Vms.Thumb.Cache;
 //
 // O minuto é contado no fuso LOCAL, porque o nome da pasta e do arquivo existem
 // para alguém conseguir olhar o diretório e entender o que está vendo.
+//
+// A raiz é FIXA, ao lado do executável, e não configurável nem dentro do
+// storageDir. São coisas de naturezas diferentes: gravação é o dado, e vai para
+// o disco grande que o usuário escolheu; miniatura é cache descartável, some
+// sem consequência e é regenerada. Misturar as duas fazia a pasta de gravações
+// carregar peso que ninguém precisa mover num backup.
 
 interface
 
@@ -24,6 +30,9 @@ uses
   System.DateUtils,
   System.Classes,
   VMS.Rec.Paths;
+
+// <pasta do executável>\cache — a raiz de tudo o que é descartável.
+function DefaultCacheDir: string;
 
 type
   TThumbDiskCache = class
@@ -49,7 +58,13 @@ implementation
 
 const
   THUMBS_DIR = 'thumbs';
+  CACHE_DIR = 'cache';
   ONE_MINUTE_MS = Int64(60000);
+
+function DefaultCacheDir: string;
+begin
+  Result := TPath.Combine(ExtractFilePath(ParamStr(0)), CACHE_DIR);
+end;
 
 constructor TThumbDiskCache.Create(const AStorageDir: string);
 begin

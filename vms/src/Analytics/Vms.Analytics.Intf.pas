@@ -91,6 +91,23 @@ type
     function Available: Boolean;
   end;
 
+  // Ate onde a analise ja chegou em cada camera.
+  //
+  // Fronteira propria, e nao um metodo do IEventStore, porque sao perguntas
+  // diferentes: o store guarda o QUE aconteceu, isto guarda ATE ONDE se olhou.
+  // Separadas, o worker deixa de depender da classe concreta do store — que era
+  // a unica coisa impedindo trocar arquivo por banco sem tocar nele.
+  IAnalysisProgress = interface
+    ['{4E1A7B93-6C25-4F08-BD37-9A5C0E2F81D4}']
+    // 0 = nunca rodou. Model e o modelo configurado AGORA: se o progresso
+    // gravado veio de outro, ele nao vale e a resposta e 0 — trocar o .onnx
+    // sem reanalisar deixava horas vistas pelo modelo velho passando por
+    // analisadas, e ninguem percebia.
+    function ReadProgress(const Camera, Model: string): Int64;
+    procedure WriteProgress(const Camera: string; AnalyzedToMs, Frames,
+                            Failures: Int64; const Model: string);
+  end;
+
   // Um quadro decodificado, com hora. O que o worker entrega ao analisador.
   IFrameAnalyzer = interface
     ['{0B4E7C29-6A13-4F85-9D2C-7E3A1B5F8C60}']

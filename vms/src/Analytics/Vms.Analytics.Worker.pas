@@ -44,8 +44,7 @@ uses
   Vms.Server.IndexCache,
   Vms.Thumb.Intf,
   Vms.Analytics.Types,
-  Vms.Analytics.Intf,
-  Vms.Analytics.Store;
+  Vms.Analytics.Intf;
 
 type
   TAnalyticsWorker = class(TThread)
@@ -54,7 +53,13 @@ type
     FKeyframes: IKeyframeSource;
     FGrabber: IFrameGrabber;
     FAnalyzer: IFrameAnalyzer;
-    FStore: TEventFileStore;
+    // Interface, e nao a classe: e o que permitiu trocar arquivo por banco sem
+    // tocar em nada aqui dentro.
+    FProgress: IAnalysisProgress;
+    // Nome do modelo em vigor (so o arquivo, sem o caminho — mudar a pasta nao
+    // pode invalidar o progresso). Vai junto do progresso para que trocar de
+    // modelo faca a analise recomecar sozinha.
+    FModel: string;
     FCache: TVmsIndexCache;
     FClock: IClock;
     FLogger: ILogger;
@@ -63,6 +68,8 @@ type
     FAtMs: Int64;          // proximo instante a pedir
     FLastFrameMs: Int64;   // instante do ultimo quadro que de fato foi analisado
     FFrames: Int64;
+    FFalhas: Int64;        // quadros que nao decodificaram
+    FFalhasLote: Integer;
     FSalvoEmMs: Int64;     // progresso ja gravado
     function StartPoint: Int64;
     function FirstRecordedMs: Int64;
@@ -76,7 +83,7 @@ type
   public
     constructor Create(const ACamera: string; const AKeyframes: IKeyframeSource;
                        const AGrabber: IFrameGrabber; const AAnalyzer: IFrameAnalyzer;
-                       AStore: TEventFileStore; ACache: TVmsIndexCache;
+                       const AProgress: IAnalysisProgress; ACache: TVmsIndexCache;
                        const ACfg: TAnalyticsConfig; const AClock: IClock;
                        const ALogger: ILogger; AStop: TEvent);
   end;
@@ -108,7 +115,7 @@ end;
 
 constructor TAnalyticsWorker.Create(const ACamera: string;
   const AKeyframes: IKeyframeSource; const AGrabber: IFrameGrabber;
-  const AAnalyzer: IFrameAnalyzer; AStore: TEventFileStore;
+  const AAnalyzer: IFrameAnalyzer; const AProgress: IAnalysisProgress;
   ACache: TVmsIndexCache; const ACfg: TAnalyticsConfig; const AClock: IClock;
   const ALogger: ILogger; AStop: TEvent);
 begin
@@ -119,9 +126,10 @@ begin
   FKeyframes := AKeyframes;
   FGrabber := AGrabber;
   FAnalyzer := AAnalyzer;
-  FStore := AStore;
+  FProgress := AProgress;
   FCache := ACache;
   FCfg := ACfg;
+  FModel := ExtractFileName(ACfg.ModelPath);
   FClock := AClock;
   FLogger := ALogger;
   FStop := AStop;
@@ -153,7 +161,7 @@ function TAnalyticsWorker.StartPoint: Int64;
 var
   Salvo, Primeiro, Limite: Int64;
 begin
-  Salvo := FStore.ReadProgress(FCamera);
+  Salvo := FProgress.ReadProgress(FCamera, FModel);
   Primeiro := FirstRecordedMs;
   if Primeiro = 0 then
     Primeiro := FClock.NowUtcMs;
@@ -179,7 +187,7 @@ end;
 procedure TAnalyticsWorker.SaveProgress;
 begin
   if FAtMs <= FSalvoEmMs then Exit;
-  FStore.WriteProgress(FCamera, FAtMs);
+  FProgress.WriteProgress(FCamera, FAtMs, FFrames, FFalhas, FModel);
   FSalvoEmMs := FAtMs;
 end;
 
@@ -226,6 +234,15 @@ begin
   begin
     FAnalyzer.Feed(ActualMs, Img);
     Inc(FFrames);
+  end
+  else
+  begin
+    // Nao e excecao: keyframe truncado por perda de pacote no UDP, ou
+    // parameter set do header que nao descreve o que a camera transmitiu. O
+    // passo segue; o que nao pode e o quadro entrar na analise como se
+    // estivesse bom. Contado, e nao logado um a um: sao milhares por vez.
+    Inc(FFalhas);
+    Inc(FFalhasLote);
   end;
 
   FLastFrameMs := ActualMs;
@@ -291,15 +308,22 @@ begin
       FAnalyzer.Flush;
       SaveProgress;
       if NoLote > 0 then
-        Log(Format('%d quadros analisados; ate %s', [NoLote,
-          FormatDateTime('dd/mm hh:nn:ss', HoraLocal(FAtMs))]));
+        if FFalhasLote > 0 then
+          Log(Format('%d quadros analisados (%d nao decodificaram); ate %s',
+            [NoLote, FFalhasLote,
+             FormatDateTime('dd/mm hh:nn:ss', HoraLocal(FAtMs))]))
+        else
+          Log(Format('%d quadros analisados; ate %s', [NoLote,
+            FormatDateTime('dd/mm hh:nn:ss', HoraLocal(FAtMs))]));
+      FFalhasLote := 0;
 
       if FStop.WaitFor(IDLE_MS) = wrSignaled then Break;
     end;
 
     FAnalyzer.Flush;
     SaveProgress;
-    Log(Format('parou; %d quadros analisados nesta subida', [FFrames]));
+    Log(Format('parou; %d quadros analisados nesta subida, %d descartados ' +
+      'por nao decodificarem', [FFrames, FFalhas]));
   except
     on E: Exception do
       if FLogger <> nil then

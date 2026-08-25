@@ -154,6 +154,7 @@ begin
     FAnalytics.ObjectMinIntervalMs := GetJsonInt(Obj, 'objectIntervalMs', 5000);
     FAnalytics.ObjectThreshold := GetJsonDouble(Obj, 'objectThreshold', 0.35);
     FAnalytics.MergeGapMs := GetJsonInt(Obj, 'mergeGapMs', 8000);
+    FAnalytics.MaxEventMs := GetJsonInt(Obj, 'maxEventMs', 300000);
     FAnalytics.BackfillMs := Int64(GetJsonInt(Obj, 'backfillHours', 6)) * 3600 * 1000;
     FAnalytics.LagMs := GetJsonInt(Obj, 'lagMs', 30000);
     FAnalytics.ModelPath := Trim(GetJsonStr(Obj, 'modelPath', ''));

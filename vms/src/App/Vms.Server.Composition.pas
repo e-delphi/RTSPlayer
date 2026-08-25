@@ -36,9 +36,9 @@ uses
   VMS.App.Composition,
   Vms.Server.IndexCache,   // TVmsIndexCache, que a fonte de miniaturas consulta
   Vms.Thumb.Intf,          // IThumbSource, o que esta unit devolve
+  Vms.Db.Intf,             // IDbQueue: o banco entra por interface, so
   Vms.Analytics.Types,
   Vms.Analytics.Intf,      // IEventSource, o que a rota /api/events enxerga
-  Vms.Analytics.Store,
   Vms.Analytics.Worker,
   Vms.Server.LiveHub;
 
@@ -48,7 +48,9 @@ function IsDvripUrl(const Url: string): Boolean;
 // concretas aparecem: quem acha o keyframe, quem decodifica, quem encoda e onde
 // guardar. Sem FFmpeg na máquina, devolve a fonte nula, e nada acima disto muda
 // de comportamento.
-function BuildThumbSource(const StorageDir: string; Cache: TVmsIndexCache;
+// StorageDir nao entra mais: as miniaturas moram em DefaultCacheDir, ao lado
+// do executavel. Ver o cabecalho do Vms.Thumb.Cache.
+function BuildThumbSource(Cache: TVmsIndexCache;
                           ThumbWidth, ThumbHeight: Integer;
                           const Logger: ILogger): IThumbSource;
 
@@ -59,7 +61,6 @@ type
   // resultado da montagem, e quem o recebe só guarda e libera.
   TAnalyticsRig = record
     Events: IEventSource;
-    Store: TEventFileStore;
     Workers: TArray<TAnalyticsWorker>;
     procedure Stop;
     // Não se chama Free: quem chama isto é um registro, não um objeto, e a
@@ -76,7 +77,7 @@ type
 // são exatamente as mesmas interfaces. Sem FFmpeg na máquina não há como
 // decodificar quadro nenhum, e aí a análise nem sobe — com um aviso, porque
 // nesse caso o usuário pediu algo que não vai acontecer.
-function BuildAnalytics(const Cfg: TAnalyticsConfig; const StorageDir: string;
+function BuildAnalytics(const Cfg: TAnalyticsConfig; const Db: IDbQueue;
                         const Cameras: TArray<string>; Cache: TVmsIndexCache;
                         const Clock: IClock; const Logger: ILogger;
                         Stop: TEvent): TAnalyticsRig;
@@ -96,6 +97,7 @@ uses
   Vms.Thumb.Service,
   Vms.Analytics.Motion,
   Vms.Analytics.Analyzer,
+  Vms.Analytics.StoreDb,
 {$IFDEF MSWINDOWS}
   Vms.Thumb.FFmpeg,
   Vms.Thumb.JpegVcl,
@@ -103,7 +105,7 @@ uses
 {$ENDIF}
   Vms.Server.RecSink;
 
-function BuildThumbSource(const StorageDir: string; Cache: TVmsIndexCache;
+function BuildThumbSource(Cache: TVmsIndexCache;
   ThumbWidth, ThumbHeight: Integer; const Logger: ILogger): IThumbSource;
 {$IFDEF MSWINDOWS}
 var
@@ -119,7 +121,7 @@ begin
     Exit(TThumbService.Create(TVmsKeyframeSource.Create(Cache, Logger),
                               Grabber,
                               TVclJpegEncoder.Create,
-                              TThumbDiskCache.Create(StorageDir),
+                              TThumbDiskCache.Create(DefaultCacheDir),
                               ThumbWidth, ThumbHeight, Logger));
 {$ENDIF}
   Result := TNullThumbSource.Create;
@@ -147,10 +149,8 @@ begin
   for I := 0 to High(Workers) do
     Workers[I].Free;
   Workers := nil;
-  // A interface primeiro: é ela que aponta para o mesmo objeto do Store, e
-  // liberar o objeto com a interface ainda viva deixaria um ponteiro morto.
+  // Depois dos workers: são eles que seguram o analisador, que segura o store.
   Events := nil;
-  Store := nil;
 end;
 
 // Metade dos núcleos, no mínimo 1. A outra metade é da gravação, que é o
@@ -163,26 +163,31 @@ begin
   if Result < 1 then Result := 1;
 end;
 
-function BuildAnalytics(const Cfg: TAnalyticsConfig; const StorageDir: string;
+function BuildAnalytics(const Cfg: TAnalyticsConfig; const Db: IDbQueue;
   const Cameras: TArray<string>; Cache: TVmsIndexCache; const Clock: IClock;
   const Logger: ILogger; Stop: TEvent): TAnalyticsRig;
 var
   Grabber: IFrameGrabber;
   Keyframes: IKeyframeSource;
   Objetos: IObjectDetector;
-  Store: TEventFileStore;
+  Store: TSqliteEventStore;
   Analyzer: IFrameAnalyzer;
   I: Integer;
 begin
   Result.Events := nil;
-  Result.Store := nil;
   Result.Workers := nil;
   if not Cfg.Enabled then Exit;
   if Length(Cameras) = 0 then Exit;
+  if (Db = nil) or (not Db.IsOpen) then
+  begin
+    Logger.Warn('analytics', 'ligada na config, mas o banco nao esta aberto. ' +
+      'A analise nao vai subir.');
+    Exit;
+  end;
 
   Grabber := nil;
 {$IFDEF MSWINDOWS}
-  Grabber := TFFmpegFrameGrabber.Create(Logger);
+  Grabber := TFFmpegFrameGrabber.Create(Logger, 'analytics');
 {$ENDIF}
   // Sem decodificador não há quadro para analisar, e nenhuma parte do resto
   // adiantaria. É diferente do modelo ausente, que só desliga metade.
@@ -204,9 +209,12 @@ begin
   if (Objetos = nil) or (not Objetos.Available) then
     Objetos := TNullObjectDetector.Create;
 
-  Store := TEventFileStore.Create(StorageDir, Logger);
-  Result.Store := Store;
-  Result.Events := Store;   // o mesmo objeto pelas duas interfaces
+  // O mesmo objeto pelas TRÊS interfaces: escreve evento (IEventStore), a API
+  // consulta (IEventSource) e o worker guarda o progresso (IAnalysisProgress).
+  Store := TSqliteEventStore.Create(Db, Clock, Cfg.MaxEventMs, Logger);
+  // Primeira referencia de interface: a partir daqui a contagem e dona do
+  // objeto, e ele morre junto com o rig.
+  Result.Events := Store;
   Keyframes := TVmsKeyframeSource.Create(Cache, Logger);
 
   Logger.Info('analytics', Cfg.Describe);
@@ -224,6 +232,7 @@ begin
       Objetos, Store, Cfg, Logger);
     Result.Workers[I] := TAnalyticsWorker.Create(Cameras[I], Keyframes, Grabber,
       Analyzer, Store, Cache, Cfg, Clock, Logger, Stop);
+    // (Store entra como IAnalysisProgress; a conversão é implícita.)
   end;
 end;
 
