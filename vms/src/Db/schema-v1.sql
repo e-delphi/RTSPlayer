@@ -272,6 +272,9 @@ INSERT OR IGNORE INTO setting (key, value, updated_at_ms) VALUES
   ('retention.maxTotalGB',         '0',           0),
   ('retention.minFreeGB',          '20',          0),
   ('retention.intervalMinutes',    '5',           0),
+  -- Idade do LOG, separada da idade da gravacao: quem guarda video ate o
+  -- disco encher (maxDays 0) ainda quer o log parando de crescer.
+  ('retention.logDays',            '7',           0),
 
   ('live.enabled',                 '1',           0),
   ('live.bufferMs',                '4000',        0),
@@ -282,8 +285,8 @@ INSERT OR IGNORE INTO setting (key, value, updated_at_ms) VALUES
 
   ('analytics.enabled',            '0',           0),
   ('analytics.stepMs',             '2000',        0),
-  ('analytics.motionThreshold',    '0.012',       0),
-  ('analytics.sceneChangeThreshold','0.55',       0),
+  ('analytics.motionThreshold',    '0.006',       0),
+  ('analytics.sceneChangeThreshold','0.85',       0),
   ('analytics.mergeGapMs',         '8000',        0),
   -- novo: teto de duracao de um evento. Fecha e comeca outro ao passar
   -- disto. Serve a dois donos — da piso a consulta por janela e impede
@@ -294,6 +297,9 @@ INSERT OR IGNORE INTO setting (key, value, updated_at_ms) VALUES
   ('analytics.modelPath',          '',            0),
   ('analytics.onnxDll',            'onnxruntime.dll', 0),
   ('analytics.objectIntervalMs',   '5000',        0),
+  -- A rede tambem roda sem movimento, de minuto em minuto: quem entra no
+  -- quadro e para de se mexer e absorvido pelo fundo em ~20 s.
+  ('analytics.objectIdleIntervalMs','60000',      0),
   ('analytics.objectThreshold',    '0.35',        0),
   -- lista separada por virgula; vazio = todos os rotulos do modelo
   ('analytics.classes',            '',            0);

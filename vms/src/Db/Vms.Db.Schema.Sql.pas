@@ -26,7 +26,7 @@ uses
   System.Classes;
 
 const
-  LINHAS: array[0..172] of string = (
+  LINHAS: array[0..176] of string = (
     'PRAGMA foreign_keys = ON;',
     '',
     'CREATE TABLE db_meta (',
@@ -176,6 +176,8 @@ const
     '  (''retention.minFreeGB'',          ''20'',          0),',
     '  (''retention.intervalMinutes'',    ''5'',           0),',
     '',
+    '  (''retention.logDays'',            ''7'',           0),',
+    '',
     '  (''live.enabled'',                 ''1'',           0),',
     '  (''live.bufferMs'',                ''4000'',        0),',
     '  (''live.maxBufferMB'',             ''32'',          0),',
@@ -185,8 +187,8 @@ const
     '',
     '  (''analytics.enabled'',            ''0'',           0),',
     '  (''analytics.stepMs'',             ''2000'',        0),',
-    '  (''analytics.motionThreshold'',    ''0.012'',       0),',
-    '  (''analytics.sceneChangeThreshold'',''0.55'',       0),',
+    '  (''analytics.motionThreshold'',    ''0.006'',       0),',
+    '  (''analytics.sceneChangeThreshold'',''0.85'',       0),',
     '  (''analytics.mergeGapMs'',         ''8000'',        0),',
     '',
     '  (''analytics.maxEventMs'',         ''300000'',      0),',
@@ -195,6 +197,8 @@ const
     '  (''analytics.modelPath'',          '''',            0),',
     '  (''analytics.onnxDll'',            ''onnxruntime.dll'', 0),',
     '  (''analytics.objectIntervalMs'',   ''5000'',        0),',
+    '',
+    '  (''analytics.objectIdleIntervalMs'',''60000'',      0),',
     '  (''analytics.objectThreshold'',    ''0.35'',        0),',
     '',
     '  (''analytics.classes'',            '''',            0);',

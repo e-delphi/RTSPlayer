@@ -326,7 +326,13 @@ begin
       Analytics := BuildAnalytics(AnalyticsCfg, Db, CameraNames, Cache,
                                   Clock, Logger, GStopEvent);
       Api := TApiRouter.Create(ApiCfg, CameraNames, Cache, Hub, Thumbs,
-                               Analytics.Events, Logger);
+                               Analytics.Events, Db, Logger);
+      // Nao e o mesmo aviso da API: aquele fala de baixar gravacao, este fala
+      // de SQL livre. Quem alcanca esta porta le camera_endpoint.password, que
+      // guarda as senhas das cameras em texto, e pode apagar qualquer tabela.
+      Logger.Warn('main', 'ROTA /api/sql ATIVA E SEM AUTENTICACAO: quem alcanca ' +
+        'esta porta le e altera o banco inteiro, senhas de camera incluidas. ' +
+        'Use bindAddress para limitar ao tailnet.');
     end
     else if AnalyticsCfg.Enabled then
       Logger.Warn('main', 'analise ligada mas API desligada: os eventos seriam ' +
@@ -339,17 +345,12 @@ begin
 
         if Retention.Enabled then
         begin
-          Sweeper := TRetentionThread.Create(StorageDir, Retention, Logger, GStopEvent);
+          // O banco vai junto: a mesma varredura que apaga .vms antigo agora
+          // poda a tabela de log, que cresce ~65 mil linhas por dia.
+          Sweeper := TRetentionThread.Create(StorageDir, Retention, Logger,
+                                             GStopEvent, Db);
           Sweeper.Start;
         end;
-
-        // Log e evento tambem envelhecem. Sem isto a tabela cresce para sempre,
-        // que e o unico jeito de um log em banco ficar pior que um em arquivo.
-        // Uma passada na subida; a periodica entra quando a retencao souber do
-        // banco (ver docs/banco-de-dados.md).
-        if (Retention.Enabled) and (Retention.MaxDays > 0) then
-          Logger.Info('main', Format('Banco: %d linha(s) de log antiga(s) apagada(s)',
-            [PruneLog(Db, Clock.NowUtcMs - Int64(Retention.MaxDays) * 86400000)]));
 
         // loop=False: modo ao vivo nunca reinicia a gravação do começo. Com o
         // hub, o /live/ sai da memória; sem ele (ou com a câmera fora do ar), do

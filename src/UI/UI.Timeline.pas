@@ -29,6 +29,7 @@ uses
   System.Types,
   System.UITypes,
   System.DateUtils,
+  System.Math,
   FMX.Types,
   FMX.Controls,
   FMX.Objects,
@@ -75,6 +76,15 @@ type
     FLblPool: TArray<TLabel>;
     FLblUsed: Integer;
     FWheelX: Single;   // último X sob o ponteiro: a roda não traz posição
+    // Distância entre os dedos no quadro anterior da pinça. 0 = sem pinça.
+    FPinchDist: Single;
+    // A segunda linha da barra de controles. Só existe quando tudo não cabe
+    // numa linha só — ver LayoutRows.
+    FRowHost: TLayout;
+    FRow2: TLayout;
+    FBtnLive: TLabel;
+    FDuasLinhas: Boolean;      // estado atual, para não refazer a cada Resize
+    FEmLayout: Boolean;        // guarda de reentrada: mexer na altura reentra
     FPanActive: Boolean;
     FPanMoved: Boolean;
     FPanStartX: Single;
@@ -89,6 +99,8 @@ type
     FLblEventos: TLabel;
     function XToMs(X: Single): Int64;
     function MsToX(Ms: Int64): Single;
+    // Sem grampo: o X pode sair negativo, ou passar da direita.
+    function MsToXRaw(Ms: Int64): Single;
     function ViewSpanMs: Int64;
     procedure PanToStart(NewStartMs: Int64);
     // Um controle da reserva, criando mais um só quando a reserva acaba.
@@ -108,6 +120,12 @@ type
     procedure TrackMouseMove(Sender: TObject; Shift: TShiftState; X, Y: Single);
     procedure TrackMouseWheel(Sender: TObject; Shift: TShiftState;
                               WheelDelta: Integer; var Handled: Boolean);
+    // Põe 'ao vivo' e 'eventos' na segunda linha quando a primeira não cabe.
+    procedure LayoutRows;
+    // Pinça: no Android é ela que faz o papel da roda do mouse.
+    procedure TrackGesture(Sender: TObject; const EventInfo: TGestureEventInfo;
+                           var Handled: Boolean);
+
     // Troca o nível de zoom mantendo parado o instante que está sob AtX.
     procedure ZoomAtX(NewZoom: Integer; AtX: Single);
     procedure TrackMouseUp(Sender: TObject; Button: TMouseButton;
@@ -129,6 +147,12 @@ type
     function MakeTextButton(AParent: TFmxObject; AWidth: Single; AAlign: TAlignLayout;
                             const AText: string; AColor: TAlphaColor;
                             AOnClick: TNotifyEvent): TLabel;
+    // MakeTextButton devolve o TLabel de DENTRO do botão. Quem precisa mexer no
+    // BOTÃO — posição, visibilidade, largura — tem de subir um nível, e
+    // `Parent` é TFmxObject, que não tem nenhuma dessas propriedades. Foi por
+    // esquecer isso que esconder o "zoom" só apagou o texto e deixou o
+    // retângulo ocupando lugar.
+    function BotaoDe(L: TLabel): TControl;
   protected
     procedure Resize; override;
   public
@@ -144,6 +168,11 @@ type
     // outra tela fosse aberta.
     procedure ThumbsArrived;
     procedure SetDay(DayStartMs, DayEndMs: Int64; const Segments: TArray<TApiSegment>);
+    // Só troca as faixas e redesenha. NÃO mexe no zoom, na janela visível nem
+    // na posição — é o que se chama quando as faixas são rebuscadas enquanto o
+    // dia continua sendo gravado, e reenquadrar ali desfaria o zoom do usuário
+    // a cada atualização.
+    procedure SetSegments(const Segments: TArray<TApiSegment>);
     // O que a análise do servidor viu neste dia. Vazio = a faixa de eventos
     // simplesmente não aparece, e a barra fica como sempre foi.
     procedure SetEvents(const Events: TArray<TApiEvent>);
@@ -184,6 +213,9 @@ const
   // Largura de cada miniatura. Nenhuma outra é desenhada mais perto que isto:
   // é o que faz o zoom decidir quantas cabem, sem nenhuma conta a mais.
   THUMB_W = 86;
+  // Abaixo disto a sobra no fim da gravação vira uma tira fina que não mostra
+  // nada; melhor não desenhar.
+  THUMB_MIN_W = 16;
   // Maior velocidade do ciclo do botão. O engine aceita até isto (SetSpeed).
   MAX_SPEED = 64;
   // marca cheia (6) + rótulo: apertar mais corta o texto embaixo
@@ -196,9 +228,21 @@ const
   ZOOM_SPANS: array[0..4] of Int64 =
     (0, 4 * ONE_HOUR_MS, ONE_HOUR_MS, 15 * ONE_MIN_MS, 3 * ONE_MIN_MS);
   ZOOM_NAMES: array[0..4] of string = ('dia', '4h', '1h', '15min', '3min');
+  // Onde a barra abre. Uma hora mostra o suficiente em volta do instante para
+  // se localizar, sem virar um risco de poucos pixels como no zoom "dia".
+  ZOOM_INICIAL = 2;
   // Abaixo disto o arrasto é toque, não navegação: dedo em tela nunca fica
   // parado de verdade.
   DRAG_THRESHOLD_PX = 6;
+  // Altura de cada linha de controles.
+  ROW_HEIGHT = 44;
+  // O que a primeira linha precisa para caber inteira: play 46 + velocidade 46
+  // + zoom 40/52/40 + relógio 92 + 'ao vivo' 96 + 'eventos' 96, e uma folga.
+  UMA_LINHA_W = 520;
+  // Quanto os dedos precisam se afastar (ou juntar) para valer um degrau de
+  // zoom. O zoom da barra é discreto — são cinco níveis —, então a pinça
+  // acumula até cruzar isto e então dá UM passo, reancorando em seguida.
+  PINCH_STEP = 1.35;
   // Espaço mínimo entre dois rótulos de horário para não virarem uma mancha.
   MIN_LABEL_PX = 64;
   // Idem para as marcas sem rótulo: abaixo disso somem em vez de virar um risco
@@ -228,6 +272,13 @@ begin
   Result.HitTest := True;
 end;
 
+function TFrameTimeline.BotaoDe(L: TLabel): TControl;
+begin
+  Result := nil;
+  if (L <> nil) and (L.Parent is TControl) then
+    Result := TControl(L.Parent);
+end;
+
 function TFrameTimeline.MakeTextButton(AParent: TFmxObject; AWidth: Single;
   AAlign: TAlignLayout; const AText: string; AColor: TAlphaColor;
   AOnClick: TNotifyEvent): TLabel;
@@ -254,10 +305,12 @@ var
 begin
   inherited Create(AOwner);
   Name := '';
-  Height := BAR_HEIGHT + 12 + RULER_HEIGHT + 44;
+  // Começa em uma linha; o primeiro Resize decide se precisa da segunda.
+  Height := BAR_HEIGHT + 12 + RULER_HEIGHT + ROW_HEIGHT;
+  FDuasLinhas := False;
   FSpeed := 1.0;
   FPlaying := True;
-  FZoom := 0;
+  FZoom := ZOOM_INICIAL;
   FFollow := True;
 
   // hospedeiro de cima: a barra e, logo abaixo dela, a régua de horários
@@ -285,6 +338,11 @@ begin
   FTrack.YRadius := 4;
   FTrack.Fill.Color := COLOR_SURFACE2;
   FTrack.Stroke.Kind := TBrushKind.None;
+  // Recorta o que passa das bordas. A miniatura que COMEÇA antes da janela é
+  // desenhada com X negativo de propósito (é o pedaço que ainda aparece); sem
+  // recorte ela era pintada FORA da barra, encostada na margem esquerda, e
+  // parecia uma miniatura parada enquanto as outras rolavam.
+  FTrack.ClipChildren := True;
   FTrack.HitTest := True;
   // Sem isto o arrasto trava "segurando": o FMX só entrega MouseMove/MouseUp
   // enquanto o ponteiro está SOBRE o controle, então soltar o dedo (ou o mouse)
@@ -302,6 +360,9 @@ begin
   FTrack.OnMouseMove := TrackMouseMove;
   FTrack.OnMouseUp := TrackMouseUp;
   FTrack.OnMouseWheel := TrackMouseWheel;
+  FTrack.OnGesture := TrackGesture;
+  // Sem isto o Android não entrega a pinça a este controle.
+  FTrack.Touch.InteractiveGestures := [TInteractiveGesture.Zoom];
 
   FCursor := TRectangle.Create(Self);
   FCursor.Parent := FTrack;
@@ -312,13 +373,37 @@ begin
   FCursor.Fill.Color := COLOR_TEXT;
   FCursor.Stroke.Kind := TBrushKind.None;
 
-  // hospedeiro de baixo: os controles
-  FRow := TLayout.Create(Self);
-  FRow.Parent := Self;
-  FRow.Align := TAlignLayout.Bottom;
-  FRow.Height := 44;
+  // Hospedeiro de baixo: DUAS linhas de controles.
+  //
+  // As duas moram dentro de um layout só, alinhadas ao topo DELE e com Y
+  // explícito. Dois irmãos Align=Bottom seriam ordenados por
+  // `(Top + Height) >= ...` — posição, não ordem de criação —, e a ordem entre
+  // eles ficaria à mercê de quando o realinhamento roda. Com Y explícito não
+  // há empate. (Ver InsertBefore em FMX.Types.AlignObjects.)
+  FRowHost := TLayout.Create(Self);
+  FRowHost.Parent := Self;
+  FRowHost.Align := TAlignLayout.Bottom;
+  FRowHost.Height := ROW_HEIGHT;
 
+  FRow := TLayout.Create(Self);
+  FRow.Parent := FRowHost;
+  FRow.Align := TAlignLayout.Top;
+  FRow.Position.Y := 0;
+  FRow.Height := ROW_HEIGHT;
+
+  FRow2 := TLayout.Create(Self);
+  FRow2.Parent := FRowHost;
+  FRow2.Align := TAlignLayout.Top;
+  FRow2.Position.Y := ROW_HEIGHT;
+  FRow2.Height := ROW_HEIGHT;
+  FRow2.Visible := False;
+
+  // X explícito em toda a linha: Align=Left é ordenado por `C1.Left < C2.Left`
+  // e todo controle nasce em X = 0, ou seja, todos empatados. Hoje sai na ordem
+  // certa só porque a barra é montada uma vez; qualquer remontagem embaralharia,
+  // como já aconteceu na lista de dias.
   BtnPlay := MakeButton(FRow, 46, TAlignLayout.Left);
+  BtnPlay.Position.X := 0;
   BtnPlay.OnClick := PlayClick;
   FPathPlay := TPath.Create(Self);
   FPathPlay.Parent := BtnPlay;
@@ -332,9 +417,11 @@ begin
   FPathPlay.Data.Data := ICON_PAUSE;
 
   FLblSpeed := MakeTextButton(FRow, 46, TAlignLayout.Left, '1x', COLOR_TEXT, SpeedClick);
+  BotaoDe(FLblSpeed).Position.X := 46;
 
   // zoom: menos abre a janela, mais fecha. O rótulo no meio diz onde se está.
-  MakeTextButton(FRow, 40, TAlignLayout.Left, '-', COLOR_TEXT, ZoomOutClick);
+  BotaoDe(MakeTextButton(FRow, 40, TAlignLayout.Left, '-', COLOR_TEXT,
+                         ZoomOutClick)).Position.X := 92;
   FLblZoom := TLabel.Create(Self);
   FLblZoom.Parent := FRow;
   FLblZoom.Align := TAlignLayout.Left;
@@ -346,15 +433,24 @@ begin
   FLblZoom.TextSettings.HorzAlign := TTextAlign.Center;
   FLblZoom.TextSettings.VertAlign := TTextAlign.Center;
   FLblZoom.Text := ZOOM_NAMES[0];
-  MakeTextButton(FRow, 40, TAlignLayout.Left, '+', COLOR_TEXT, ZoomInClick);
+  FLblZoom.Position.X := 132;
+  BotaoDe(MakeTextButton(FRow, 40, TAlignLayout.Left, '+', COLOR_TEXT,
+                         ZoomInClick)).Position.X := 184;
 
-  MakeTextButton(FRow, 84, TAlignLayout.Right, 'ao vivo', STAT_GREEN, LiveClick);
+  // --- segunda linha ---
+  // X explícito pelo mesmo motivo do Y das linhas: Align=Left é ordenado por
+  // `C1.Left < C2.Left`, e dois controles nascendo em X = 0 empatam.
+  FBtnLive := MakeTextButton(FRow, 96, TAlignLayout.Right, 'ao vivo', STAT_GREEN, LiveClick);
+  BotaoDe(FBtnLive).Position.X := 9000;
 
   // Só aparece quando o servidor tem análise: quem liga isto é o formulário, ao
   // descobrir na resposta de /api/cameras (ver SetHasEvents).
-  FLblEventos := MakeTextButton(FRow, 76, TAlignLayout.Right, 'eventos',
+  FLblEventos := MakeTextButton(FRow, 96, TAlignLayout.Right, 'eventos',
                                 COLOR_DIM, EventsClick);
-  FLblEventos.Visible := False;
+  BotaoDe(FLblEventos).Position.X := 10000;
+  // Visible no BOTÃO, não no rótulo: esconder só o rótulo deixaria o retângulo
+  // ocupando lugar — foi exatamente o defeito da tentativa anterior.
+  BotaoDe(FLblEventos).Visible := False;
 
   FLblTime := TLabel.Create(Self);
   FLblTime.Parent := FRow;
@@ -387,11 +483,26 @@ begin
   Result := FViewStartMs + Round(ViewSpanMs * Frac);
 end;
 
+// GRAMPEADO na janela visível. É o que as faixas de gravação e as marcas de
+// evento querem: um trecho que começou ontem tem de ser desenhado a partir da
+// borda esquerda, e não fora dela.
 function TFrameTimeline.MsToX(Ms: Int64): Single;
 begin
   if ViewSpanMs <= 0 then Exit(0);
   if Ms < FViewStartMs then Ms := FViewStartMs;
   if Ms > FViewEndMs then Ms := FViewEndMs;
+  Result := FTrack.Width * ((Ms - FViewStartMs) / ViewSpanMs);
+end;
+
+// SEM grampo. É o que as MINIATURAS querem, e a diferença não é sutil: a
+// primeira miniatura de cada vista começa, por construção, um passo ANTES da
+// borda esquerda (o passo é ancorado na meia-noite). Grampeada, ela ficava
+// exatamente em X = 0 — parada, encostada na esquerda, enquanto todas as outras
+// rolavam. Com o X verdadeiro ela desliza para fora, e o ClipChildren da barra
+// corta o que sobra.
+function TFrameTimeline.MsToXRaw(Ms: Int64): Single;
+begin
+  if ViewSpanMs <= 0 then Exit(0);
   Result := FTrack.Width * ((Ms - FViewStartMs) / ViewSpanMs);
 end;
 
@@ -452,14 +563,16 @@ begin
   if FPositionMs > FDayEndMs then FPositionMs := FDayEndMs;
   CenterOn := FPositionMs;
 
-  // Zoom inicial que ENQUADRA o gravado. Vinte minutos num dia de 24 h dariam um
-  // risco de poucos pixels no zoom "dia" — quem abre o histórico quer ver o que
-  // existe, não o vazio em volta. A partir daí o - e o + mandam.
+  // Abre em UMA HORA. É a janela em que se enxerga o entorno do instante sem
+  // precisar de zoom, e é onde as miniaturas ainda cabem lado a lado.
+  //
+  // Só abre mais fechado se o gravado do dia for MENOR que uma hora: aí mostrar
+  // uma hora seria mostrar o vazio em volta de um risco de poucos pixels.
   if Length(Segments) > 0 then
   begin
     Covered := Segments[High(Segments)].EndMs - Segments[0].StartMs;
-    FZoom := 0;
-    for I := High(ZOOM_SPANS) downto 1 do
+    FZoom := ZOOM_INICIAL;
+    for I := High(ZOOM_SPANS) downto ZOOM_INICIAL + 1 do
       if ZOOM_SPANS[I] >= Covered then
         FZoom := I;
     // Centra onde a reprodução está, quando ela cai dentro do gravado — que é o
@@ -480,6 +593,12 @@ begin
   UpdateZoomLabel;
 end;
 
+procedure TFrameTimeline.SetSegments(const Segments: TArray<TApiSegment>);
+begin
+  FSegments := Segments;
+  RedrawTrack;
+end;
+
 procedure TFrameTimeline.SetEvents(const Events: TArray<TApiEvent>);
 begin
   FEvents := Events;
@@ -488,8 +607,9 @@ end;
 
 procedure TFrameTimeline.SetHasEvents(Value: Boolean);
 begin
-  if FLblEventos <> nil then
-    FLblEventos.Visible := Value and Assigned(FOnEvents);
+  // No BOTÃO (o pai), e não no rótulo: ver o comentário na criação.
+  if BotaoDe(FLblEventos) <> nil then
+    BotaoDe(FLblEventos).Visible := Value and Assigned(FOnEvents);
 end;
 
 // De quanto em quanto tempo marcar a régua, para os rótulos ficarem legíveis em
@@ -725,8 +845,8 @@ end;
 // de THUMB_W, e mais perto no tempo elas ficam.
 procedure TFrameTimeline.RedrawThumbs;
 var
-  Span, PassoMs, T, PrimeiroMs: Int64;
-  W: Single;
+  Span, PassoMs, T, PrimeiroMs, GravadoDe, GravadoAte: Int64;
+  W, X, Cabe, FimX: Single;
   Img: TImage;
   Bmp: TBitmap;
   Faltando: Integer;
@@ -748,19 +868,47 @@ begin
   PrimeiroMs := FDayStartMs +
     ((FViewStartMs - FDayStartMs) div PassoMs) * PassoMs;
 
+  // A tira de miniaturas não pode passar do que existe gravado — nem começar
+  // antes. Uma miniatura tem largura FIXA (THUMB_W); colada no último minuto
+  // gravado, ela avançava para a direita do fim da barra azul e dava a
+  // entender que havia mais vídeo ali. Com o fim conhecido, a última é cortada
+  // exatamente onde a gravação termina.
+  if Length(FSegments) > 0 then
+  begin
+    GravadoDe := FSegments[0].StartMs;
+    GravadoAte := FSegments[High(FSegments)].EndMs;
+  end
+  else
+  begin
+    GravadoDe := FDayStartMs;
+    GravadoAte := FDayEndMs;
+  end;
+  FimX := MsToXRaw(GravadoAte);
+
   Faltando := 0;
   T := PrimeiroMs;
   while T <= FViewEndMs do
   begin
-    if T >= FDayStartMs then
+    // Fora do que foi gravado não há o que mostrar, e mostrar seria mentir.
+    if (T >= GravadoDe) and (T < GravadoAte) then
       if FThumbs.TryGet(T, Bmp) then
       begin
-        Img := TakeThumb;
-        Img.Bitmap := Bmp;
-        Img.Position.X := MsToX(T);
-        Img.Position.Y := 0;
-        Img.Width := THUMB_W;
-        Img.Height := FTrack.Height - SEG_HEIGHT;
+        X := MsToXRaw(T);
+        // O que sobra até o fim da gravação. Encolher a última em vez de
+        // escondê-la: some a borda que passava do azul, e ainda se vê o que
+        // há no trecho final.
+        Cabe := FimX - X;
+        if Cabe > THUMB_W then Cabe := THUMB_W;
+        // Sobrou uma fatia fina demais para representar coisa alguma.
+        if Cabe >= THUMB_MIN_W then
+        begin
+          Img := TakeThumb;
+          Img.Bitmap := Bmp;
+          Img.Position.X := X;
+          Img.Position.Y := 0;
+          Img.Width := Cabe;
+          Img.Height := FTrack.Height - SEG_HEIGHT;
+        end;
       end
       else if Faltando < 24 then
       begin
@@ -869,10 +1017,120 @@ end;
 procedure TFrameTimeline.Resize;
 begin
   inherited;
+  LayoutRows;
   // A largura da barra mudou: faixas e régua estão em pixels e precisam ser
   // recalculadas a partir do tempo.
   RedrawTrack;
   UpdateCursor;
+end;
+
+// Uma linha quando cabe, duas quando não cabe.
+//
+// A barra completa pede ~520 px. No desktop isso é trivial; num celular em pé
+// (~360 dp) os botões da direita saíam da tela — inalcançáveis. Em vez de
+// encolher ou esconder controle, 'ao vivo' e 'eventos' descem para uma segunda
+// linha. O custo vertical é nenhum na prática: a proporção da câmera já deixa
+// margem preta acima e abaixo do vídeo.
+//
+// O X é reposto nas duas direções porque Align=Left ordena por `C1.Left`, e um
+// controle que veio da outra linha traz a posição de lá.
+procedure TFrameTimeline.LayoutRows;
+var
+  Cabe: Boolean;
+  BtnLive, BtnEventos: TControl;
+begin
+  if (FRowHost = nil) or (FRow = nil) or (FRow2 = nil) or FEmLayout then Exit;
+  BtnLive := BotaoDe(FBtnLive);
+  BtnEventos := BotaoDe(FLblEventos);
+  if (BtnLive = nil) or (BtnEventos = nil) then Exit;
+
+  Cabe := Width >= UMA_LINHA_W;
+  // Nada mudou: sair cedo evita reparentar a cada Resize, que custaria um
+  // realinhamento inteiro por quadro de animação.
+  if Cabe = (not FDuasLinhas) then Exit;
+
+  FEmLayout := True;
+  try
+    FDuasLinhas := not Cabe;
+    if Cabe then
+    begin
+      BtnLive.Parent := FRow;
+      BtnEventos.Parent := FRow;
+      BtnLive.Align := TAlignLayout.Right;
+      BtnEventos.Align := TAlignLayout.Right;
+      // Align=Right ordena por `(Left + Width) >= ...`: o maior fica primeiro,
+      // ou seja, mais à direita. 'eventos' encosta na borda, 'ao vivo' antes.
+      BtnEventos.Position.X := 10000;
+      BtnLive.Position.X := 9000;
+      FRow2.Visible := False;
+      FRowHost.Height := ROW_HEIGHT;
+    end
+    else
+    begin
+      BtnLive.Parent := FRow2;
+      BtnEventos.Parent := FRow2;
+      BtnLive.Align := TAlignLayout.Left;
+      BtnEventos.Align := TAlignLayout.Left;
+      BtnLive.Position.X := 0;
+      BtnEventos.Position.X := 96;
+      FRow2.Visible := True;
+      FRowHost.Height := ROW_HEIGHT * 2;
+    end;
+    Height := BAR_HEIGHT + 12 + RULER_HEIGHT + FRowHost.Height;
+  finally
+    FEmLayout := False;
+  end;
+end;
+
+// A pinça faz, no toque, o que a roda do mouse faz no desktop.
+//
+// O zoom daqui é DISCRETO (cinco níveis em ZOOM_SPANS), então não dá para
+// seguir a razão entre os dedos continuamente. A razão acumula desde o último
+// degrau e, ao cruzar PINCH_STEP, dá um passo e reancora — o gesto fica
+// previsível em vez de disparar cinco níveis num movimento só.
+procedure TFrameTimeline.TrackGesture(Sender: TObject;
+  const EventInfo: TGestureEventInfo; var Handled: Boolean);
+var
+  P: TPointF;
+  Razao: Single;
+begin
+  if EventInfo.GestureID <> igiZoom then Exit;
+
+  if TInteractiveGestureFlag.gfBegin in EventInfo.Flags then
+  begin
+    FPinchDist := EventInfo.Distance;
+    // Os dois dedos também geram evento de mouse: sem encerrar o arrasto aqui,
+    // a barra navegaria no tempo enquanto se amplia.
+    EndPan;
+    Handled := True;
+    Exit;
+  end;
+
+  if TInteractiveGestureFlag.gfEnd in EventInfo.Flags then
+  begin
+    FPinchDist := 0;
+    EndPan;
+    Handled := True;
+    Exit;
+  end;
+
+  if (FPinchDist > 0) and (EventInfo.Distance > 0) then
+  begin
+    P := FTrack.ScreenToLocal(EventInfo.Location);
+    Razao := EventInfo.Distance / FPinchDist;
+    // Afastar os dedos aproxima o tempo (janela menor), que é o índice maior.
+    if Razao >= PINCH_STEP then
+    begin
+      ZoomAtX(FZoom + 1, P.X);
+      FPinchDist := EventInfo.Distance;
+    end
+    else if Razao <= 1 / PINCH_STEP then
+    begin
+      ZoomAtX(FZoom - 1, P.X);
+      FPinchDist := EventInfo.Distance;
+    end;
+  end;
+  Handled := True;
 end;
 
 procedure TFrameTimeline.UpdateCursor;
@@ -1039,6 +1297,9 @@ var
   DeltaMs: Int64;
 begin
   FWheelX := X;
+  // Pinça em andamento: os dois dedos também geram evento de mouse, e deixar o
+  // arrasto correr junto faria a barra navegar no tempo enquanto se amplia.
+  if FPinchDist > 0 then Exit;
   if not FPanActive then Exit;
   // O botão já está solto e o MouseUp nunca chegou — a captura se perdeu no
   // caminho (ver AutoCapture, na construção). Sem esta saída a barra continua

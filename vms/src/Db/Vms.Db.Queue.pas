@@ -47,6 +47,7 @@ uses
   FireDAC.Phys.SQLite,
   FireDAC.Phys.SQLiteDef,
   FireDAC.Stan.Def,
+  FireDAC.Stan.Intf,       // dtInt32/dtInt64, da regra de mapeamento abaixo
   FireDAC.Stan.Option,
   FireDAC.DApt,
   FireDAC.Stan.Async,
@@ -92,6 +93,8 @@ type
     public
       constructor Create(AQuery: TFDQuery);
       procedure Invalidate;    // depois do Read: uso posterior falha alto
+      function ColumnCount: Integer;
+      function ColumnName(Index: Integer): string;
       function IsNull(const Name: string): Boolean;
       function AsInt64(const Name: string): Int64;
       function AsInt(const Name: string): Integer;
@@ -225,6 +228,30 @@ begin
     Result.ResourceOptions.MacroExpand := False;
     Result.ResourceOptions.EscapeExpand := False;
     Result.UpdateOptions.LockWait := True;
+
+    // INTEGER do SQLite tem de chegar como 64 BITS.
+    //
+    // O SQLite guarda inteiro de 64 bits e nao declara largura; o FireDAC, sem
+    // essa informacao, mapeia a coluna declarada `INTEGER` para 32 bits. Todo
+    // instante unix em milissegundos (13 digitos) chegava TRUNCADO:
+    //
+    //     gravado   1787715972042
+    //     lido      1009576906     (= o gravado mod 2^32)
+    //
+    // Silencioso e destrutivo. Foi o que fazia o analysis_progress voltar para
+    // um valor menor que a gravacao mais antiga, e ai o StartPoint reanalisava
+    // TUDO a cada reinicio, para sempre. Atingia igualmente start_ms/end_ms de
+    // event e recording — qualquer Int64 lido pela IDbRow.
+    //
+    // Mapear todo Int32 para Int64 e seguro: as colunas pequenas (0/1, largura,
+    // codec) cabem de sobra, e nenhuma conta depende de estourar em 32 bits.
+    Result.FormatOptions.OwnMapRules := True;
+    with Result.FormatOptions.MapRules.Add do
+    begin
+      SourceDataType := dtInt32;
+      TargetDataType := dtInt64;
+    end;
+
     Result.Open;
   except
     Result.Free;
@@ -279,6 +306,19 @@ begin
     raise EDbError.CreateFmt('coluna "%s" nao existe no resultado', [Name]);
 end;
 
+function TDbQueue.TFdRow.ColumnCount: Integer;
+begin
+  if FQuery = nil then Exit(0);
+  Result := FQuery.Fields.Count;
+end;
+
+function TDbQueue.TFdRow.ColumnName(Index: Integer): string;
+begin
+  if (FQuery = nil) or (Index < 0) or (Index >= FQuery.Fields.Count) then
+    Exit('');
+  Result := FQuery.Fields[Index].FieldName;
+end;
+
 function TDbQueue.TFdRow.IsNull(const Name: string): Boolean;
 begin
   Result := Field(Name).IsNull;
@@ -326,6 +366,14 @@ var
 begin
   F := Field(Name);
   if F.IsNull then Exit('');
+  // Ponto flutuante sai com PONTO, sempre. TField.AsString usa o separador
+  // decimal da MAQUINA: numa configurada em pt-BR, o JSON da API saia com
+  // "0,65", que nenhum consumidor consegue ler como numero. Nao e so a rota
+  // /api/sql — vale para qualquer lugar que leia um REAL como texto.
+  case F.DataType of
+    ftFloat, ftSingle, ftExtended, ftCurrency, ftBCD, ftFMTBcd:
+      Exit(FloatToStr(F.AsFloat, TFormatSettings.Invariant));
+  end;
   Result := F.AsString;
 end;
 

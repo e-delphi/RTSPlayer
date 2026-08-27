@@ -221,6 +221,23 @@ begin
   // O rectPlaceholder (tela preta de "sem vídeo") fica acima da camada, e é ele
   // que recebe o toque enquanto não há imagem — que é o que já acontecia antes.
   FGesture.SendToBack;
+
+  // O vídeo passa a ser FILHO da área de vídeo, e não irmão dela.
+  //
+  // Como irmão, ele era posicionado em coordenadas do frame inteiro
+  // (FGesture.Position + deslocamento) e nada o impedia de invadir o vizinho:
+  // bastavam limites velhos — a barra do tempo aparecendo, a janela sendo
+  // restaurada — para o vídeo ficar pintado POR CIMA da linha do tempo, ao
+  // vivo, até o próximo redimensionamento recalcular tudo. Era também por isso
+  // que a barra "só atualizava depois de um resize": ela estava lá embaixo, e o
+  // que se via era o vídeo cobrindo-a.
+  //
+  // Como filho, o recorte do pai resolve por construção: por mais errado que o
+  // retângulo esteja, ele não sai da área de vídeo. E a conta fica mais simples,
+  // porque o deslocamento já é em coordenadas locais do FGesture — que é o
+  // mesmo sistema em que o gesto e o arrasto chegam.
+  imgVideo.Parent := FGesture;
+  FGesture.ClipChildren := True;
   imgVideo.SendToBack;
   // Ampliado, o vídeo desenha além do retângulo dele. Sem recorte isso vazaria
   // para fora do frame.
@@ -263,8 +280,10 @@ begin
   if FOffY > 0 then FOffY := 0;
   if FOffY < MinY then FOffY := MinY;
 
-  imgVideo.SetBounds(FGesture.Position.X + FOffX, FGesture.Position.Y + FOffY,
-                     W0 * FZoom, H0 * FZoom);
+  // Coordenadas LOCAIS do FGesture: o vídeo é filho dele (ver CreateGestureLayer),
+  // e é nesse mesmo sistema que FOffX/FOffY são calculados pelo gesto e pelo
+  // arrasto. Somar FGesture.Position aqui seria contar a origem duas vezes.
+  imgVideo.SetBounds(FOffX, FOffY, W0 * FZoom, H0 * FZoom);
 end;
 
 procedure TFramePlayer.ZoomAt(NewZoom, SX, SY: Single);
@@ -386,6 +405,23 @@ begin
   if TInteractiveGestureFlag.gfEnd in EventInfo.Flags then
   begin
     FPinchDist := 0;
+    // REBASE do arrasto, e é o que conserta o vídeo saltando para 0,0.
+    //
+    // Os dois dedos também geram evento de mouse. Enquanto a pinça corre, o
+    // VideoMouseMove sai cedo (FPinchDist > 0) e não mexe em nada — mas o
+    // toque nunca deixou de estar "pressionado", e FVStartOffX/FVStartX ainda
+    // guardam o estado de ANTES da pinça. Bastava um MouseMove chegar depois
+    // do gfEnd para ele calcular
+    //
+    //     FOffX := FVStartOffX + (X - FVStartX)
+    //
+    // com a origem velha e jogar fora tudo o que a pinça enquadrou — a imagem
+    // pulava para o canto. Reancorando aqui, o arrasto que continuar (o dedo
+    // que ficou na tela) segue de onde a pinça parou, em vez de desfazê-la.
+    FVStartOffX := FOffX;
+    FVStartOffY := FOffY;
+    FVStartX := FVLastX;
+    FVStartY := FVLastY;
     Handled := True;
     Exit;
   end;

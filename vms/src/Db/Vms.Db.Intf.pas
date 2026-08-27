@@ -51,6 +51,11 @@ type
   // que ela le e o cursor, que ja terá andado.
   IDbRow = interface
     ['{7B3F1C48-2E95-4A60-9D71-4C8E0A5B3F62}']
+    // Quais colunas vieram. So quem NAO escreveu o SELECT precisa disto — a
+    // rota /api/sql, que recebe a consulta pronta de fora. Quem escreve o SQL
+    // ja sabe os nomes e usa os acessores por nome, que sao mais legiveis.
+    function ColumnCount: Integer;
+    function ColumnName(Index: Integer): string;
     function IsNull(const Name: string): Boolean;
     function AsInt64(const Name: string): Int64;
     function AsInt(const Name: string): Integer;

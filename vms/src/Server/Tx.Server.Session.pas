@@ -382,7 +382,8 @@ begin
     SendApiResponse(Req, Resp);
     Exit;
   end;
-  Resp := FApi.Handle(Req.Method, Req.Uri);
+  // O corpo vai junto por causa do POST /api/sql, unica rota que o usa.
+  Resp := FApi.Handle(Req.Method, Req.Uri, Req.Body);
   SendApiResponse(Req, Resp);
 end;
 

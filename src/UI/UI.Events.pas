@@ -11,6 +11,18 @@ unit UI.Events;
 //
 // Montada em código, sem .fmx, pelo mesmo motivo da UI.Days: é uma lista.
 //
+// ## Por que TListView, e não cartões como na UI.Days
+//
+// Uma câmera movimentada produz ~1.500 eventos por dia. Com um TRectangle e
+// quatro filhos por item, isso seriam ~7.500 controles FMX construídos de uma
+// vez — segundos de espera e memória à toa. O TListView cria os controles das
+// linhas VISÍVEIS e reaproveita conforme se rola; a lista pode ter mil itens
+// que o custo é o de uma tela.
+//
+// A miniatura de cada item também é preenchida sob demanda, no OnUpdateObjects
+// — o evento que o TListView dispara quando uma linha entra em cena. Pedir a
+// imagem dos 1.500 seria uma enxurrada que ninguém veria.
+//
 // As miniaturas vêm pelo MESMO IThumbProvider da barra do tempo. Não há cache
 // novo, nem thread nova, nem rota nova: o evento tem hora, e a barra já sabia
 // pedir a imagem de uma hora. Se a tela tivesse a sua própria busca, as duas
@@ -29,6 +41,10 @@ uses
   FMX.Layouts,
   FMX.StdCtrls,
   FMX.Graphics,
+  FMX.ListView,
+  FMX.ListView.Types,
+  FMX.ListView.Appearances,
+  FMX.ListView.Adapters.Base,
   VMS.Api.Client,
   UI.Thumbs,
   UI.Common;
@@ -49,25 +65,29 @@ type
     FLblTitle: TLabel;
     FTabs: TLayout;
     FTabBtn: array[TEventFilter] of TLabel;
-    FList: TVertScrollBox;
+    FList: TListView;
     FLblEmpty: TLabel;
     FEvents: TArray<TApiEvent>;   // tudo o que veio do servidor
+    // Índice em FEvents de cada linha da lista (a lista tem cabeçalhos de hora
+    // no meio, então a posição não serve como índice).
+    FLinhas: TArray<Integer>;
     FFilter: TEventFilter;
     FThumbs: IThumbProvider;
-    // Miniaturas pedidas mas ainda não chegadas: o Tag da TImage guarda o
-    // minuto, e é por ele que a chegada encontra onde desenhar.
-    FPendentes: TArray<TImage>;
+    // A lista só é construída quando a tela aparece: montá-la ao receber os
+    // eventos fazia o PLAYER demorar a abrir, porque é lá que eles chegam.
+    FPrecisaMontar: Boolean;
     FOnBack: TNotifyEvent;
     FOnPick: TEventPickEvent;
     procedure BackClick(Sender: TObject);
     procedure TabClick(Sender: TObject);
-    procedure ItemClick(Sender: TObject);
-    procedure ClearItems;
     procedure Rebuild;
+    procedure ItemClickLv(const Sender: TObject; const AItem: TListViewItem);
+    // Preenche a miniatura da linha que acabou de entrar em cena.
+    procedure UpdateObjects(const Sender: TObject; const AItem: TListViewItem);
+    function MinutoDe(Index: Integer): Int64;
     procedure SetMessage(const S: string);
     function Accepts(const Ev: TApiEvent): Boolean;
-    function AddHeader(const Texto: string): TLabel;
-    function AddItem(const Ev: TApiEvent; Index: Integer): TRectangle;
+
     procedure UpdateTabs;
   public
     constructor Create(AOwner: TComponent); override;
@@ -78,6 +98,8 @@ type
     // A lista completa do dia. O filtro é aplicado aqui dentro, sem ir ao
     // servidor de novo: trocar de aba não é motivo para uma requisição.
     procedure SetEvents(const Events: TArray<TApiEvent>);
+    // Chamado quando a tela vai aparecer: é aqui que a lista é montada.
+    procedure Montar;
     procedure SetThumbProvider(const Provider: IThumbProvider);
     // Quem assina o aviso do provedor é o formulário, e não esta tela: o
     // provedor é o mesmo da barra do tempo e só aceita um assinante (ver
@@ -96,9 +118,11 @@ function FormatEventDuration(Ms: Int64): string;
 implementation
 
 const
-  ITEM_HEIGHT = 76;
-  THUMB_W = 96;
-  THUMB_H = 60;
+  // A miniatura manda no tamanho da linha: 16:9, que é o formato do vídeo, com
+  // uma folga em volta para o texto respirar.
+  THUMB_W = 128;
+  THUMB_H = 72;
+  ITEM_HEIGHT = THUMB_H + 12;
   HEADER_HEIGHT = 28;
   ONE_MINUTE_MS = Int64(60000);
   // As mesmas duas cores da faixa de eventos na barra do tempo (ver
@@ -222,9 +246,24 @@ begin
   end;
   UpdateTabs;
 
-  FList := TVertScrollBox.Create(Self);
+  FList := TListView.Create(Self);
   FList.Parent := Self;
   FList.Align := TAlignLayout.Client;
+  // Aparência de fábrica com imagem + título + detalhe: é exatamente miniatura,
+  // hora e descrição, sem precisar desenhar item à mão.
+  FList.ItemAppearanceName := 'ImageListItemBottomDetail';
+  // As alturas vivem em ItemAppearance (TPublishedAppearance), e nao em
+  // ItemAppearanceObjects — aquele so guarda os OBJETOS de cada aparencia.
+  FList.ItemAppearance.ItemHeight := ITEM_HEIGHT;
+  FList.ItemAppearance.HeaderHeight := HEADER_HEIGHT;
+  // O tamanho da imagem NÃO vem da aparência escolhida — ela traz um ícone
+  // pequeno, pensado para avatar. Aqui a miniatura é o conteúdo principal da
+  // linha, então é preciso dizer o tamanho.
+  FList.ItemAppearanceObjects.ItemObjects.Image.Width := THUMB_W;
+  FList.ItemAppearanceObjects.ItemObjects.Image.Height := THUMB_H;
+  FList.CanSwipeDelete := False;
+  FList.OnItemClick := ItemClickLv;
+  FList.OnUpdateObjects := UpdateObjects;
 
   FLblEmpty := TLabel.Create(Self);
   FLblEmpty.Parent := Self;
@@ -280,6 +319,8 @@ begin
   if F = FFilter then Exit;
   FFilter := F;
   UpdateTabs;
+  // A tela já está aberta: trocar de aba remonta na hora, sem ir ao servidor.
+  FPrecisaMontar := False;
   Rebuild;
 end;
 
@@ -293,18 +334,17 @@ begin
   end;
 end;
 
-procedure TFrameEvents.ClearItems;
-var
-  I: Integer;
+function TFrameEvents.MinutoDe(Index: Integer): Int64;
 begin
-  FPendentes := nil;
-  for I := FList.Content.ChildrenCount - 1 downto 0 do
-    FList.Content.Children[I].Free;
+  Result := 0;
+  if (Index < 0) or (Index > High(FEvents)) then Exit;
+  Result := (FEvents[Index].StartMs div ONE_MINUTE_MS) * ONE_MINUTE_MS;
 end;
 
 procedure TFrameEvents.SetMessage(const S: string);
 begin
-  ClearItems;
+  FList.Items.Clear;
+  FLinhas := nil;
   FLblEmpty.Text := S;
   FLblEmpty.Visible := True;
   FLblEmpty.BringToFront;
@@ -321,205 +361,124 @@ begin
   SetMessage(Msg);
 end;
 
+// Guarda e marca para montar. NÃO monta: quem chama isto é a resposta da API,
+// que chega enquanto o PLAYER está abrindo — montar aqui era o que fazia o
+// histórico demorar a aparecer.
 procedure TFrameEvents.SetEvents(const Events: TArray<TApiEvent>);
 begin
   FEvents := Events;
+  FPrecisaMontar := True;
+end;
+
+procedure TFrameEvents.Montar;
+begin
+  if not FPrecisaMontar then Exit;
+  FPrecisaMontar := False;
   Rebuild;
-end;
-
-function TFrameEvents.AddHeader(const Texto: string): TLabel;
-begin
-  Result := TLabel.Create(Self);
-  Result.Parent := FList.Content;
-  Result.Align := TAlignLayout.Top;
-  Result.Height := HEADER_HEIGHT;
-  Result.Margins.Left := 14;
-  Result.Margins.Top := 10;
-  Result.HitTest := False;
-  Result.StyledSettings := [];
-  Result.TextSettings.FontColor := COLOR_DIM;
-  Result.TextSettings.Font.Size := 12;
-  Result.TextSettings.VertAlign := TTextAlign.Center;
-  Result.Text := Texto;
-end;
-
-// O Tag do card guarda o índice em FEvents, e o da miniatura guarda o minuto.
-// Os dados ficam nos próprios controles para a tela não manter uma cópia
-// paralela da lista — mesma disciplina da UI.Days.
-function TFrameEvents.AddItem(const Ev: TApiEvent; Index: Integer): TRectangle;
-var
-  Card, Faixa: TRectangle;
-  Img: TImage;
-  LblHora, LblNome: TLabel;
-  Bmp: TBitmap;
-  MinutoMs: Int64;
-  Texto: string;
-begin
-  Card := TRectangle.Create(Self);
-  Card.Parent := FList.Content;
-  Card.Align := TAlignLayout.Top;
-  Card.Height := ITEM_HEIGHT;
-  Card.Margins.Left := 8;
-  Card.Margins.Right := 8;
-  Card.Margins.Top := 6;
-  Card.XRadius := 8;
-  Card.YRadius := 8;
-  Card.Fill.Color := COLOR_SURFACE;
-  Card.Stroke.Kind := TBrushKind.None;
-  Card.HitTest := True;
-  Card.Tag := Index;
-  Card.OnClick := ItemClick;
-
-  // Tira colorida na borda esquerda: diz o tipo do evento sem gastar texto, e
-  // com a MESMA cor que a barra do tempo usa para ele.
-  Faixa := TRectangle.Create(Self);
-  Faixa.Parent := Card;
-  Faixa.Align := TAlignLayout.Left;
-  Faixa.Width := 4;
-  Faixa.HitTest := False;
-  Faixa.Stroke.Kind := TBrushKind.None;
-  if Ev.IsMotion then
-    Faixa.Fill.Color := EV_MOTION_COLOR
-  else
-    Faixa.Fill.Color := EV_OBJECT_COLOR;
-
-  Img := TImage.Create(Self);
-  Img.Parent := Card;
-  Img.SetBounds(12, (ITEM_HEIGHT - THUMB_H) / 2, THUMB_W, THUMB_H);
-  Img.HitTest := False;
-  Img.WrapMode := TImageWrapMode.Fit;
-  // O minuto do evento é a chave da miniatura, igual à da barra do tempo.
-  MinutoMs := (Ev.StartMs div ONE_MINUTE_MS) * ONE_MINUTE_MS;
-  Img.TagString := '';
-  if FThumbs <> nil then
-  begin
-    if FThumbs.TryGet(MinutoMs, Bmp) and (Bmp <> nil) then
-      Img.Bitmap.Assign(Bmp)
-    else
-    begin
-      FThumbs.Request(MinutoMs);
-      // Guardada para quando a imagem chegar. O minuto vai no TagString, e não
-      // no Tag: Tag é NativeInt, que numa build 32 bits não comporta um instante
-      // unix em milissegundos — truncaria e a imagem nunca acharia o dono.
-      Img.TagString := IntToStr(MinutoMs);
-      SetLength(FPendentes, Length(FPendentes) + 1);
-      FPendentes[High(FPendentes)] := Img;
-    end;
-  end;
-
-  LblHora := TLabel.Create(Self);
-  LblHora.Parent := Card;
-  LblHora.SetBounds(THUMB_W + 22, 12, 240, 22);
-  LblHora.HitTest := False;
-  LblHora.StyledSettings := [];
-  LblHora.TextSettings.FontColor := COLOR_TEXT;
-  LblHora.TextSettings.Font.Size := 15;
-  LblHora.Text := FormatDateTime('hh:nn:ss', LocalOf(Ev.StartMs));
-
-  LblNome := TLabel.Create(Self);
-  LblNome.Parent := Card;
-  LblNome.SetBounds(THUMB_W + 22, 36, 260, 20);
-  LblNome.HitTest := False;
-  LblNome.StyledSettings := [];
-  LblNome.TextSettings.FontColor := COLOR_DIM;
-  LblNome.TextSettings.Font.Size := 12;
-  Texto := EventLabelPt(Ev.Name);
-  if Ev.Count > 1 then
-    Texto := Format('%s x%d', [Texto, Ev.Count]);
-  Texto := Texto + ' - ' + FormatEventDuration(Ev.DurationMs);
-  // A confiança só aparece para objeto: no evento de movimento o "score" é a
-  // fração da tela que mexeu, que não é a mesma grandeza e enganaria.
-  if not Ev.IsMotion then
-    Texto := Texto + Format(' - %.0f%%', [Ev.Score * 100]);
-  LblNome.Text := Texto;
-
-  Result := Card;
 end;
 
 procedure TFrameEvents.Rebuild;
 var
   I, Mostrados: Integer;
   Hora, HoraAnterior: Int64;
+  Item: TListViewItem;
+  Texto: string;
 begin
-  ClearItems;
-  if Length(FEvents) = 0 then
-  begin
-    SetMessage('Nenhum evento neste dia.');
-    Exit;
-  end;
-
-  FLblEmpty.Visible := False;
-  FList.Visible := True;
-  Mostrados := 0;
-  HoraAnterior := -1;
-  // Do mais recente para o mais antigo: com Align=Top os filhos empilham na
-  // ordem de criação, e é o fim do dia que se quer ver primeiro.
-  for I := High(FEvents) downto 0 do
-  begin
-    if not Accepts(FEvents[I]) then Continue;
-    // A hora local do evento como número inteiro de horas desde a época do
-    // TDateTime: é só uma chave de agrupamento, e comparar horas soltas juntaria
-    // as 14h de dois dias diferentes.
-    Hora := Trunc(LocalOf(FEvents[I].StartMs) * 24);
-    if Hora <> HoraAnterior then
+  FList.BeginUpdate;
+  try
+    FList.Items.Clear;
+    FLinhas := nil;
+    Mostrados := 0;
+    HoraAnterior := -1;
+    // Do mais recente para o mais antigo: é o fim do dia que se quer ver
+    // primeiro. Aqui a ordem é a de inserção mesmo — TListView é uma lista, e
+    // não controles alinhados (ver o comentário gêmeo em UI.Days).
+    for I := High(FEvents) downto 0 do
     begin
-      AddHeader(FormatDateTime('hh', LocalOf(FEvents[I].StartMs)) + 'h');
-      HoraAnterior := Hora;
+      if not Accepts(FEvents[I]) then Continue;
+      Hora := Trunc(LocalOf(FEvents[I].StartMs) * 24);
+      if Hora <> HoraAnterior then
+      begin
+        Item := FList.Items.Add;
+        Item.Purpose := TListItemPurpose.Header;
+        Item.Text := FormatDateTime('hh', LocalOf(FEvents[I].StartMs)) + 'h';
+        SetLength(FLinhas, Length(FLinhas) + 1);
+        FLinhas[High(FLinhas)] := -1;      // cabeçalho não aponta para evento
+        HoraAnterior := Hora;
+      end;
+
+      Item := FList.Items.Add;
+      Item.Text := FormatDateTime('hh:nn:ss', LocalOf(FEvents[I].StartMs));
+      Texto := EventLabelPt(FEvents[I].Name);
+      if FEvents[I].Count > 1 then
+        Texto := Format('%s x%d', [Texto, FEvents[I].Count]);
+      Texto := Texto + ' - ' + FormatEventDuration(FEvents[I].DurationMs);
+      // A confiança só aparece para objeto: no evento de movimento o "score" é
+      // a fração da tela que mexeu, que não é a mesma grandeza e enganaria.
+      if not FEvents[I].IsMotion then
+        Texto := Texto + Format(' - %.0f%%', [FEvents[I].Score * 100]);
+      Item.Detail := Texto;
+      SetLength(FLinhas, Length(FLinhas) + 1);
+      FLinhas[High(FLinhas)] := I;
+      Inc(Mostrados);
     end;
-    AddItem(FEvents[I], I);
-    Inc(Mostrados);
+  finally
+    FList.EndUpdate;
   end;
 
   if Mostrados = 0 then
   begin
-    FPendentes := nil;
     if FFilter = efObjects then
       SetMessage('Nenhum objeto reconhecido neste dia.' + sLineBreak +
                  'Veja em "Movimento" ou "Tudo".')
     else
       SetMessage('Nenhum evento deste tipo neste dia.');
+    Exit;
   end;
+  FLblEmpty.Visible := False;
+  FList.Visible := True;
 end;
 
-// Chamado na thread principal quando alguma miniatura nova chegou. Percorre só
-// o que ainda está pendente: a lista encolhe sozinha conforme as imagens
-// entram, e quando esvazia não há mais trabalho a cada rajada.
-procedure TFrameEvents.ThumbsArrived;
+// Disparado pelo TListView quando uma linha entra em cena. É o gancho da
+// virtualização: só as visíveis pedem imagem.
+procedure TFrameEvents.UpdateObjects(const Sender: TObject;
+  const AItem: TListViewItem);
 var
-  I, N: Integer;
+  Idx: Integer;
+  Minuto: Int64;
   Bmp: TBitmap;
-  Restantes: TArray<TImage>;
 begin
-  if FThumbs = nil then Exit;
-  SetLength(Restantes, Length(FPendentes));
-  N := 0;
-  for I := 0 to High(FPendentes) do
-  begin
-    if FPendentes[I] = nil then Continue;
-    if FThumbs.TryGet(StrToInt64Def(FPendentes[I].TagString, 0), Bmp) and
-       (Bmp <> nil) then
-      FPendentes[I].Bitmap.Assign(Bmp)
-    else
-    begin
-      Restantes[N] := FPendentes[I];
-      Inc(N);
-    end;
-  end;
-  SetLength(Restantes, N);
-  FPendentes := Restantes;
+  if (FThumbs = nil) or (AItem = nil) then Exit;
+  if AItem.Purpose <> TListItemPurpose.None then Exit;
+  if (AItem.Index < 0) or (AItem.Index > High(FLinhas)) then Exit;
+  Idx := FLinhas[AItem.Index];
+  if Idx < 0 then Exit;
+  Minuto := MinutoDe(Idx);
+  if FThumbs.TryGet(Minuto, Bmp) and (Bmp <> nil) then
+    AItem.Bitmap := Bmp
+  else
+    FThumbs.Request(Minuto);
 end;
 
-procedure TFrameEvents.ItemClick(Sender: TObject);
+// Uma imagem nova chegou. Repintar basta: o OnUpdateObjects roda de novo para
+// as linhas em cena e pega o que agora está em memória.
+procedure TFrameEvents.ThumbsArrived;
+begin
+  if FList <> nil then
+    FList.Repaint;
+end;
+
+procedure TFrameEvents.ItemClickLv(const Sender: TObject;
+  const AItem: TListViewItem);
 var
   Idx: Integer;
 begin
-  if not Assigned(FOnPick) then Exit;
-  if not (Sender is TRectangle) then Exit;
-  Idx := TRectangle(Sender).Tag;
+  if (not Assigned(FOnPick)) or (AItem = nil) then Exit;
+  if (AItem.Index < 0) or (AItem.Index > High(FLinhas)) then Exit;
+  Idx := FLinhas[AItem.Index];
   if (Idx < 0) or (Idx > High(FEvents)) then Exit;
   // Um pouco ANTES do começo: cair exatamente no primeiro quadro do evento faz
-  // a reprodução começar com a coisa já acontecendo. Dois segundos de antes é o
-  // que deixa ver o que entrou em cena.
+  // a reprodução começar com a coisa já acontecendo.
   FOnPick(Self, FEvents[Idx].StartMs - 2000);
 end;
 

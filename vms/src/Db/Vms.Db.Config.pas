@@ -280,6 +280,7 @@ begin
   GravaNum('retention.maxTotalGB', ARetention.MaxTotalBytes / GIGABYTE);
   GravaNum('retention.minFreeGB', ARetention.MinFreeBytes / GIGABYTE);
   GravaInt('retention.intervalMinutes', ARetention.IntervalMs div 60000);
+  GravaInt('retention.logDays', ARetention.LogDays);
 
   GravaBool('live.enabled', ALive.Enabled);
   GravaInt('live.bufferMs', ALive.BufferMs);
@@ -299,6 +300,7 @@ begin
   Grava('analytics.modelPath', AAnalytics.ModelPath);
   Grava('analytics.onnxDll', AAnalytics.OnnxDllPath);
   GravaInt('analytics.objectIntervalMs', AAnalytics.ObjectMinIntervalMs);
+  GravaInt('analytics.objectIdleIntervalMs', AAnalytics.ObjectIdleIntervalMs);
   GravaNum('analytics.objectThreshold', AAnalytics.ObjectThreshold);
   Grava('analytics.classes', ClassesToText(AAnalytics.Classes));
 
@@ -540,6 +542,7 @@ begin
   Gb := Num('retention.minFreeGB', 0);
   if Gb > 0 then FRetention.MinFreeBytes := Round(Gb * GIGABYTE);
   FRetention.IntervalMs := Integer(Int('retention.intervalMinutes', 5) * 60000);
+  FRetention.LogDays := Integer(Int('retention.logDays', 7));
   // TRetentionPolicy.Enabled e FUNCAO: ela mesma responde a partir dos limites
   // acima. Nao ha o que atribuir — e e melhor assim, porque nao da para os dois
   // discordarem.
@@ -559,8 +562,8 @@ begin
   FAnalytics := TAnalyticsConfig.Default;
   FAnalytics.Enabled := Bool('analytics.enabled', False);
   FAnalytics.StepMs := Int('analytics.stepMs', 2000);
-  FAnalytics.MotionThreshold := Num('analytics.motionThreshold', 0.012);
-  FAnalytics.SceneChangeThreshold := Num('analytics.sceneChangeThreshold', 0.55);
+  FAnalytics.MotionThreshold := Num('analytics.motionThreshold', 0.006);
+  FAnalytics.SceneChangeThreshold := Num('analytics.sceneChangeThreshold', 0.85);
   FAnalytics.MergeGapMs := Int('analytics.mergeGapMs', 8000);
   FAnalytics.MaxEventMs := Int('analytics.maxEventMs', 300000);
   FAnalytics.BackfillMs := Int('analytics.backfillHours', 6) * 3600000;
@@ -574,6 +577,7 @@ begin
     FAnalytics.ModelPath := ExtractFilePath(ParamStr(0)) + FAnalytics.ModelPath;
   FAnalytics.OnnxDllPath := Trim(Str('analytics.onnxDll', 'onnxruntime.dll'));
   FAnalytics.ObjectMinIntervalMs := Int('analytics.objectIntervalMs', 5000);
+  FAnalytics.ObjectIdleIntervalMs := Int('analytics.objectIdleIntervalMs', 60000);
   FAnalytics.ObjectThreshold := Num('analytics.objectThreshold', 0.35);
   FAnalytics.Classes := TextToClasses(Str('analytics.classes', ''));
   if FAnalytics.StepMs < 500 then FAnalytics.StepMs := 500;

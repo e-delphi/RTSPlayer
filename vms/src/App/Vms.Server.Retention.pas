@@ -44,6 +44,7 @@ uses
   System.Generics.Defaults,
   VMS.Domain.Logging,
   VMS.Rec.Sidecar,
+  Vms.Db.Intf,
   Vms.Thumb.Cache,
   Vms.Analytics.Intf,
   Vms.Analytics.Store;
@@ -54,6 +55,12 @@ type
     MaxTotalBytes: Int64;  // 0 = sem limite de tamanho
     MinFreeBytes: Int64;   // 0 = não olha espaço livre
     IntervalMs: Integer;   // de quanto em quanto tempo varre
+    // Idade máxima das linhas da tabela `log`, em dias. 0 = não apaga.
+    //
+    // Separado de MaxDays de propósito: gravação e log envelhecem por motivos
+    // diferentes. Quem guarda vídeo até o disco encher (MaxDays = 0) ainda quer
+    // que o log pare de crescer — são ~65 mil linhas por dia.
+    LogDays: Integer;
     function Enabled: Boolean;
     function Describe: string;
   end;
@@ -73,11 +80,16 @@ type
     FPolicy: TRetentionPolicy;
     FLogger: ILogger;
     FStop: TEvent;
+    // Só para podar as tabelas que envelhecem (log, evento, índice de
+    // miniatura). Nil = a varredura cuida só dos arquivos, como antes.
+    FDb: IDbQueue;
+    procedure SweepDb;
   protected
     procedure Execute; override;
   public
     constructor Create(const ADir: string; const APolicy: TRetentionPolicy;
-                       const ALogger: ILogger; AStop: TEvent);
+                       const ALogger: ILogger; AStop: TEvent;
+                       const ADb: IDbQueue = nil);
   end;
 
 // Uma passada. Separada da thread para poder rodar na partida do servidor (e
@@ -410,7 +422,7 @@ end;
 { TRetentionThread }
 
 constructor TRetentionThread.Create(const ADir: string; const APolicy: TRetentionPolicy;
-  const ALogger: ILogger; AStop: TEvent);
+  const ALogger: ILogger; AStop: TEvent; const ADb: IDbQueue);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
@@ -418,8 +430,32 @@ begin
   FPolicy := APolicy;
   FLogger := ALogger;
   FStop := AStop;
+  FDb := ADb;
   if FPolicy.IntervalMs < MIN_INTERVAL_MS then
     FPolicy.IntervalMs := MIN_INTERVAL_MS;
+end;
+
+// As tabelas que crescem sozinhas. Roda na mesma varredura dos arquivos, e
+// nao so na subida: um servidor que fica semanas de pe nunca reiniciaria para
+// podar.
+procedure TRetentionThread.SweepDb;
+var
+  Corte: Int64;
+  N: Integer;
+begin
+  if (FDb = nil) or (not FDb.IsOpen) or (FPolicy.LogDays <= 0) then Exit;
+  Corte := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Now), True) * 1000
+           - Int64(FPolicy.LogDays) * 86400000;
+  try
+    N := FDb.Exec('DELETE FROM log WHERE at_ms < ?', [Corte]);
+    if (N > 0) and (FLogger <> nil) then
+      FLogger.Info(TAG, Format('%d linha(s) de log com mais de %d dia(s) apagadas',
+        [N, FPolicy.LogDays]));
+  except
+    on E: Exception do
+      // Reclamar aqui seria escrever no log que se esta tentando limpar.
+      ;
+  end;
 end;
 
 procedure TRetentionThread.Execute;
@@ -432,6 +468,7 @@ begin
   begin
     try
       R := SweepRetention(FDir, FPolicy, FLogger);
+      SweepDb;
       if (FLogger <> nil) and ((R.Deleted > 0) or (R.Locked > 0)) then
       begin
         if R.Locked > 0 then

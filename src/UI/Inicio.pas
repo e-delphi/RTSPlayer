@@ -96,6 +96,9 @@ type
     // mesmo clique: com um contador só, o Inc da segunda faria a resposta da
     // primeira ser descartada na volta, e a barra ficaria sem as faixas do dia.
     FEventsToken: Integer;
+    // Quando as faixas do dia foram buscadas pela última vez. Elas envelhecem
+    // sozinhas: a gravação continua e o fim do último trecho anda.
+    FSegsAtualizadoMs: Int64;
     // Onde a reprodução estava ao abrir a lista de eventos, para voltar no
     // mesmo ponto em vez de no fim do dia.
     FEventsResumeMs: Int64;
@@ -122,7 +125,13 @@ type
     procedure ShowDays(Index: Integer);
     procedure ShowEvents;
     procedure LoadDaysAsync(Index: Integer);
-    procedure LoadSegmentsAsync(const Camera, Day: string);
+    // Reenquadrar = True na primeira carga (escolhe zoom e centro); False
+    // quando é só a atualização periódica, que não pode mexer na vista.
+    procedure LoadSegmentsAsync(const Camera, Day: string;
+                                Reenquadrar: Boolean = True);
+    // Rebusca as faixas de tempos em tempos, enquanto o dia aberto ainda está
+    // sendo gravado.
+    procedure RefreshSegmentsIfStale;
     // Os eventos do dia aberto. Alimentam DUAS telas com uma requisição só: a
     // faixa de marcas na barra e a lista da tela de eventos.
     procedure LoadEventsAsync(const Camera: string; FromMs, ToMs: Int64);
@@ -185,6 +194,9 @@ const
   // Quanto o histórico recua ao abrir um dia. No dia de hoje isso é "10 minutos
   // atrás"; num dia passado, os últimos 10 minutos gravados dele.
   OPEN_BACK_MS = Int64(10 * 60 * 1000);
+  // De quanto em quanto tempo as faixas do dia são rebuscadas enquanto ele
+  // ainda está sendo gravado. Ver RefreshSegmentsIfStale.
+  SEGS_REFRESH_MS = Int64(30 * 1000);
 
 { TForm1 }
 
@@ -620,11 +632,14 @@ begin
     end).Start;
 end;
 
-procedure TForm1.LoadSegmentsAsync(const Camera, Day: string);
+procedure TForm1.LoadSegmentsAsync(const Camera, Day: string;
+  Reenquadrar: Boolean);
 var
   Token: Integer;
   Api: TVmsApiClient;
 begin
+  if FClock <> nil then
+    FSegsAtualizadoMs := FClock.NowUtcMs;
   Inc(FLoadToken);
   Token := FLoadToken;
   Api := FApi;
@@ -641,7 +656,14 @@ begin
         begin
           if FClosing or (Token <> FLoadToken) or (not FPlaybackOn) then Exit;
           if Ok and (DayEnd > DayStart) then
-            FTimeline.SetDay(DayStart, DayEnd, Segs)
+          begin
+            if Reenquadrar then
+              FTimeline.SetDay(DayStart, DayEnd, Segs)
+            else
+              // Só as faixas: o usuário pode ter dado zoom ou arrastado, e a
+              // atualização não pode desfazer isso a cada meio minuto.
+              FTimeline.SetSegments(Segs);
+          end
           else
             FLogger.Warn('ui', 'nao consegui carregar as faixas do dia ' + Day);
         end);
@@ -733,10 +755,39 @@ begin
     end).Start;
 end;
 
+// As faixas do dia são uma FOTOGRAFIA do momento em que se abriu o histórico.
+// Se o dia aberto é o de hoje, a gravação continua andando: o último trecho
+// cresce, e a barra azul fica cada vez mais atrás do que existe de verdade —
+// enquanto o cursor e as miniaturas avançam. Dá a impressão de que o vídeo
+// passou do fim da gravação.
+//
+// Rebuscar a cada meio minuto custa uma consulta pequena e mantém as três
+// coisas contando a mesma história. Dia passado não muda mais: não se rebusca.
+procedure TForm1.RefreshSegmentsIfStale;
+var
+  Agora: Int64;
+begin
+  if (not FPlaybackOn) or (FPlaybackCam = '') or (FPlaybackDay = '') then Exit;
+  if FClock = nil then Exit;
+  Agora := FClock.NowUtcMs;
+  if (FSegsAtualizadoMs > 0) and ((Agora - FSegsAtualizadoMs) < SEGS_REFRESH_MS) then
+    Exit;
+  // Só o dia que ainda está sendo gravado: o de ontem não ganha faixa nova.
+  if FEventsToMs <= Agora then
+  begin
+    FSegsAtualizadoMs := Agora;
+    LoadSegmentsAsync(FPlaybackCam, FPlaybackDay, False);
+  end;
+end;
+
 procedure TForm1.ShowEvents;
 begin
   FFrameEvents.SetTitle(Format('Eventos - %s',
     [FormatDayLabel(FPlaybackDay)]));
+  // Só agora a lista é construída. Montá-la ao receber os eventos fazia o
+  // PLAYER demorar a abrir — são ~1.500 eventos por câmera por dia, e eles
+  // chegam junto com as faixas do dia, antes de alguém pedir esta tela.
+  FFrameEvents.Montar;
   ShowFrame(FFrameEvents);
 end;
 
@@ -1022,6 +1073,7 @@ begin
   if FPlaybackOn and (FPlayback <> nil) then
   begin
     UpdatePlaybackStatus;
+    RefreshSegmentsIfStale;
     Exit;
   end;
   if (not FPlaying) or (FSupervisor = nil) then Exit;

@@ -100,8 +100,10 @@ begin
   // Post: quem grava evento e a thread de analise, e ela nao pode parar para
   // esperar disco. Falha vai para o log de emergencia da fila.
   FDb.Post(SQL_INSERT, [Camera, Ev.StartMs, Ev.EndMs, Ord(Ev.Kind),
-    LowerCase(Ev.Name), Double(Ev.Score), Ev.Count,
-    Double(Caixa.L), Double(Caixa.T), Double(Caixa.R), Double(Caixa.B),
+    // Single vai direto para Variant (varSingle); o typecast para Double era
+    // desnecessario e so criava chance de erro de tipo.
+    LowerCase(Ev.Name), Ev.Score, Ev.Count,
+    Caixa.L, Caixa.T, Caixa.R, Caixa.B,
     FClock.NowUtcMs]);
 end;
 
@@ -148,7 +150,7 @@ begin
   if MinScore > 0 then
   begin
     Sql := Sql + ' AND e.score >= ?';
-    AddParam(Double(MinScore));
+    AddParam(MinScore);
   end;
   Sql := Sql + ' ORDER BY e.start_ms LIMIT ?';
   AddParam(Limit);

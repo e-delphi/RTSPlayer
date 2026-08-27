@@ -68,6 +68,9 @@ implementation
 
 const
   ITEM_HEIGHT = 72;
+  // Margem superior de cada card. Entra na conta do Y porque é ela que separa
+  // um do outro depois do alinhamento.
+  ITEM_GAP = 8;
   WEEKDAYS: array[1..7] of string = ('dom', 'seg', 'ter', 'qua', 'qui', 'sex', 's'#$E1'b');
 
 function ParseApiDay(const S: string; out D: TDateTime): Boolean;
@@ -218,7 +221,7 @@ begin
   Card.Height := ITEM_HEIGHT;
   Card.Margins.Left := 8;
   Card.Margins.Right := 8;
-  Card.Margins.Top := 8;
+  Card.Margins.Top := ITEM_GAP;
   Card.XRadius := 8;
   Card.YRadius := 8;
   Card.Fill.Color := COLOR_SURFACE;
@@ -292,6 +295,7 @@ end;
 procedure TFrameDays.SetDays(const Days: TArray<TApiDay>);
 var
   I: Integer;
+  Y: Single;
 begin
   ClearItems;
   FDays := Days;
@@ -302,10 +306,20 @@ begin
   end;
   FLblEmpty.Visible := False;
   FList.Visible := True;
-  // Do mais recente para o mais antigo: a API devolve em ordem crescente, e com
-  // Align=Top os filhos empilham na ordem em que são criados.
+  // Do mais recente para o mais antigo: a API devolve em ordem crescente.
+  //
+  // O Y é atribuído à mão, e isso NÃO é decoração. O FMX ordena os irmãos
+  // Align=Top comparando `C1.Top < C2.Top` (ver AlignObjects em FMX.Types):
+  // não é a ordem de criação que manda, é a posição. Todo card nasce com Y = 0,
+  // então a comparação empata e o desempate depende de quando o realinhamento
+  // acontece — na primeira montagem saía certo por acidente, e ao reabrir a
+  // lista saía embaralhado. Com Y crescente não há empate para desfazer.
+  Y := 0;
   for I := High(Days) downto 0 do
-    AddItem(Days[I], I);
+  begin
+    AddItem(Days[I], I).Position.Y := Y;
+    Y := Y + ITEM_HEIGHT + ITEM_GAP;
+  end;
 end;
 
 // A barra de cobertura acompanha a largura da lista (giro de tela, janela

@@ -91,6 +91,7 @@ begin
   // limites — e a partida loga em qual regime está rodando.
   FillChar(FRetention, SizeOf(FRetention), 0);
   FRetention.IntervalMs := 5 * 60 * 1000;
+  FRetention.LogDays := 7;
   V := Root.GetValue('retention');
   if V is TJSONObject then
   begin
@@ -101,6 +102,7 @@ begin
     Gb := GetJsonDouble(Obj, 'minFreeGB', 0);
     if Gb > 0 then FRetention.MinFreeBytes := Round(Gb * GIGABYTE);
     FRetention.IntervalMs := GetJsonInt(Obj, 'intervalMinutes', 5) * 60 * 1000;
+    FRetention.LogDays := GetJsonInt(Obj, 'logDays', 7);
   end;
 
   // Ao contrário da retenção, o buffer ao vivo vem LIGADO por omissão: ele não
@@ -149,9 +151,10 @@ begin
     Obj := TJSONObject(V);
     FAnalytics.Enabled := GetJsonBool(Obj, 'enabled', True);
     FAnalytics.StepMs := GetJsonInt(Obj, 'stepMs', 2000);
-    FAnalytics.MotionThreshold := GetJsonDouble(Obj, 'motionThreshold', 0.012);
-    FAnalytics.SceneChangeThreshold := GetJsonDouble(Obj, 'sceneChangeThreshold', 0.55);
+    FAnalytics.MotionThreshold := GetJsonDouble(Obj, 'motionThreshold', 0.006);
+    FAnalytics.SceneChangeThreshold := GetJsonDouble(Obj, 'sceneChangeThreshold', 0.85);
     FAnalytics.ObjectMinIntervalMs := GetJsonInt(Obj, 'objectIntervalMs', 5000);
+    FAnalytics.ObjectIdleIntervalMs := GetJsonInt(Obj, 'objectIdleIntervalMs', 60000);
     FAnalytics.ObjectThreshold := GetJsonDouble(Obj, 'objectThreshold', 0.35);
     FAnalytics.MergeGapMs := GetJsonInt(Obj, 'mergeGapMs', 8000);
     FAnalytics.MaxEventMs := GetJsonInt(Obj, 'maxEventMs', 300000);

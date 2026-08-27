@@ -290,13 +290,26 @@ begin
 
   CloseStale(Ms);
 
-  if not Mov.Moved then Exit;
+  if Mov.Moved then
+    Note(Ms, MOTION_NAME, ekMotion, Mov.Score, 1, Mov.Box);
 
-  Note(Ms, MOTION_NAME, ekMotion, Mov.Score, 1, Mov.Box);
-
-  // A rede so entra com movimento na tela e respeitando o intervalo minimo.
   if (FObjects = nil) or (not FObjects.Available) then Exit;
-  if (FLastObjectMs > 0) and (Abs(Ms - FLastObjectMs) < FCfg.ObjectMinIntervalMs) then Exit;
+
+  // Com movimento, a rede respeita o intervalo curto. SEM movimento, ela ainda
+  // roda de vez em quando: quem entra no quadro e fica parado deixa de ser
+  // movimento em ~20 s (o fundo o absorve) e sumiria da analise justamente
+  // enquanto continua ali. O intervalo longo e o preco de continuar vendo.
+  if Mov.Moved then
+  begin
+    if (FLastObjectMs > 0) and
+       (Abs(Ms - FLastObjectMs) < FCfg.ObjectMinIntervalMs) then Exit;
+  end
+  else
+  begin
+    if FCfg.ObjectIdleIntervalMs <= 0 then Exit;
+    if (FLastObjectMs > 0) and
+       (Abs(Ms - FLastObjectMs) < FCfg.ObjectIdleIntervalMs) then Exit;
+  end;
   FLastObjectMs := Ms;
 
   if not FObjects.Detect(Img, FCfg.ObjectThreshold, Hits) then Exit;

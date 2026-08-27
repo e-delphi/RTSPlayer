@@ -14,6 +14,7 @@
 //   GET /api/index?file=…                 o índice de blocos, cru
 //                                         (as duas últimas são diagnóstico)
 //   GET /api/events?camera=X&fromMs=…     o que a análise viu naquela janela
+//   GET|POST /api/sql?q=…                 SQL livre no banco (diagnóstico)
 //
 // Regra de ouro destas rotas: **o cliente não sabe que existem arquivos**. Ele
 // pede instante e recebe faixa; que a câmera tenha gerado 37 .vms naquele dia
@@ -46,6 +47,7 @@ uses
   Vms.Thumb.Intf,
   Vms.Analytics.Types,
   Vms.Analytics.Intf,
+  Vms.Db.Intf,
   Vms.Server.Media;
 
 const
@@ -56,6 +58,10 @@ const
   // ausência de verdade.
   API_DEFAULT_GAP_MS = 5000;
   MS_PER_DAY = Int64(86400000);
+  // Teto de linhas que /api/sql devolve. Sem isto, um `select * from log` num
+  // servidor de semanas montaria um JSON de centenas de MB na thread do banco.
+  SQL_DEFAULT_LIMIT = 500;
+  SQL_MAX_LIMIT = 10000;
 
 type
   TApiConfig = record
@@ -90,6 +96,9 @@ type
     // não a implementação. É o que mantém o onnxruntime fora desta camada, que
     // só deveria falar HTTP. Nil = servidor sem análise, e a rota responde 503.
     FEvents: IEventSource;
+    // Só a rota /api/sql usa. Nil = a rota responde 503, e o resto da API não
+    // sabe da diferença.
+    FDb: IDbQueue;
     FLogger: ILogger;
     function KnownCamera(const Name: string; out Canonical: string): Boolean;
     function IsLive(const Camera: string): Boolean;
@@ -101,6 +110,7 @@ type
     function HandleIndex(const Query: string): TApiResponse;
     function HandleThumb(const Query: string): TApiResponse;
     function HandleEvents(const Query: string): TApiResponse;
+    function HandleSql(const Query: string; const Body: TBytes): TApiResponse;
   public
     // O cache e a fonte de miniaturas vêm de fora, e o roteador não é dono de
     // nenhum dos dois: quem os cria é a composição, que é o único lugar que
@@ -108,11 +118,13 @@ type
     constructor Create(const AConfig: TApiConfig; const ACameras: TArray<string>;
                        ACache: TVmsIndexCache; AHub: TLiveHub;
                        const AThumbs: IThumbSource; const AEvents: IEventSource;
-                       const ALogger: ILogger);
+                       const ADb: IDbQueue; const ALogger: ILogger);
     destructor Destroy; override;
     // Method e Uri como vieram da linha do pedido. Nunca levanta exceção: erro
     // vira resposta.
-    function Handle(const Method, Uri: string): TApiResponse;
+    // Body só é usado pelo POST /api/sql; as demais rotas ignoram.
+    function Handle(const Method, Uri: string;
+                    const Body: TBytes = nil): TApiResponse;
     class function IsApiPath(const Uri: string): Boolean; static;
     property Cache: TVmsIndexCache read FCache;
     property Config: TApiConfig read FConfig;
@@ -311,11 +323,12 @@ end;
 constructor TApiRouter.Create(const AConfig: TApiConfig;
   const ACameras: TArray<string>; ACache: TVmsIndexCache; AHub: TLiveHub;
   const AThumbs: IThumbSource; const AEvents: IEventSource;
-  const ALogger: ILogger);
+  const ADb: IDbQueue; const ALogger: ILogger);
 begin
   inherited Create;
   FThumbs := AThumbs;
   FEvents := AEvents;
+  FDb := ADb;
   FConfig := AConfig;
   if FConfig.MaxBlocksPerRequest <= 0 then
     FConfig.MaxBlocksPerRequest := API_DEFAULT_MAX_BLOCKS;
@@ -368,17 +381,26 @@ begin
   Result := (Stream <> nil) and Stream.IsPublishing;
 end;
 
-function TApiRouter.Handle(const Method, Uri: string): TApiResponse;
+function TApiRouter.Handle(const Method, Uri: string;
+  const Body: TBytes): TApiResponse;
 var
   Path, Query: string;
 begin
   try
     if not FConfig.Enabled then
       Exit(TApiResponse.Error(404, 'api desligada'));
-    if not (SameText(Method, 'GET') or SameText(Method, 'HEAD')) then
-      Exit(TApiResponse.Error(405, 'so GET e HEAD'));
     if not SplitPathAndQuery(Uri, Path, Query) then
       Exit(TApiResponse.Error(400, 'uri invalida'));
+    // POST existe por uma rota só: SQL longo não cabe confortável numa query
+    // string. Todo o resto continua sendo leitura, e recusa POST.
+    if SameText(Path, API_PREFIX + 'sql') then
+    begin
+      if not (SameText(Method, 'GET') or SameText(Method, 'POST')) then
+        Exit(TApiResponse.Error(405, 'use GET ou POST'));
+      Exit(HandleSql(Query, Body));
+    end;
+    if not (SameText(Method, 'GET') or SameText(Method, 'HEAD')) then
+      Exit(TApiResponse.Error(405, 'so GET e HEAD'));
 
     if SameText(Path, API_PREFIX + 'cameras') then
       Result := HandleCameras
@@ -487,6 +509,142 @@ begin
     Arr.AddElement(Item);
   end;
   Result := TApiResponse.FromJson(Root);
+end;
+
+// SQL livre no banco. Existe para olhar o que está sendo gravado sem precisar
+// parar o servidor e abrir o arquivo num cliente de SQLite — e, quando fizer
+// falta, corrigir uma linha na mão.
+//
+//   GET  /api/sql?q=select%20count(*)%20from%20event
+//   POST /api/sql            (o corpo é o SQL; use quando ele for longo)
+//
+// **Não há autenticação.** Quem alcança esta porta lê qualquer tabela — o que
+// inclui `camera_endpoint.password`, que guarda as senhas das câmeras em texto
+// — e pode alterar ou apagar o que quiser. Limite a porta com `bindAddress`, ou
+// desligue a API, se a máquina não estiver numa rede de confiança. O aviso na
+// subida diz o mesmo.
+//
+// A distinção leitura x escrita sai da PRIMEIRA palavra. `select`, `pragma`,
+// `explain` e `with` vão por Read (devolvem linhas); qualquer outra coisa vai
+// por Exec (devolve quantas linhas mudaram). Não é análise de SQL — é só o que
+// basta para escolher o caminho, e um erro de classificação vira erro do banco,
+// não corrupção.
+//
+// Os valores saem todos como TEXTO, e null continua null. É deliberado: um
+// console de diagnóstico ganha mais em não ter surpresa de formatação de float
+// do que em tipos ricos no JSON.
+function TApiRouter.HandleSql(const Query: string; const Body: TBytes): TApiResponse;
+var
+  Sql, Primeira: string;
+  Limite, Lidas: Integer;
+  Truncou, Leitura: Boolean;
+  Root, Erro: TJSONObject;
+  Colunas, Linhas: TJSONArray;
+  Afetadas: Integer;
+  Comeco: TDateTime;
+begin
+  if (FDb = nil) or (not FDb.IsOpen) then
+    Exit(TApiResponse.Error(503, 'servidor sem banco aberto'));
+
+  // O corpo tem prioridade: quem manda POST mandou por caber melhor lá.
+  Sql := '';
+  if Length(Body) > 0 then
+    Sql := TEncoding.UTF8.GetString(Body);
+  if Trim(Sql) = '' then
+    Sql := QueryValue(Query, 'q');
+  Sql := Trim(Sql);
+  if Sql = '' then
+    Exit(TApiResponse.Error(400, 'informe o sql em q= ou no corpo'));
+
+  Limite := Integer(QueryInt(Query, 'limit', SQL_DEFAULT_LIMIT));
+  if Limite <= 0 then Limite := SQL_DEFAULT_LIMIT;
+  if Limite > SQL_MAX_LIMIT then Limite := SQL_MAX_LIMIT;
+
+  Primeira := LowerCase(Copy(TrimLeft(Sql), 1, 7));
+  Leitura := StartsText('select', Primeira) or StartsText('pragma', Primeira) or
+             StartsText('explain', Primeira) or StartsText('with', Primeira);
+
+  if FLogger <> nil then
+    FLogger.Info('api.sql', Sql);
+
+  Root := TJSONObject.Create;
+  try
+    Root.AddPair('sql', Sql);
+    Comeco := Now;
+    try
+      if Leitura then
+      begin
+        Colunas := TJSONArray.Create;
+        Linhas := TJSONArray.Create;
+        Root.AddPair('kind', 'read');
+        Root.AddPair('columns', Colunas);
+        Root.AddPair('rows', Linhas);
+        Lidas := 0;
+        Truncou := False;
+        FDb.Read(Sql, [],
+          procedure(const Row: IDbRow)
+          var
+            Linha: TJSONArray;
+            I: Integer;
+          begin
+            // Os nomes das colunas saem da primeira linha: é a única em que se
+            // tem certeza de que o cursor está posicionado.
+            if Lidas = 0 then
+              for I := 0 to Row.ColumnCount - 1 do
+                Colunas.Add(Row.ColumnName(I));
+            Inc(Lidas);
+            // Passou do teto: continua consumindo o cursor (interromper no meio
+            // deixaria a consulta pela metade na thread do banco), mas para de
+            // montar JSON.
+            if Lidas > Limite then
+            begin
+              Truncou := True;
+              Exit;
+            end;
+            Linha := TJSONArray.Create;
+            for I := 0 to Row.ColumnCount - 1 do
+              if Row.IsNull(Row.ColumnName(I)) then
+                Linha.AddElement(TJSONNull.Create)
+              else
+                Linha.Add(Row.AsString(Row.ColumnName(I)));
+            Linhas.AddElement(Linha);
+          end);
+        Root.AddPair('count', TJSONNumber.Create(Linhas.Count));
+        Root.AddPair('scanned', TJSONNumber.Create(Lidas));
+        Root.AddPair('truncated', TJSONBool.Create(Truncou));
+        if Truncou then
+          Root.AddPair('hint', Format('use limit= (max %d) ou refine o sql',
+            [SQL_MAX_LIMIT]));
+      end
+      else
+      begin
+        Afetadas := FDb.Exec(Sql, []);
+        Root.AddPair('kind', 'write');
+        Root.AddPair('affected', TJSONNumber.Create(Afetadas));
+      end;
+    except
+      on E: Exception do
+      begin
+        // O erro do banco volta inteiro: quem escreveu o SQL é quem precisa
+        // lê-lo, e esconder a mensagem tornaria a rota inútil.
+        Root.Free;
+        Erro := TJSONObject.Create;
+        Erro.AddPair('error', E.Message);
+        Erro.AddPair('sql', Sql);
+        Result := TApiResponse.FromJson(Erro);
+        Result.Status := 400;
+        Exit;
+      end;
+    end;
+    // Sem Round: MilliSecondsBetween ja devolve Int64, e Round quer ponto
+    // flutuante. TJSONNumber tem sobrecarga para Int64.
+    Root.AddPair('elapsedMs',
+      TJSONNumber.Create(MilliSecondsBetween(Now, Comeco)));
+    Result := TApiResponse.FromJson(Root);
+  except
+    Root.Free;
+    raise;
+  end;
 end;
 
 // A miniatura do instante pedido. O cliente manda o instante que quer mostrar;

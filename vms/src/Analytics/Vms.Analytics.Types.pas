@@ -65,10 +65,22 @@ type
     MotionThreshold: Single;
     // Acima disto o quadro inteiro mudou (luz acesa, IR ligando, camera
     // reposicionada). Nao e movimento: e cena nova, e a referencia e refeita.
+    //
+    // Comecou em 0.55 e isso era BAIXO DEMAIS. Medido em 20 h de gravacao das
+    // tres cameras: a distribuicao dos eventos de movimento, em vez de cair na
+    // cauda, EMPILHAVA na ultima faixa (67 eventos entre 0.50 e 0.55 contra 40
+    // entre 0.45 e 0.50). Ou seja, o movimento mais forte — alguem passando
+    // perto da camera — era descartado como "cena nova". Pior: descartar
+    // refazia a referencia, e os ~20 s seguintes ficavam cegos. Era a causa de
+    // "quase nao detecta mais nada".
     SceneChangeThreshold: Single;
     // Intervalo minimo entre duas passadas da rede. A rede e cara; o movimento
     // e barato. Este numero e o que separa os dois custos.
     ObjectMinIntervalMs: Int64;
+    // A rede tambem roda de tempos em tempos SEM movimento nenhum. Sem isto,
+    // quem entra no quadro e para de se mexer some da analise: o fundo absorve
+    // a pessoa em ~20 s e ela deixa de ser movimento. 0 = so com movimento.
+    ObjectIdleIntervalMs: Int64;
     ObjectThreshold: Single;   // confianca minima para a deteccao virar evento
     // Dois avistamentos do mesmo rotulo separados por menos que isto sao o
     // mesmo evento. Sem isso, uma pessoa parada na cena viraria um evento por
@@ -158,9 +170,10 @@ class function TAnalyticsConfig.Default: TAnalyticsConfig;
 begin
   Result.Enabled := False;   // ver o comentario do LoadExtra: nao liga sozinho
   Result.StepMs := 2000;
-  Result.MotionThreshold := 0.012;
-  Result.SceneChangeThreshold := 0.55;
+  Result.MotionThreshold := 0.006;
+  Result.SceneChangeThreshold := 0.85;
   Result.ObjectMinIntervalMs := 5000;
+  Result.ObjectIdleIntervalMs := 60000;
   Result.ObjectThreshold := 0.35;
   Result.MergeGapMs := 8000;
   Result.MaxEventMs := 300000;
