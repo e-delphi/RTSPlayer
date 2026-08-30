@@ -1,7 +1,9 @@
 ﻿unit UI.Common;
 
 // Constantes visuais (cores/ícones) e helpers de câmera/URL compartilhados entre
-// o shell (Inicio) e os frames (UI.List / UI.Player / UI.Editor).
+// o shell (Inicio) e a casca em HTML. Depois que a interface virou pagina,
+// o que sobrou aqui e serializacao de camera e parsing de URL -- usados pelo
+// cadastro que a pagina edita por /api/app/cameras.
 
 interface
 
@@ -289,6 +291,9 @@ begin
     begin
       O := TJSONObject.Create;
       O.AddPair('name', Cams[I].Name);
+      // Sem isto o campo nao voltava da leitura, e a caixa "habilitada" da
+      // tela de cadastro era decorativa: marcava e desmarcava sem efeito.
+      O.AddPair('enabled', TJSONBool.Create(Cams[I].Enabled));
       // Os caminhos alternativos vão como estão.
       if Length(Cams[I].Endpoints) > 0 then
       begin
@@ -365,6 +370,9 @@ begin
                           JsonInt(O, 'audioDelayMs', 200),
                           JsonInt(O, 'videoDelayMs', 200),
                           JsonBool(O, 'tailscale', False));
+        // Ausente = habilitada. O campo e novo, e cameras.json antigo nao o tem
+        // -- assumir False la faria as cameras existentes sumirem da lista.
+        Cam.Enabled := JsonBool(O, 'enabled', True);
 
         EpValue := O.GetValue('endpoints');
         if EpValue is TJSONArray then

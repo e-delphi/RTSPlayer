@@ -264,13 +264,18 @@ end;
 procedure TRecordingSink.OpenWriter;
 var
   Path: string;
+  Header: TVmsHeader;
 begin
   Path := UniqueRecordingPath(OutputPath);
+  // Uma vez só: o header vai para o arquivo e as escalas dele vão para o
+  // builder, que precisa delas para ancorar os blocos (ver VMS.Rec.Block).
+  Header := BuildHeader;
   FWriter := TFileRecordingWriter.Create(Path);
-  FWriter.WriteHeader(BuildHeader);
+  FWriter.WriteHeader(Header);
   FFileStartedMs := FClock.MonotonicMs;
 
   FBuilder := TBlockBuilder.Create(FMaxSamples, FMaxDurationMs, FMaxSizeBytes);
+  FBuilder.SetTimescales(Header.Video.Timescale, Header.Audio.Timescale);
   FBuilder.SetOnBlockClosed(
     procedure(const Block: TVmsBlock)
     begin

@@ -57,6 +57,14 @@ type
     // aponta para onde se vai, não para onde se estava: sem esta marca, o
     // servidor que o recebe não teria como saber que aquilo é uma emenda.
     NewFile: Boolean;
+    // Aponta para DEPOIS do último bloco de um arquivo que ainda está sendo
+    // gravado. O bloco não existe agora e vai existir daqui a pouco; até lá a
+    // resposta é "nada novo", e não "acabou".
+    //
+    // Sem esta marca não havia como separar os dois casos, e o cursor morria na
+    // ponta do arquivo aberto: era por isso que o próprio servidor não tinha
+    // por onde continuar o ao vivo.
+    Tail: Boolean;
     function Encode: string;
     class function Decode(const S: string; out C: TMediaCursor): Boolean; static;
   end;
@@ -90,6 +98,9 @@ type
     Keyframe: Boolean;
     Growing: Boolean;
     Thinned: Boolean;      // veio decimado: é varredura, não reprodução
+    // Nada novo desde o cursor, e a gravação não acabou: quem segue o ao vivo
+    // pergunta de novo daqui a pouco com o MESMO cursor. Não é erro nem fim.
+    Empty: Boolean;
     Cursor: string;
   end;
 
@@ -118,13 +129,22 @@ const
 
 { TMediaCursor }
 
-// '<nextMs>-<bloco>-<novoArquivo>-<arquivo>'. Só dígitos e o nome do arquivo,
-// que já é restrito a [A-Za-z0-9._-]: passa numa query sem escapar nada.
+// '<nextMs>-<bloco>-<tipo>-<arquivo>'. Só dígitos e o nome do arquivo, que já é
+// restrito a [A-Za-z0-9._-]: passa numa query sem escapar nada.
+//
+// <tipo>: 0 continua no mesmo arquivo, 1 emenda noutro, 2 cauda de arquivo em
+// crescimento. São exclusivos entre si. Cursor emitido antes do 2 existir
+// continua sendo lido igual: 0 e 1 querem dizer o mesmo de sempre.
 function TMediaCursor.Encode: string;
+var
+  Tipo: Integer;
 begin
   if not Valid then Exit('');
+  if Tail then Tipo := 2
+  else if NewFile then Tipo := 1
+  else Tipo := 0;
   Result := Format('%d%s%d%s%d%s%s',
-    [NextMs, CURSOR_SEP, BlockIdx, CURSOR_SEP, Ord(NewFile), CURSOR_SEP, FileName]);
+    [NextMs, CURSOR_SEP, BlockIdx, CURSOR_SEP, Tipo, CURSOR_SEP, FileName]);
 end;
 
 class function TMediaCursor.Decode(const S: string; out C: TMediaCursor): Boolean;
@@ -144,7 +164,8 @@ begin
   if not TryStrToInt64(Copy(S, 1, P1 - 1), C.NextMs) then Exit;
   if not TryStrToInt(Copy(S, P1 + 1, P2 - P1 - 1), C.BlockIdx) then Exit;
   if not TryStrToInt(Copy(S, P2 + 1, P3 - P2 - 1), Flag) then Exit;
-  C.NewFile := Flag <> 0;
+  C.NewFile := Flag = 1;
+  C.Tail := Flag = 2;
   C.FileName := Copy(S, P3 + 1, MaxInt);
   if C.FileName = '' then Exit;
   C.Valid := True;
@@ -337,6 +358,8 @@ var
   CameraOfFile: string;
   UsedCursorHint, Thinned: Boolean;
   Cursor: TMediaCursor;
+  NextReq: TMediaRequest;
+  Proximo: TMediaFragment;
   FromMs: Int64;
 begin
   Info := Default(TVmsFileInfo);
@@ -378,7 +401,56 @@ begin
     CameraOfFile := Info.Camera;
 
   // 2. Que bloco.
-  if UsedCursorHint then
+  if UsedCursorHint and Req.Cursor.Tail then
+  begin
+    // Aqui o BLOCO é a verdade, e não o instante. Cair na busca por tempo
+    // devolveria de novo o último bloco existente, e outra vez, e outra: o ao
+    // vivo ficaria repetindo os mesmos dois segundos para sempre.
+    First := Req.Cursor.BlockIdx;
+    if First > High(Index) then
+    begin
+      // O bloco ainda não foi escrito. Se a câmera já seguiu noutro arquivo,
+      // é para lá que se vai; senão, é só esperar.
+      //
+      // O que prova que este arquivo acabou é a EXISTÊNCIA do seguinte, e não o
+      // rodapé deste. Rodapé era a condição aqui, e ela não se cumpre quando a
+      // gravação perde o stream: `StreamLoop` que sai por exceção fecha o
+      // arquivo com `DrainWriter(False)`, sem rodapé (ver VMS.Domain.Session), e
+      // daqui em diante ele tem cara de "ainda crescendo" para sempre — é
+      // justamente por isso que existe o reparo na subida do servidor.
+      //
+      // Exigindo rodapé, a câmera que derruba a conexão deixava o ao vivo
+      // esperando eternamente um bloco que ninguém ia escrever: imagem
+      // congelada, requisições rodando, 204 atrás de 204, até fechar e reabrir.
+      if NextFileAfter(CameraOfFile, Info.Name,
+                       Index[High(Index)].StartUnixMs + ASSUMED_BLOCK_MS,
+                       NextInfo) then
+      begin
+        NextReq := Req;
+        NextReq.Cursor.FileName := NextInfo.Name;
+        NextReq.Cursor.NextMs := NextInfo.StartMs;
+        NextReq.Cursor.BlockIdx := 0;
+        NextReq.Cursor.NewFile := True;
+        NextReq.Cursor.Tail := False;
+        Proximo := Fetch(NextReq);
+        // O seguinte pode ter acabado de ser criado e ainda não ter bloco
+        // legível — a gravação abre o arquivo antes de escrever nele. Aí espera
+        // mais um pouco neste, em vez de devolver o erro dele e derrubar a
+        // reprodução por causa de uma corrida de milissegundos.
+        if Proximo.Ok then Exit(Proximo);
+      end;
+      Result := Default(TMediaFragment);
+      Result.Ok := True;
+      Result.Status := 204;
+      Result.Empty := True;
+      Result.NextMs := -1;
+      Result.Growing := not Info.Closed;
+      Result.Cursor := Req.Cursor.Encode;   // o mesmo: é por ele que se volta
+      Exit;
+    end;
+    if First < 0 then First := 0;
+  end
+  else if UsedCursorHint then
   begin
     First := Req.Cursor.BlockIdx;
     // Dica velha (arquivo cresceu de outro jeito, ou índice mudou): resolve pelo
@@ -521,7 +593,9 @@ begin
     Move(BodyBytes[0], Result.Data[Length(HeaderBytes)], Length(BodyBytes));
 
   // 4. Por onde continuar.
-  Cursor.Valid := False;
+  // Default, e nao so Valid := False: os ramos abaixo preenchem campos
+  // diferentes, e um campo que um deles nao toca ficaria com lixo da pilha.
+  Cursor := Default(TMediaCursor);
   Result.NextMs := -1;
   Result.GapMs := 0;
   if Last < High(Index) then
@@ -532,6 +606,18 @@ begin
     Cursor.FileName := Info.Name;
     Cursor.BlockIdx := Last + 1;
     Cursor.NewFile := False;
+  end
+  else if not Info.Closed then
+  begin
+    // Entregamos até o último bloco de um arquivo que a gravação ainda escreve.
+    // O próximo bloco vem, só não veio ainda: o cursor aponta para ele, e a
+    // requisição seguinte ou o encontra, ou recebe 204.
+    Cursor.Valid := True;
+    Cursor.NextMs := Result.EndMs;
+    Cursor.FileName := Info.Name;
+    Cursor.BlockIdx := Last + 1;
+    Cursor.NewFile := False;
+    Cursor.Tail := True;
   end
   else if NextFileAfter(CameraOfFile, Info.Name, Result.EndMs, NextInfo) then
   begin

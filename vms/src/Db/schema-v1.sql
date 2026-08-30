@@ -281,6 +281,15 @@ INSERT OR IGNORE INTO setting (key, value, updated_at_ms) VALUES
   ('live.maxBufferMB',             '32',          0),
 
   ('api.enabled',                  '1',           0),
+  -- Autenticacao. Nasce LIGADA e sem senha: nesse estado so o proprio
+  -- computador entra, e so para definir uma. Assim uma instalacao nova nunca
+  -- fica aberta por esquecimento -- que e o modo classico de publicar um
+  -- servidor de cameras na internet sem querer.
+  ('auth.enabled',                 '1',           0),
+  ('auth.user',                    'admin',       0),
+  -- pbkdf2$iteracoes$sal$hash. Vazio = senha ainda nao definida.
+  ('auth.hash',                    '',            0),
+  ('auth.sessionHours',            '720',         0),
   ('api.maxBlocksPerRequest',      '32',          0),
 
   ('analytics.enabled',            '0',           0),

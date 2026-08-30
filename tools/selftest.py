@@ -24,6 +24,7 @@ import genvms
 import apimodel
 import fragment
 import pacemodel
+import anchormodel
 import eventlib
 
 VERBOSE = '-v' in sys.argv
@@ -810,6 +811,68 @@ def teste_agregacao_eventos(pasta):
           'vieram %d' % len(evs))
 
 
+def teste_ancora_do_gravador(_pasta):
+    """A âncora de cada bloco sai do pts da gravação, e não da chegada.
+
+    O leitor calcula `wallMs = âncora + (pts - primeiro pts) / timescale`: dentro
+    do bloco quem manda é o pts, e na virada quem manda é a âncora. Enquanto a
+    âncora foi o relógio de chegada, os dois não andavam no mesmo passo, e a rede
+    que segura quadros e depois os despeja fazia dois blocos cobrirem o mesmo
+    intervalo -- que na reprodução é a imagem voltando um pedaço.
+    """
+    print('âncora dos blocos do gravador')
+    TS, POR_BLOCO = 90000, 20
+
+    def medir(cena, regra):
+        blocos = anchormodel.montar(cena, TS, POR_BLOCO, regra)
+        r = anchormodel.analisar(blocos, TS)
+        r['recuou'] = any(blocos[i]['ancora'] < blocos[i - 1]['ancora']
+                          for i in range(1, len(blocos)))
+        r['desvio'] = max(abs(b['ancora'] - b['chegou']) for b in blocos)
+        return r
+
+    # 1) rede que trava e depois despeja: o caso que apareceu em disco
+    rajada = anchormodel.cena_rajada()
+    antes = medir(rajada, anchormodel.ancora_por_chegada)
+    depois = medir(rajada, anchormodel.ancora_derivada)
+    check('pela chegada, a rajada faz blocos se sobreporem',
+          len(antes['sobrepostos']) > 0 and antes['maiorSobreposicao'] > 1000,
+          '%d sobreposições, maior %d ms'
+          % (len(antes['sobrepostos']), antes['maiorSobreposicao']))
+    check('pela chegada, a âncora chega a andar para trás', antes['recuou'])
+    check('derivada do pts, nenhum bloco se sobrepõe',
+          not depois['sobrepostos'],
+          '%d sobreposições' % len(depois['sobrepostos']))
+    check('derivada do pts, a âncora nunca anda para trás', not depois['recuou'])
+    # A rajada é atraso de TRANSPORTE: os quadros foram capturados no ritmo
+    # normal. Inventar buraco ali seria mentir sobre a gravação.
+    check('derivada do pts, a rajada não vira buraco', not depois['buracos'],
+          'buracos: %s' % depois['buracos'])
+    check('pela chegada, a rajada inventava buracos', len(antes['buracos']) > 0,
+          '%d buracos' % len(antes['buracos']))
+
+    # 2) tremor de chegada, que é o caso de todo dia
+    tremor = anchormodel.cena_jitter()
+    a2 = medir(tremor, anchormodel.ancora_por_chegada)
+    d2 = medir(tremor, anchormodel.ancora_derivada)
+    check('pela chegada, o tremor já bastava para sobrepor',
+          len(a2['sobrepostos']) > 0, '%d sobreposições' % len(a2['sobrepostos']))
+    check('derivada do pts, o tremor some', not d2['sobrepostos'])
+    check('e o desvio para o relógio de quem grava fica pequeno',
+          d2['desvio'] < 1000, '%d ms' % d2['desvio'])
+
+    # 3) reconexão com pts zerado: aí a âncora TEM de ser refeita, e o buraco
+    #    de verdade tem de aparecer
+    reinicio = anchormodel.cena_reinicio()
+    d3 = medir(reinicio, anchormodel.ancora_derivada)
+    check('pts reiniciado re-ancora pelo relógio de quem grava',
+          d3['desvio'] == 0, 'desvio %d ms' % d3['desvio'])
+    check('e o buraco real de 40 s continua lá',
+          d3['maiorBuraco'] > 39000 and d3['maiorBuraco'] < 41000,
+          'maior buraco %d ms' % d3['maiorBuraco'])
+    check('sem sobrepor nada na volta', not d3['sobrepostos'])
+
+
 def main():
     pasta = tempfile.mkdtemp(prefix='vms_selftest_')
     try:
@@ -824,6 +887,7 @@ def main():
         teste_fragmento(pasta)
         teste_varredura(pasta)
         teste_ritmo(pasta)
+        teste_ancora_do_gravador(pasta)
         teste_eventos_formato(pasta)
         teste_eventos_consulta(pasta)
         teste_movimento(pasta)

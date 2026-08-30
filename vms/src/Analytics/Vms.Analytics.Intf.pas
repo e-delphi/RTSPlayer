@@ -108,6 +108,29 @@ type
                             Failures: Int64; const Model: string);
   end;
 
+  // Uma amostra do ENSAIO: o que o detector concluiu de UM quadro, com os
+  // parametros que o pedido mandou. Ver Vms.Analytics.Probe.
+  TMotionSample = record
+    Ms: Int64;
+    Score: Single;          // fracao da grade que mudou
+    Moved: Boolean;         // passou do limiar
+    SceneChanged: Boolean;  // tratado como cena nova (nao vira evento)
+    Box: TEventBox;
+  end;
+  TMotionSamples = TArray<TMotionSample>;
+
+  // Reprocessa um trecho de gravacao SEM GRAVAR NADA, com parametros dados na
+  // hora. Existe porque o banco so guarda o pico dos eventos que passaram do
+  // limiar: dos quadros que nao viraram evento nao sobra nada, e ai nao da para
+  // distinguir "nada se moveu" de "o limiar comeu".
+  IMotionProbe = interface
+    ['{6D0F3A21-8B54-4C97-A1E6-2F7B9C4D0538}']
+    function Run(const Camera: string; FromMs, ToMs, StepMs: Int64;
+                 Threshold, SceneThreshold: Single;
+                 MaxSamples: Integer): TMotionSamples;
+    function Available: Boolean;
+  end;
+
   // Um quadro decodificado, com hora. O que o worker entrega ao analisador.
   IFrameAnalyzer = interface
     ['{0B4E7C29-6A13-4F85-9D2C-7E3A1B5F8C60}']

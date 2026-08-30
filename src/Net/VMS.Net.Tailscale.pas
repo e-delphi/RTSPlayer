@@ -52,6 +52,25 @@ function LooksLikeTailnetHost(const Host: string): Boolean;
 // Alcança Host:Port? Um TCP connect, sem nada por cima.
 function HostReachable(const Host: string; Port: Word; TimeoutMs: Cardinal): Boolean;
 
+// O nome resolve para DENTRO da faixa da tailnet (100.64.0.0/10)?
+//
+// Existe porque um TCP connect sozinho mente. Operadora que responde NXDOMAIN
+// com página própria -- prática comum, e a deste usuário faz isso -- devolve um
+// IP público para `qualquercoisa.ts.net` e aceita conexão na 443. Para o
+// connect isso é "alcançou"; na verdade é a operadora, e o servidor continua
+// inalcançável.
+//
+// MagicDNS e o DNS público do Tailscale sempre devolvem 100.x para um nome de
+// tailnet. Endereço fora dessa faixa, portanto, não é a tailnet -- é outra
+// coisa se passando por ela.
+function ResolvesIntoTailnet(const Host: string): Boolean;
+
+// A pergunta que o resto do arquivo realmente queria fazer: "há rota ATÉ A
+// TAILNET para este host?". Para host que não parece de tailnet é o
+// HostReachable de sempre.
+function TailnetReachable(const Host: string; Port: Word;
+                          TimeoutMs: Cardinal): Boolean;
+
 type
   // Três estados de propósito: fora do Android não dá para saber, e "não sei"
   // é diferente de "está caída". Tratar desconhecido como caída jogaria o
@@ -77,6 +96,9 @@ function EnsureTailnetUp(const Host: string; Port: Word; const Logger: ILogger;
 implementation
 
 uses
+  System.StrUtils,
+  IdGlobal,
+  IdStack,
   VMS.Net.Intf,
   VMS.Net.Tcp
   {$IFDEF ANDROID}
@@ -342,6 +364,55 @@ begin
     OfferTailscaleInstall(Logger);
 end;
 
+function ResolvesIntoTailnet(const Host: string): Boolean;
+var
+  Ip: string;
+  P1, P2: Integer;
+  A, B: Integer;
+
+  // Só o primeiro e o segundo octeto interessam: 100.64.0.0/10 vai de 100.64
+  // a 100.127.
+  function DoisPrimeirosOctetos(const S: string; out X, Y: Integer): Boolean;
+  begin
+    Result := False;
+    P1 := Pos('.', S);
+    if P1 < 2 then Exit;
+    P2 := PosEx('.', S, P1 + 1);
+    if P2 <= P1 + 1 then Exit;
+    Result := TryStrToInt(Copy(S, 1, P1 - 1), X) and
+              TryStrToInt(Copy(S, P1 + 1, P2 - P1 - 1), Y);
+  end;
+
+begin
+  if Trim(Host) = '' then Exit(False);
+
+  // Já é um IP literal da faixa: nada a resolver.
+  if DoisPrimeirosOctetos(Host, A, B) and (A = 100) and (B >= 64) and (B <= 127) then
+    Exit(True);
+
+  Ip := '';
+  try
+    // Sem pilha Indy iniciada não dá para resolver. Nesse caso não se inventa
+    // uma resposta negativa: seguir com o connect é o comportamento de antes.
+    if GStack = nil then Exit(True);
+    Ip := GStack.ResolveHost(Host, Id_IPv4);
+  except
+    // Não resolveu: não é a tailnet, e o connect também não iria a lugar nenhum.
+    Exit(False);
+  end;
+  if Ip = '' then Exit(False);
+  Result := DoisPrimeirosOctetos(Ip, A, B) and
+            (A = 100) and (B >= 64) and (B <= 127);
+end;
+
+function TailnetReachable(const Host: string; Port: Word;
+  TimeoutMs: Cardinal): Boolean;
+begin
+  if LooksLikeTailnetHost(Host) and not ResolvesIntoTailnet(Host) then
+    Exit(False);
+  Result := HostReachable(Host, Port, TimeoutMs);
+end;
+
 function EnsureTailnetUp(const Host: string; Port: Word; const Logger: ILogger;
   AStop: TEvent; TimeoutMs: Cardinal): Boolean;
 var
@@ -357,7 +428,7 @@ var
 begin
   // 1) Já alcança? Então não há VPN a subir — nem para abrir app, nem para
   //    esperar. É o caminho normal de quem está na mesma rede da câmera.
-  if HostReachable(Host, Port, TAILNET_PROBE_MS) then
+  if TailnetReachable(Host, Port, TAILNET_PROBE_MS) then
   begin
     if Logger <> nil then
       Logger.Debug(TAG, Format('%s:%d ja responde; sem VPN a subir', [Host, Port]));
@@ -403,7 +474,7 @@ begin
     begin
       if Stopped then Exit(False);
       Inc(Attempts);
-      if HostReachable(Host, Port, TAILNET_PROBE_MS) then
+      if TailnetReachable(Host, Port, TAILNET_PROBE_MS) then
       begin
         if Logger <> nil then
           Logger.Info(TAG, Format('tunel de pe: %s:%d respondeu na tentativa %d',

@@ -131,6 +131,12 @@ begin
                                       FHub, FApi);
   AContext.Data := Holder;
   AContext.Connection.IOHandler.ReadTimeout := 500;
+  // Sem Nagle: as respostas daqui sao mensagens completas, e juntar a proxima
+  // com a anterior so serve para esperar o ACK atrasado do outro lado.
+  try
+    AContext.Connection.Socket.Binding.UseNagle := False;
+  except
+  end;
   FLogger.Info('tx.listener', 'Client connected: ' + AContext.Binding.PeerIP);
 end;
 

@@ -10,11 +10,32 @@
 //   GET /api/segments?camera=X&day=Y      as faixas contínuas daquele dia
 //   GET /api/media?camera=X&fromMs=…      a mídia: header .vms + N blocos
 //   GET /api/media?camera=X&cursor=…      a continuação, sem busca
+//   GET /api/live?camera=X&cursor=…       o ao vivo: a cauda do que se grava
 //   GET /api/recordings?camera=X&...      a lista crua, arquivo por arquivo
 //   GET /api/index?file=…                 o índice de blocos, cru
 //                                         (as duas últimas são diagnóstico)
 //   GET /api/events?camera=X&fromMs=…     o que a análise viu naquela janela
+//   GET /api/settings                     os parâmetros do servidor
+//   POST /api/settings                    grava parâmetros (corpo JSON)
 //   GET|POST /api/sql?q=…                 SQL livre no banco (diagnóstico)
+//   GET /api/motion/probe?camera=X&…      ensaio do detector, sem gravar nada
+//   GET /ui/motion                        a página de sintonia do movimento
+//   GET /ui/events                        a faixa de eventos, para o app
+//   GET /                                 a mesma casca: entrar no servidor
+//                                         pelo endereco nu ja abre a interface
+//   GET /favicon.svg  /favicon.ico        o icone da aba
+//   GET /ui/login                         a tela de entrada
+//   GET /api/auth/status                  se ha senha, e se esta autenticado
+//   POST /api/auth/login                  {user,password} -> cookie de sessao
+//   POST /api/auth/logout                 encerra a sessao deste cookie
+//   POST /api/auth/password               define/troca a senha
+//
+// TUDO o mais exige credencial quando auth.enabled=1: cookie (navegador) ou
+// Basic (o app, que encaminha de dentro do Delphi). Sem senha definida, so o
+// proprio computador entra -- e so para definir uma.
+//   GET /ui/app                           a casca do app (cameras/dias/play)
+//   GET /ui/player                        o player de gravacao em HTML
+//   GET /ui/vmsreader.js /ui/player.js    o que a pagina do player carrega
 //
 // Regra de ouro destas rotas: **o cliente não sabe que existem arquivos**. Ele
 // pede instante e recebe faixa; que a câmera tenha gerado 37 .vms naquele dia
@@ -39,6 +60,7 @@ uses
   System.JSON,
   System.IOUtils,
   System.NetEncoding,
+  System.Generics.Collections,
   VMS.Domain.Types,
   VMS.Domain.Logging,
   VMS.Rec.Format,
@@ -48,10 +70,29 @@ uses
   Vms.Analytics.Types,
   Vms.Analytics.Intf,
   Vms.Db.Intf,
+  Vms.Server.Ui.Html,
+  Vms.Server.Events.Html,
+  Vms.Server.App.Html,
+  Vms.Server.Player.Html,
+  Vms.Server.Favicon.Svg,
+  Vms.Server.UiFiles,
+  Vms.Server.Login.Html,
+  Vms.Server.Auth,
+  Vms.Server.Player.Js,
+  Vms.Server.Reader.Js,
   Vms.Server.Media;
 
 const
   API_PREFIX = '/api/';
+  // As telas servidas pelo próprio servidor. Não é dado, é interface: fica
+  // fora do /api/ para nunca ser confundida com uma rota de consumo.
+  UI_PREFIX = '/ui/';
+  // Quanto se recua ao abrir o ao vivo. Pouco, porque cada segundo daqui é um
+  // segundo de atraso em relação ao que a câmera está vendo; o bastante para a
+  // tela não abrir vazia esperando o próximo bloco fechar.
+  LIVE_PREROLL_MS = 4000;
+  // De quanto em quanto auth.* e relido do banco.
+  AUTH_RELEITURA_MS = 5000;
   API_DEFAULT_MAX_BLOCKS = 32;
   // Colagem: dois arquivos separados por menos que isto viram uma faixa só. Uma
   // reconexão de câmera custa centenas de ms; 5 s cobre com folga sem esconder
@@ -68,6 +109,25 @@ type
     Enabled: Boolean;
     MaxBlocksPerRequest: Integer;
     function Describe: string;
+  end;
+
+  // Uma requisição HTTP já separada do socket.
+  //
+  // Existe porque o porteiro precisa de cabeçalhos -- Authorization, Cookie --
+  // e a assinatura antiga levava só método e URI. Um registro, e não a lista de
+  // cabeçalhos do Indy, para o roteador continuar sem saber o que é um socket.
+  TApiRequest = record
+    Method: string;
+    Uri: string;
+    Body: TBytes;
+    Authorization: string;
+    Cookie: string;
+    // "https" quando um proxy à frente terminou o TLS (o `tailscale serve` põe
+    // X-Forwarded-Proto). É o que decide se o cookie sai com Secure: marcá-lo
+    // sempre quebraria o acesso por http na LAN, e nunca marcá-lo deixaria o
+    // cookie viajar em claro se alguém publicar a porta sem TLS.
+    ForwardedProto: string;
+    PeerIP: string;
   end;
 
   TApiResponse = record
@@ -87,6 +147,11 @@ type
     FHub: TLiveHub;
     FCache: TVmsIndexCache;
     FMedia: TMediaBuilder;
+    FAuth: TAutenticador;
+    // Quando auth.* foi lido do banco pela ultima vez. Reler de tempos em
+    // tempos resolve dois casos sem cerimonia: o banco que ainda nao estava
+    // aberto na criacao, e a senha trocada por fora.
+    FAuthLido: UInt64;
     // A miniatura entra por uma interface, e não pela implementação: é o que
     // mantém FFmpeg e VCL fora desta camada, que só deveria falar HTTP. Sem
     // decodificador na máquina, a composição liga a fonte nula e a rota
@@ -99,6 +164,8 @@ type
     // Só a rota /api/sql usa. Nil = a rota responde 503, e o resto da API não
     // sabe da diferença.
     FDb: IDbQueue;
+    // O ensaio do detector de movimento. Nil = a rota responde 503.
+    FProbe: IMotionProbe;
     FLogger: ILogger;
     function KnownCamera(const Name: string; out Canonical: string): Boolean;
     function IsLive(const Camera: string): Boolean;
@@ -106,11 +173,33 @@ type
     function HandleDays(const Query: string): TApiResponse;
     function HandleSegments(const Query: string): TApiResponse;
     function HandleRecordings(const Query: string): TApiResponse;
-    function HandleMedia(const Query: string): TApiResponse;
+    function HandleMedia(const Query: string; Live: Boolean): TApiResponse;
     function HandleIndex(const Query: string): TApiResponse;
     function HandleThumb(const Query: string): TApiResponse;
     function HandleEvents(const Query: string): TApiResponse;
     function HandleSql(const Query: string; const Body: TBytes): TApiResponse;
+    function HandleSettingsGet: TApiResponse;
+    function HandleSettingsPost(const Body: TBytes): TApiResponse;
+    function HandleMotionProbe(const Query: string): TApiResponse;
+    function HandleMotionUi: TApiResponse;
+    function HandleEventsUi: TApiResponse;
+    function HandleAppUi: TApiResponse;
+    function HandleFavicon: TApiResponse;
+    function HandleLoginUi: TApiResponse;
+    function HandleAuthStatus(const Req: TApiRequest): TApiResponse;
+    function HandleLogin(const Req: TApiRequest): TApiResponse;
+    function HandleLogout(const Req: TApiRequest): TApiResponse;
+    function HandleAuthSenha(const Req: TApiRequest): TApiResponse;
+    // Relê auth.* do banco. Chamada na criação e sempre que algo que possa ter
+    // mudado a autenticação for gravado.
+    procedure RecarregarAuth;
+    // Rota que responde sem credencial: a tela de entrada, o próprio login e o
+    // ícone. Curta de propósito -- cada item aqui é uma porta a menos.
+    function RotaAberta(const Path: string): Boolean;
+    function RespostaDeAcesso(const Req: TApiRequest;
+                              Acesso: TAcesso): TApiResponse;
+    function HandlePlayerUi: TApiResponse;
+    function HandleJs(const NomeArquivo, Codigo: string): TApiResponse;
   public
     // O cache e a fonte de miniaturas vêm de fora, e o roteador não é dono de
     // nenhum dos dois: quem os cria é a composição, que é o único lugar que
@@ -118,13 +207,15 @@ type
     constructor Create(const AConfig: TApiConfig; const ACameras: TArray<string>;
                        ACache: TVmsIndexCache; AHub: TLiveHub;
                        const AThumbs: IThumbSource; const AEvents: IEventSource;
-                       const ADb: IDbQueue; const ALogger: ILogger);
+                       const ADb: IDbQueue; const AProbe: IMotionProbe;
+                       const ALogger: ILogger);
     destructor Destroy; override;
     // Method e Uri como vieram da linha do pedido. Nunca levanta exceção: erro
     // vira resposta.
     // Body só é usado pelo POST /api/sql; as demais rotas ignoram.
     function Handle(const Method, Uri: string;
-                    const Body: TBytes = nil): TApiResponse;
+                    const Body: TBytes = nil): TApiResponse; overload;
+    function Handle(const Req: TApiRequest): TApiResponse; overload;
     class function IsApiPath(const Uri: string): Boolean; static;
     property Cache: TVmsIndexCache read FCache;
     property Config: TApiConfig read FConfig;
@@ -323,12 +414,13 @@ end;
 constructor TApiRouter.Create(const AConfig: TApiConfig;
   const ACameras: TArray<string>; ACache: TVmsIndexCache; AHub: TLiveHub;
   const AThumbs: IThumbSource; const AEvents: IEventSource;
-  const ADb: IDbQueue; const ALogger: ILogger);
+  const ADb: IDbQueue; const AProbe: IMotionProbe; const ALogger: ILogger);
 begin
   inherited Create;
   FThumbs := AThumbs;
   FEvents := AEvents;
   FDb := ADb;
+  FProbe := AProbe;
   FConfig := AConfig;
   if FConfig.MaxBlocksPerRequest <= 0 then
     FConfig.MaxBlocksPerRequest := API_DEFAULT_MAX_BLOCKS;
@@ -337,12 +429,20 @@ begin
   FLogger := ALogger;
   FCache := ACache;
   FMedia := TMediaBuilder.Create(FCache, FConfig.MaxBlocksPerRequest, ALogger);
+  FAuth := TAutenticador.Create;
+  RecarregarAuth;
+  // Uma pasta `ui` esquecida ao lado do executável mudaria a interface sem
+  // nenhum outro sinal. Dizer isso na subida é o sinal.
+  if UiDirAtivo and (FLogger <> nil) then
+    FLogger.Info('api', 'servindo a interface de ' + UiDir +
+                        ' (o que estiver la substitui o embutido)');
 end;
 
 destructor TApiRouter.Destroy;
 begin
   // O cache não é nosso: quem criou destrói.
   FMedia.Free;
+  FAuth.Free;
   inherited;
 end;
 
@@ -350,7 +450,10 @@ class function TApiRouter.IsApiPath(const Uri: string): Boolean;
 var
   Path, Query: string;
 begin
-  Result := SplitPathAndQuery(Uri, Path, Query) and StartsText(API_PREFIX, Path);
+  Result := SplitPathAndQuery(Uri, Path, Query) and
+            ((Path = '/') or StartsText(API_PREFIX, Path) or
+             StartsText(UI_PREFIX, Path) or
+             SameText(Path, '/favicon.svg') or SameText(Path, '/favicon.ico'));
 end;
 
 // O nome da câmera vem do cliente e vira parte de um caminho de arquivo. Aceitar
@@ -381,16 +484,183 @@ begin
   Result := (Stream <> nil) and Stream.IsPublishing;
 end;
 
+// O endereço é do próprio computador? É a saída de emergência da instalação
+// nova: sem senha definida ninguém entra de fora, mas quem está na máquina
+// precisa poder definir uma.
+function EhLoopback(const IP: string): Boolean;
+var
+  S: string;
+begin
+  S := Trim(IP);
+  Result := (S = '127.0.0.1') or (S = '::1') or (S = '0:0:0:0:0:0:0:1') or
+            StartsText('127.', S);
+end;
+
+function TApiRouter.RotaAberta(const Path: string): Boolean;
+begin
+  // Curta de propósito: cada item aqui é uma porta a menos. A tela de entrada,
+  // as rotas que a fazem funcionar e o ícone -- que o navegador pede sozinho,
+  // antes de qualquer login, e cujo 401 sujaria o console.
+  Result := SameText(Path, UI_PREFIX + 'login') or
+            SameText(Path, API_PREFIX + 'auth/status') or
+            SameText(Path, API_PREFIX + 'auth/login') or
+            SameText(Path, '/favicon.svg') or
+            SameText(Path, '/favicon.ico');
+end;
+
+procedure TApiRouter.RecarregarAuth;
+var
+  Ligado: Boolean;
+  Usuario, Hash: string;
+  Horas: Integer;
+begin
+  FAuthLido := TThread.GetTickCount64;
+  if (FDb = nil) or (not FDb.IsOpen) then
+  begin
+    // Sem banco não dá para saber se há senha. O lado seguro é assumir que há
+    // autenticação e que ela ainda não foi configurada: só o próprio
+    // computador entra. Assumir "liberado" abriria tudo justamente no momento
+    // em que o servidor não sabe o que está fazendo.
+    FAuth.Configurar(True, 'admin', '', SESSAO_PADRAO_HORAS);
+    Exit;
+  end;
+  Ligado := True;
+  Usuario := 'admin';
+  Hash := '';
+  Horas := SESSAO_PADRAO_HORAS;
+  try
+    FDb.Read('SELECT key, value FROM setting WHERE key LIKE ''auth.%''', [],
+      procedure(const Row: IDbRow)
+      var
+        K, V: string;
+      begin
+        K := Row.AsString('key');
+        V := Row.AsString('value');
+        if SameText(K, 'auth.enabled') then Ligado := Trim(V) <> '0'
+        else if SameText(K, 'auth.user') then Usuario := V
+        else if SameText(K, 'auth.hash') then Hash := V
+        else if SameText(K, 'auth.sessionHours') then
+          Horas := StrToIntDef(Trim(V), SESSAO_PADRAO_HORAS);
+      end);
+  except
+    on E: Exception do
+      FLogger.Warn('api', 'nao consegui ler auth.*: ' + E.Message);
+  end;
+  FAuth.Configurar(Ligado, Usuario, Hash, Horas);
+end;
+
+// A recusa, na forma que serve a quem pediu: navegador pedindo tela vai para o
+// login; chamada de api leva 401 em json, que a página sabe ler.
+function TApiRouter.RespostaDeAcesso(const Req: TApiRequest;
+  Acesso: TAcesso): TApiResponse;
+var
+  Path, Query: string;
+  EhTela: Boolean;
+begin
+  SplitPathAndQuery(Req.Uri, Path, Query);
+  EhTela := (Path = '/') or StartsText(UI_PREFIX, Path);
+
+  if Acesso = acSemSenhaDefinida then
+  begin
+    // Beco: mandar para o login não adianta, porque não há senha para digitar.
+    // O texto diz o que fazer, e diz de onde -- é a única informação útil aqui.
+    Result := TApiResponse.Error(503,
+      'este servidor ainda nao tem senha definida; abra-o no proprio ' +
+      'computador (http://localhost:8554) e defina uma em /ui/login');
+    Exit;
+  end;
+
+  if EhTela then
+  begin
+    Result.Status := 302;
+    Result.ContentType := 'text/plain; charset=utf-8';
+    Result.Body := TEncoding.UTF8.GetBytes('entre primeiro');
+    Result.Extra := TArray<string>.Create('Location: ' + UI_PREFIX + 'login');
+    Exit;
+  end;
+
+  // Sem WWW-Authenticate de propósito: o cabeçalho faria o navegador abrir o
+  // diálogo dele por cima da página, e quem usa Basic aqui é o app, que já
+  // manda a credencial sem precisar ser desafiado.
+  Result := TApiResponse.Error(401, 'nao autenticado');
+end;
+
 function TApiRouter.Handle(const Method, Uri: string;
   const Body: TBytes): TApiResponse;
 var
-  Path, Query: string;
+  Req: TApiRequest;
 begin
+  Req := Default(TApiRequest);
+  Req.Method := Method;
+  Req.Uri := Uri;
+  Req.Body := Body;
+  Result := Handle(Req);
+end;
+
+function TApiRouter.Handle(const Req: TApiRequest): TApiResponse;
+var
+  Path, Query: string;
+  Method: string;
+  Body: TBytes;
+  Acesso: TAcesso;
+begin
+  Method := Req.Method;
+  Body := Req.Body;
   try
     if not FConfig.Enabled then
       Exit(TApiResponse.Error(404, 'api desligada'));
-    if not SplitPathAndQuery(Uri, Path, Query) then
+    if not SplitPathAndQuery(Req.Uri, Path, Query) then
       Exit(TApiResponse.Error(400, 'uri invalida'));
+
+    if TThread.GetTickCount64 - FAuthLido > AUTH_RELEITURA_MS then
+      RecarregarAuth;
+
+    // O porteiro vem ANTES de tudo: o que não passa daqui não chega a tocar em
+    // gravação, em banco nem em configuração.
+    if not RotaAberta(Path) then
+    begin
+      Acesso := FAuth.Avaliar(Req.Authorization, Req.Cookie);
+      if (Acesso = acSemSenhaDefinida) and EhLoopback(Req.PeerIP) then
+        Acesso := acLiberado;
+      if Acesso <> acLiberado then
+        Exit(RespostaDeAcesso(Req, Acesso));
+    end;
+
+    if SameText(Path, UI_PREFIX + 'login') then
+      Exit(HandleLoginUi);
+    if SameText(Path, API_PREFIX + 'auth/status') then
+      Exit(HandleAuthStatus(Req));
+    if SameText(Path, API_PREFIX + 'auth/login') then
+      Exit(HandleLogin(Req));
+    if SameText(Path, API_PREFIX + 'auth/logout') then
+      Exit(HandleLogout(Req));
+    if SameText(Path, API_PREFIX + 'auth/password') then
+      Exit(HandleAuthSenha(Req));
+    // A raiz é a interface. Quem digita o endereço do servidor quer a tela, e
+    // não um 404 seguido de "agora descubra a sub-rota".
+    if (Path = '/') or SameText(Path, UI_PREFIX) then
+      Exit(HandleAppUi);
+    // O navegador pede /favicon.ico sozinho, sem perguntar. As duas rotas
+    // devolvem o mesmo SVG; o <link> das páginas aponta para a .svg, que é a
+    // que casa com o tipo declarado.
+    if SameText(Path, '/favicon.svg') or SameText(Path, '/favicon.ico') then
+      Exit(HandleFavicon);
+    // A página de sintonia não mora sob /api/: ela é tela, não dado.
+    if SameText(Path, UI_PREFIX + 'motion') then
+      Exit(HandleMotionUi);
+    if SameText(Path, UI_PREFIX + 'events') then
+      Exit(HandleEventsUi);
+    if SameText(Path, UI_PREFIX + 'app') then
+      Exit(HandleAppUi);
+    if SameText(Path, UI_PREFIX + 'player') then
+      Exit(HandlePlayerUi);
+    // Os dois scripts que a página do player carrega. Servidos soltos, e não
+    // embutidos nela, porque também servirão às próximas páginas -- e assim o
+    // navegador os guarda em cache uma vez só.
+    if SameText(Path, UI_PREFIX + 'vmsreader.js') then
+      Exit(HandleJs('vmsreader.js', VmsReaderJs));
+    if SameText(Path, UI_PREFIX + 'player.js') then
+      Exit(HandleJs('player.js', PlayerJs));
     // POST existe por uma rota só: SQL longo não cabe confortável numa query
     // string. Todo o resto continua sendo leitura, e recusa POST.
     if SameText(Path, API_PREFIX + 'sql') then
@@ -398,6 +668,18 @@ begin
       if not (SameText(Method, 'GET') or SameText(Method, 'POST')) then
         Exit(TApiResponse.Error(405, 'use GET ou POST'));
       Exit(HandleSql(Query, Body));
+    end;
+
+    // Os parâmetros do servidor. Existe separado do /api/sql de propósito: a
+    // tela de configuração não deveria precisar de uma rota que lê o banco
+    // inteiro, e esta dá para proteger sem tirar aquela do ar.
+    if SameText(Path, API_PREFIX + 'settings') then
+    begin
+      if SameText(Method, 'POST') then
+        Exit(HandleSettingsPost(Body));
+      if not (SameText(Method, 'GET') or SameText(Method, 'HEAD')) then
+        Exit(TApiResponse.Error(405, 'use GET ou POST'));
+      Exit(HandleSettingsGet);
     end;
     if not (SameText(Method, 'GET') or SameText(Method, 'HEAD')) then
       Exit(TApiResponse.Error(405, 'so GET e HEAD'));
@@ -409,7 +691,12 @@ begin
     else if SameText(Path, API_PREFIX + 'segments') then
       Result := HandleSegments(Query)
     else if SameText(Path, API_PREFIX + 'media') then
-      Result := HandleMedia(Query)
+      Result := HandleMedia(Query, False)
+    // Ao vivo é a mesma mídia, seguida pela cauda: o servidor grava sem parar,
+    // e "agora" é o fim do arquivo aberto. Rota separada só para o cliente não
+    // precisar saber onde é o fim — ele manda cursor vazio e recebe o resto.
+    else if SameText(Path, API_PREFIX + 'live') then
+      Result := HandleMedia(Query, True)
     else if SameText(Path, API_PREFIX + 'recordings') then
       Result := HandleRecordings(Query)
     else if SameText(Path, API_PREFIX + 'index') then
@@ -418,13 +705,15 @@ begin
       Result := HandleThumb(Query)
     else if SameText(Path, API_PREFIX + 'events') then
       Result := HandleEvents(Query)
+    else if SameText(Path, API_PREFIX + 'motion/probe') then
+      Result := HandleMotionProbe(Query)
     else
       Result := TApiResponse.Error(404, 'rota desconhecida: ' + Path);
   except
     on E: Exception do
     begin
       if FLogger <> nil then
-        FLogger.Error('api', Format('%s %s: %s', [Method, Uri, E.Message]));
+        FLogger.Error('api', Format('%s %s: %s', [Method, Req.Uri, E.Message]));
       Result := TApiResponse.Error(500, E.Message);
     end;
   end;
@@ -647,6 +936,414 @@ begin
   end;
 end;
 
+// A casca do app: câmeras, dias e reprodução numa página só. A mesma que o
+// servidor local do aparelho serve -- e por isso ela só usa caminho relativo.
+function TApiRouter.HandleAppUi: TApiResponse;
+begin
+  Result.Status := 200;
+  Result.ContentType := 'text/html; charset=utf-8';
+  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('app-ui.html', AppUiHtml));
+end;
+
+// O player de gravação em HTML. Toca `.vms` direto, sem conversão aqui: o
+// vmsreader.js lê o contêiner e o WebCodecs decodifica os AUs como eles estão
+// no arquivo. O formato que já existe continua sendo o protocolo.
+function TApiRouter.HandleLoginUi: TApiResponse;
+begin
+  Result.Status := 200;
+  Result.ContentType := 'text/html; charset=utf-8';
+  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('login-ui.html', LoginUiHtml));
+end;
+
+function TApiRouter.HandleAuthStatus(const Req: TApiRequest): TApiResponse;
+var
+  Root: TJSONObject;
+  Autenticado: Boolean;
+begin
+  Root := TJSONObject.Create;
+  Root.AddPair('enabled', TJSONBool.Create(FAuth.Ligado));
+  // "ainda nao ha senha": e o que faz a tela de entrada virar tela de definir
+  // senha, em vez de pedir uma que nao existe.
+  Root.AddPair('needsSetup', TJSONBool.Create(FAuth.Ligado and FAuth.SemSenha));
+  Root.AddPair('local', TJSONBool.Create(EhLoopback(Req.PeerIP)));
+  Autenticado := (not FAuth.Ligado) or
+                 (FAuth.Avaliar(Req.Authorization, Req.Cookie) = acLiberado);
+  Root.AddPair('authenticated', TJSONBool.Create(Autenticado));
+  // O nome do usuário só para quem já entrou. É pouca coisa, mas é metade do
+  // par que se está tentando adivinhar: não se entrega de graça na rota que
+  // responde sem credencial.
+  if Autenticado then
+    Root.AddPair('user', FAuth.Usuario);
+  Result := TApiResponse.FromJson(Root);
+end;
+
+// Le {user, password} do corpo. Devolve False para corpo que nao seja objeto.
+function LerCredencial(const Body: TBytes; out Usuario, Senha: string): Boolean;
+var
+  Valor: TJSONValue;
+begin
+  Usuario := '';
+  Senha := '';
+  Result := False;
+  Valor := TJSONObject.ParseJSONValue(TEncoding.UTF8.GetString(Body));
+  try
+    if not (Valor is TJSONObject) then Exit;
+    Usuario := TJSONObject(Valor).GetValue<string>('user', '');
+    Senha := TJSONObject(Valor).GetValue<string>('password', '');
+    Result := True;
+  finally
+    Valor.Free;
+  end;
+end;
+
+function TApiRouter.HandleLogin(const Req: TApiRequest): TApiResponse;
+var
+  Usuario, Senha, Token, Cookie: string;
+  Root: TJSONObject;
+begin
+  if not SameText(Req.Method, 'POST') then
+    Exit(TApiResponse.Error(405, 'use POST'));
+  if not LerCredencial(Req.Body, Usuario, Senha) then
+    Exit(TApiResponse.Error(400, 'esperava {user, password}'));
+  if FAuth.SemSenha then
+    Exit(TApiResponse.Error(409, 'defina uma senha primeiro'));
+  if not FAuth.Confere(Usuario, Senha) then
+  begin
+    // Uma mensagem só para os dois casos: dizer "usuário não existe" entregaria
+    // metade da resposta a quem está adivinhando.
+    FLogger.Warn('auth', 'login recusado de ' + Req.PeerIP);
+    Exit(TApiResponse.Error(401, 'usuario ou senha invalidos'));
+  end;
+
+  Token := FAuth.AbrirSessao;
+  FLogger.Info('auth', 'login aceito de ' + Req.PeerIP);
+
+  // HttpOnly: script nenhum precisa ler este cookie, e não poder lê-lo tira o
+  // valor de um XSS. SameSite=Strict: o cookie não vai junto em requisição
+  // vinda de outro site, que é o que impede CSRF nas rotas de escrita.
+  Cookie := Format('Set-Cookie: %s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d',
+    [COOKIE_SESSAO, Token, SESSAO_PADRAO_HORAS * 3600]);
+  if SameText(Trim(Req.ForwardedProto), 'https') then
+    Cookie := Cookie + '; Secure';
+
+  Root := TJSONObject.Create;
+  Root.AddPair('ok', TJSONBool.Create(True));
+  Result := TApiResponse.FromJson(Root);
+  Result.Extra := TArray<string>.Create(Cookie);
+end;
+
+function TApiRouter.HandleLogout(const Req: TApiRequest): TApiResponse;
+var
+  Root: TJSONObject;
+begin
+  FAuth.FecharSessao(CookieDe(Req.Cookie, COOKIE_SESSAO));
+  Root := TJSONObject.Create;
+  Root.AddPair('ok', TJSONBool.Create(True));
+  Result := TApiResponse.FromJson(Root);
+  Result.Extra := TArray<string>.Create(
+    Format('Set-Cookie: %s=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0',
+           [COOKIE_SESSAO]));
+end;
+
+function TApiRouter.HandleAuthSenha(const Req: TApiRequest): TApiResponse;
+var
+  Usuario, Senha, Hash: string;
+  Agora: Int64;
+  Root: TJSONObject;
+begin
+  if not SameText(Req.Method, 'POST') then
+    Exit(TApiResponse.Error(405, 'use POST'));
+  if (FDb = nil) or (not FDb.IsOpen) then
+    Exit(TApiResponse.Error(503, 'banco indisponivel'));
+  if not LerCredencial(Req.Body, Usuario, Senha) then
+    Exit(TApiResponse.Error(400, 'esperava {user, password}'));
+  // Oito é pouco para uma senha boa e muito para um engano de digitação. O
+  // limite existe para não deixar passar "1234" num endereço público.
+  if Length(Senha) < 8 then
+    Exit(TApiResponse.Error(400, 'a senha precisa de ao menos 8 caracteres'));
+  // Usuário em branco MANTÉM o que já está lá. Quem está só trocando a senha
+  // não deveria precisar redigitar o usuário -- e se redigitasse errado, ou
+  // deixasse vazio, trocaria o usuário sem querer e ficaria de fora.
+  if Trim(Usuario) = '' then Usuario := FAuth.Usuario;
+  if Trim(Usuario) = '' then Usuario := 'admin';
+
+  Hash := GerarHashDeSenha(Senha);
+  Agora := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Now), True) * 1000;
+  try
+    // INSERT OR IGNORE antes do UPDATE.
+    //
+    // UPDATE em linha que nao existe nao e erro: afeta zero linhas e devolve
+    // sucesso. Num banco criado antes destas chaves existirem, definir a senha
+    // respondia "ok" e nao gravava nada -- e a tela de entrada continuava
+    // pedindo para definir uma senha, para sempre.
+    FDb.Exec('INSERT OR IGNORE INTO setting (key, value, updated_at_ms) ' +
+             'VALUES (?, ?, ?)', ['auth.user', 'admin', Agora]);
+    FDb.Exec('INSERT OR IGNORE INTO setting (key, value, updated_at_ms) ' +
+             'VALUES (?, ?, ?)', ['auth.hash', '', Agora]);
+    FDb.Exec('UPDATE setting SET value = ?, updated_at_ms = ? WHERE key = ?',
+             [Trim(Usuario), Agora, 'auth.user']);
+    FDb.Exec('UPDATE setting SET value = ?, updated_at_ms = ? WHERE key = ?',
+             [Hash, Agora, 'auth.hash']);
+  except
+    on E: Exception do
+      Exit(TApiResponse.Error(500, E.Message));
+  end;
+  // Recarregar aqui e nao esperar a releitura periodica: quem acabou de definir
+  // a senha vai entrar em seguida, e o Configurar tambem derruba as sessoes
+  // antigas -- que e o efeito esperado de trocar uma senha.
+  RecarregarAuth;
+  FLogger.Info('auth', 'senha definida por ' + Req.PeerIP);
+
+  Root := TJSONObject.Create;
+  Root.AddPair('ok', TJSONBool.Create(True));
+  Root.AddPair('user', Trim(Usuario));
+  Result := TApiResponse.FromJson(Root);
+end;
+
+function TApiRouter.HandleFavicon: TApiResponse;
+begin
+  Result.Status := 200;
+  Result.ContentType := 'image/svg+xml';
+  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('favicon.svg', FaviconSvg));
+  // O ícone não muda entre versões do executável; deixar o navegador guardá-lo
+  // evita um pedido por aba aberta.
+  Result.Extra := TArray<string>.Create('Cache-Control: public, max-age=86400');
+end;
+
+function TApiRouter.HandlePlayerUi: TApiResponse;
+begin
+  Result.Status := 200;
+  Result.ContentType := 'text/html; charset=utf-8';
+  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('player-ui.html', PlayerUiHtml));
+end;
+
+function TApiRouter.HandleJs(const NomeArquivo, Codigo: string): TApiResponse;
+begin
+  Result.Status := 200;
+  Result.ContentType := 'application/javascript; charset=utf-8';
+  Result.Body := TEncoding.UTF8.GetBytes(UiTexto(NomeArquivo, Codigo));
+end;
+
+// A faixa de eventos que o app mostra embaixo do vídeo.
+//
+// Servida pelo servidor, e não carregada de dentro do app, por um motivo
+// prático: assim o `fetch` dela para /api/events e /api/thumb é mesma origem.
+// Carregada por LoadFromStrings com base https, ela seria uma página https
+// tentando buscar http -- conteúdo misto, que o navegador bloqueia.
+function TApiRouter.HandleEventsUi: TApiResponse;
+begin
+  Result.Status := 200;
+  Result.ContentType := 'text/html; charset=utf-8';
+  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('events-ui.html', EventsUiHtml));
+end;
+
+// Todos os parâmetros, em ordem. São poucas dezenas de linhas, então não há
+// paginação: a tela mostra tudo e filtra do lado dela.
+function TApiRouter.HandleSettingsGet: TApiResponse;
+var
+  Root: TJSONObject;
+  Arr: TJSONArray;
+begin
+  if (FDb = nil) or (not FDb.IsOpen) then
+    Exit(TApiResponse.Error(503, 'banco indisponivel'));
+
+  Root := TJSONObject.Create;
+  Arr := TJSONArray.Create;
+  Root.AddPair('settings', Arr);
+  try
+    FDb.Read('SELECT key, value FROM setting ORDER BY key', [],
+      procedure(const Row: IDbRow)
+      var
+        Item: TJSONObject;
+      begin
+        // O hash da senha nao vai para a tela. Nao e segredo -- e um hash --
+        // mas mostra-lo so serviria para alguem tentar quebra-lo offline, e
+        // edita-lo a mao so serviria para travar a entrada.
+        if SameText(Row.AsString('key'), 'auth.hash') then Exit;
+        Item := TJSONObject.Create;
+        Item.AddPair('key', Row.AsString('key'));
+        Item.AddPair('value', Row.AsString('value'));
+        Arr.AddElement(Item);
+      end);
+  except
+    on E: Exception do
+    begin
+      Root.Free;
+      Exit(TApiResponse.Error(500, E.Message));
+    end;
+  end;
+  Result := TApiResponse.FromJson(Root);
+end;
+
+// Grava os parâmetros que vierem no corpo: {"analytics.motionThreshold":"0.008"}.
+//
+// Só chaves que JÁ EXISTEM são aceitas. Sem isso, um erro de digitação criaria
+// uma chave nova que ninguém lê, e a tela mostraria um parâmetro que não faz
+// nada -- pior do que recusar.
+function TApiRouter.HandleSettingsPost(const Body: TBytes): TApiResponse;
+var
+  Texto: string;
+  Valor: TJSONValue;
+  Obj, Root: TJSONObject;
+  Par: TJSONPair;
+  I, Gravadas: Integer;
+  Agora: Int64;
+  Recusadas: TJSONArray;
+  Existe: Boolean;
+begin
+  if (FDb = nil) or (not FDb.IsOpen) then
+    Exit(TApiResponse.Error(503, 'banco indisponivel'));
+
+  Texto := TEncoding.UTF8.GetString(Body);
+  if Trim(Texto) = '' then
+    Exit(TApiResponse.Error(400, 'corpo vazio'));
+
+  Valor := TJSONObject.ParseJSONValue(Texto);
+  if not (Valor is TJSONObject) then
+  begin
+    Valor.Free;
+    Exit(TApiResponse.Error(400, 'esperava um objeto JSON'));
+  end;
+
+  Obj := TJSONObject(Valor);
+  Root := TJSONObject.Create;
+  Recusadas := TJSONArray.Create;
+  Gravadas := 0;
+  Agora := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Now), True) * 1000;
+  try
+    try
+      for I := 0 to Obj.Count - 1 do
+      begin
+        Par := Obj.Pairs[I];
+        // A senha se troca pela rota propria, que sabe gerar o hash. Deixar
+        // gravar aqui abriria o caminho de por texto claro no lugar do hash --
+        // e ai a comparacao nunca mais bateria, trancando o servidor.
+        if SameText(Par.JsonString.Value, 'auth.hash') then
+        begin
+          Recusadas.Add(Par.JsonString.Value);
+          Continue;
+        end;
+        Existe := False;
+        FDb.Read('SELECT 1 AS achou FROM setting WHERE key = ?',
+          [Par.JsonString.Value],
+          procedure(const Row: IDbRow)
+          begin
+            Existe := True;
+          end);
+        if not Existe then
+        begin
+          Recusadas.Add(Par.JsonString.Value);
+          Continue;
+        end;
+        FDb.Exec('UPDATE setting SET value = ?, updated_at_ms = ? WHERE key = ?',
+          [Par.JsonValue.Value, Agora, Par.JsonString.Value]);
+        Inc(Gravadas);
+      end;
+    except
+      on E: Exception do
+      begin
+        Root.Free;
+        Recusadas.Free;
+        Exit(TApiResponse.Error(500, E.Message));
+      end;
+    end;
+  finally
+    Obj.Free;
+  end;
+
+  Root.AddPair('saved', TJSONNumber.Create(Gravadas));
+  Root.AddPair('unknown', Recusadas);
+  // A análise lê a configuração na subida: dizer isso evita o usuário achar
+  // que mexeu no limiar e nada mudou.
+  Root.AddPair('note', 'vale na proxima subida do servidor');
+  Result := TApiResponse.FromJson(Root);
+end;
+
+// A página de sintonia do movimento. Vem embutida no executável (ver
+// Vms.Server.Ui.Html), então não há arquivo solto para faltar.
+function TApiRouter.HandleMotionUi: TApiResponse;
+begin
+  Result.Status := 200;
+  Result.ContentType := 'text/html; charset=utf-8';
+  // Sem cache, mas isso já vem de graca: o TTxSession poe Cache-Control:
+  // no-store em TODA resposta HTTP, e repetir aqui daria o cabecalho em dobro.
+  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('motion-ui.html', MotionUiHtml));
+end;
+
+// O ENSAIO: reprocessa um trecho real com os parâmetros do pedido e devolve o
+// score de CADA quadro. Não grava nada.
+//
+//   GET /api/motion/probe?camera=frente&fromMs=…&toMs=…
+//                        [&stepMs=2000] [&threshold=0.006] [&sceneThreshold=0.85]
+//
+// É a peça que faltava para sintonizar: o banco só guarda o PICO dos eventos
+// que passaram do limiar, então de lá não dá para distinguir "nada se moveu" de
+// "o limiar comeu". Aqui os dois casos são visíveis.
+function TApiRouter.HandleMotionProbe(const Query: string): TApiResponse;
+var
+  Camera: string;
+  FromMs, ToMs, StepMs: Int64;
+  Limiar, Cena: Double;
+  Amostras: TMotionSamples;
+  Root, Item, Caixa: TJSONObject;
+  Arr: TJSONArray;
+  I: Integer;
+  Comeco: TDateTime;
+begin
+  if not KnownCamera(QueryValue(Query, 'camera'), Camera) then
+    Exit(TApiResponse.Error(404, 'camera desconhecida'));
+  if (FProbe = nil) or (not FProbe.Available) then
+    Exit(TApiResponse.Error(503, 'servidor sem como decodificar video'));
+
+  FromMs := QueryInt(Query, 'fromMs', 0);
+  ToMs := QueryInt(Query, 'toMs', 0);
+  if (FromMs <= 0) or (ToMs <= FromMs) then
+    Exit(TApiResponse.Error(400, 'informe fromMs e toMs'));
+
+  StepMs := QueryInt(Query, 'stepMs', 2000);
+  // Os limiares vêm como fração; QueryInt não serve. Vazio = o padrão do
+  // detector, que é o que a página mostra ao abrir.
+  Limiar := StrToFloatDef(QueryValue(Query, 'threshold'), 0.006,
+                          TFormatSettings.Invariant);
+  Cena := StrToFloatDef(QueryValue(Query, 'sceneThreshold'), 0.85,
+                        TFormatSettings.Invariant);
+
+  Comeco := Now;
+  Amostras := FProbe.Run(Camera, FromMs, ToMs, StepMs, Limiar, Cena,
+                         Integer(QueryInt(Query, 'max', 0)));
+
+  Root := TJSONObject.Create;
+  Arr := TJSONArray.Create;
+  Root.AddPair('camera', Camera);
+  Root.AddPair('fromMs', TJSONNumber.Create(FromMs));
+  Root.AddPair('toMs', TJSONNumber.Create(ToMs));
+  Root.AddPair('stepMs', TJSONNumber.Create(StepMs));
+  Root.AddPair('threshold', TJSONNumber.Create(Limiar));
+  Root.AddPair('sceneThreshold', TJSONNumber.Create(Cena));
+  Root.AddPair('count', TJSONNumber.Create(Length(Amostras)));
+  Root.AddPair('elapsedMs', TJSONNumber.Create(MilliSecondsBetween(Now, Comeco)));
+  Root.AddPair('samples', Arr);
+  for I := 0 to High(Amostras) do
+  begin
+    Item := TJSONObject.Create;
+    Item.AddPair('ms', TJSONNumber.Create(Amostras[I].Ms));
+    Item.AddPair('score', TJSONNumber.Create(Amostras[I].Score));
+    Item.AddPair('moved', TJSONBool.Create(Amostras[I].Moved));
+    Item.AddPair('sceneChanged', TJSONBool.Create(Amostras[I].SceneChanged));
+    if not Amostras[I].Box.IsEmpty then
+    begin
+      Caixa := TJSONObject.Create;
+      Caixa.AddPair('l', TJSONNumber.Create(Amostras[I].Box.L));
+      Caixa.AddPair('t', TJSONNumber.Create(Amostras[I].Box.T));
+      Caixa.AddPair('r', TJSONNumber.Create(Amostras[I].Box.R));
+      Caixa.AddPair('b', TJSONNumber.Create(Amostras[I].Box.B));
+      Item.AddPair('box', Caixa);
+    end;
+    Arr.AddElement(Item);
+  end;
+  Result := TApiResponse.FromJson(Root);
+end;
+
 // A miniatura do instante pedido. O cliente manda o instante que quer mostrar;
 // a resposta diz, no X-Vms-Thumb-Ms, o minuto que a imagem realmente representa
 // — é por ele que o app sabe que já tem aquela imagem e não pede de novo.
@@ -829,7 +1526,7 @@ begin
   Result := TApiResponse.FromJson(Root);
 end;
 
-function TApiRouter.HandleMedia(const Query: string): TApiResponse;
+function TApiRouter.HandleMedia(const Query: string; Live: Boolean): TApiResponse;
 var
   Req: TMediaRequest;
   Frag: TMediaFragment;
@@ -854,6 +1551,9 @@ begin
   end;
 
   CursorText := Trim(QueryValue(Query, 'cursor'));
+  // O cliente abre o ao vivo com cursor=0, que é como o anel do app diz "do
+  // começo". Aqui não há anel: 0 quer dizer "sem cursor", e a cauda resolve.
+  if Live and (CursorText = '0') then CursorText := '';
   if CursorText <> '' then
     if not TMediaCursor.Decode(CursorText, Req.Cursor) then
       Exit(TApiResponse.Error(400, 'cursor invalido'));
@@ -861,6 +1561,14 @@ begin
   if Trim(QueryValue(Query, 'fromMs')) <> '' then
   begin
     Req.FromMs := QueryInt(Query, 'fromMs', 0);
+    Req.HasFromMs := True;
+  end
+  else if Live and (CursorText = '') then
+  begin
+    // Abrir o ao vivo é entrar pelo fim. O recuo dá o que tocar enquanto o
+    // primeiro pedido de continuação não volta; o keyframe atrás dele o
+    // /api/media já busca sozinho.
+    Req.FromMs := LocalToUnixMs(Now) - LIVE_PREROLL_MS;
     Req.HasFromMs := True;
   end;
   if Trim(QueryValue(Query, 'fromBlock')) <> '' then
@@ -878,6 +1586,20 @@ begin
   Frag := FMedia.Fetch(Req);
   if not Frag.Ok then
     Exit(TApiResponse.Error(Frag.Status, Frag.Error));
+
+  // 204 com o cursor de volta: nada novo ainda. Corpo vazio é a resposta certa,
+  // e o cursor tem de voltar junto, senão quem segue o ao vivo perde o fio e
+  // recomeça do zero a cada pergunta.
+  if Frag.Empty then
+  begin
+    Result.Status := 204;
+    Result.ContentType := 'application/x-vms';
+    Result.Body := nil;
+    Result.Extra := TArray<string>.Create(
+      'X-Vms-Cursor: ' + Frag.Cursor,
+      Format('X-Vms-Growing: %d', [Ord(Frag.Growing)]));
+    Exit;
+  end;
 
   Result.Status := 200;
   Result.ContentType := 'application/x-vms';

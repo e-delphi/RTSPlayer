@@ -68,6 +68,11 @@ function BuildFooter(TotalBlocks: Cardinal; DurationMs: Int64;
 // entrega uma varredura: ali ele reescreve o bloco com só os quadros que o
 // cliente vai exibir (ver Vms.Server.Media).
 function BuildBlockBytes(const Block: TVmsBlock): TBytes;
+// Os bytes do cabeçalho. Mesmo motivo do BuildBlockBytes: além do gravador,
+// quem monta cabeçalho é quem serve mídia ao vivo da memória, sem arquivo
+// nenhum (ver VMS.Live.Ring). Dois serializadores dariam dois formatos na
+// primeira vez que um deles mudasse.
+function BuildHeaderBytes(const Header: TVmsHeader): TBytes;
 
 implementation
 
@@ -214,15 +219,12 @@ begin
   inherited;
 end;
 
-procedure TFileRecordingWriter.WriteHeader(const Header: TVmsHeader);
+function BuildHeaderBytes(const Header: TVmsHeader): TBytes;
 var
   UriBytes, Buf: TBytes;
   Size, Offset: Integer;
   Crc: Cardinal;
 begin
-  if FHeaderDone then
-    raise EVmsIoError.Create('Header already written');
-
   UriBytes := TEncoding.UTF8.GetBytes(Header.SourceUri);
   if Length(UriBytes) > 65535 then
     SetLength(UriBytes, 65535);
@@ -286,7 +288,17 @@ begin
 
   Crc := Crc32Update(0, Buf, 0, Offset);
   WriteU32ToBytes(Buf, Offset, Crc);
+  Result := Buf;
+end;
 
+procedure TFileRecordingWriter.WriteHeader(const Header: TVmsHeader);
+var
+  Buf: TBytes;
+begin
+  if FHeaderDone then
+    raise EVmsIoError.Create('Header already written');
+
+  Buf := BuildHeaderBytes(Header);
   FStream.WriteBuffer(Buf[0], Length(Buf));
   Inc(FBytes, Length(Buf));
   FHeaderDone := True;

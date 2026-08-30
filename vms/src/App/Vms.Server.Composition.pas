@@ -55,6 +55,12 @@ function BuildThumbSource(Cache: TVmsIndexCache; const Db: IDbQueue;
                           ThumbWidth, ThumbHeight: Integer;
                           const Logger: ILogger): IThumbSource;
 
+// Monta o ensaio do detector de movimento — a peca da pagina /ui/motion.
+// Reusa as MESMAS duas interfaces do worker e do servico de miniaturas: achar o
+// quadro e decodifica-lo. Sem FFmpeg devolve nil, e a rota responde 503.
+function BuildMotionProbe(Cache: TVmsIndexCache;
+                          const Logger: ILogger): IMotionProbe;
+
 type
   // O que a análise devolve para o `.dpr` amarrar: a fonte que a API consulta,
   // o dono do arquivo de eventos e as threads que precisam ser paradas.
@@ -98,6 +104,7 @@ uses
   Vms.Thumb.Service,
   Vms.Analytics.Motion,
   Vms.Analytics.Analyzer,
+  Vms.Analytics.Probe,
   Vms.Analytics.StoreDb,
 {$IFDEF MSWINDOWS}
   Vms.Thumb.FFmpeg,
@@ -245,6 +252,24 @@ begin
       Analyzer, Store, Cache, Cfg, Clock, Logger, Stop);
     // (Store entra como IAnalysisProgress; a conversão é implícita.)
   end;
+end;
+
+function BuildMotionProbe(Cache: TVmsIndexCache;
+  const Logger: ILogger): IMotionProbe;
+{$IFDEF MSWINDOWS}
+var
+  Grabber: IFrameGrabber;
+{$ENDIF}
+begin
+  Result := nil;
+{$IFDEF MSWINDOWS}
+  // Decodificador PROPRIO, e nao o da analise: o ensaio roda na thread da
+  // requisicao HTTP, e compartilhar levaria as duas a se atrapalharem.
+  Grabber := TFFmpegFrameGrabber.Create(Logger, 'probe');
+  if Grabber.Available then
+    Result := TMotionProbe.Create(TVmsKeyframeSource.Create(Cache, Logger),
+                                  Grabber, Logger);
+{$ENDIF}
 end;
 
 function IsDvripUrl(const Url: string): Boolean;

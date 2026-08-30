@@ -854,6 +854,9 @@ begin
   FBlockBuilder := TBlockBuilder.Create(FConfig.MaxBlockSamples,
                                         FConfig.MaxBlockDurationMs,
                                         FConfig.MaxBlockSizeBytes);
+  // Com as escalas, a âncora de cada bloco passa a ser derivada do pts em vez
+  // de saltar para o relógio de chegada a cada bloco. Ver VMS.Rec.Block.
+  FBlockBuilder.SetTimescales(Header.Video.Timescale, Header.Audio.Timescale);
   FBlockBuilder.SetOnBlockClosed(
     procedure(const Block: TVmsBlock)
     begin

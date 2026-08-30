@@ -4,19 +4,6 @@ uses
   System.StartUpCopy,
   FMX.Forms,
   Inicio in 'src\UI\Inicio.pas' {Form1},
-  {$IFDEF ANDROID}
-  VMS.Android.JNIUtil in 'src\Android\VMS.Android.JNIUtil.pas',
-  VMS.Android.VideoDecoder in 'src\Android\VMS.Android.VideoDecoder.pas',
-  VMS.Android.AudioDecoder in 'src\Android\VMS.Android.AudioDecoder.pas',
-  VMS.Android.MediaRenderer in 'src\Android\VMS.Android.MediaRenderer.pas',
-  {$ENDIF }
-  {$IFDEF MSWINDOWS}
-  FFmpegLib in 'src\Win\FFmpegLib.pas',
-  VMS.Win.VideoDecoder in 'src\Win\VMS.Win.VideoDecoder.pas',
-  VMS.Win.AudioDecoder in 'src\Win\VMS.Win.AudioDecoder.pas',
-  VMS.Win.MediaRenderer in 'src\Win\VMS.Win.MediaRenderer.pas',
-  {$ENDIF }
-  VMS.Media.Renderer in 'src\Media\VMS.Media.Renderer.pas',
   VMS.Android.MemoLogger in 'src\Android\VMS.Android.MemoLogger.pas',
   VMS.Dvrip.Protocol in 'src\Dvrip\VMS.Dvrip.Protocol.pas',
   VMS.Dvrip.Media in 'src\Dvrip\VMS.Dvrip.Media.pas',
@@ -24,8 +11,8 @@ uses
   VMS.App.Clock in 'src\App\VMS.App.Clock.pas',
   VMS.App.Composition in 'src\App\VMS.App.Composition.pas',
   VMS.App.Config in 'src\App\VMS.App.Config.pas',
-  VMS.App.Share in 'src\App\VMS.App.Share.pas',
   VMS.App.Logger in 'src\App\VMS.App.Logger.pas',
+  VMS.App.Encerrar in 'src\App\VMS.App.Encerrar.pas',
   VMS.App.ScreenAwake in 'src\App\VMS.App.ScreenAwake.pas',
   VMS.Depk.AAC in 'src\Depacketizer\VMS.Depk.AAC.pas',
   VMS.Depk.Base in 'src\Depacketizer\VMS.Depk.Base.pas',
@@ -52,7 +39,6 @@ uses
   VMS.Rec.Block in 'src\Recording\VMS.Rec.Block.pas',
   VMS.Rec.Crc32 in 'src\Recording\VMS.Rec.Crc32.pas',
   VMS.Rec.Format in 'src\Recording\VMS.Rec.Format.pas',
-  VMS.Rec.Reader in 'src\Recording\VMS.Rec.Reader.pas',
   VMS.Rec.Paths in 'src\Recording\VMS.Rec.Paths.pas',
   VMS.Rec.Writer in 'src\Recording\VMS.Rec.Writer.pas',
   VMS.Rec.Sidecar in 'src\Recording\VMS.Rec.Sidecar.pas',
@@ -66,18 +52,21 @@ uses
   VMS.Rtsp.WireReader in 'src\Rtsp\VMS.Rtsp.WireReader.pas',
   VMS.Sdp.Parser in 'src\Sdp\VMS.Sdp.Parser.pas',
   VMS.Sdp.Types in 'src\Sdp\VMS.Sdp.Types.pas',
-  VMS.Api.Client in 'src\Api\VMS.Api.Client.pas',
-  VMS.Play.Engine in 'src\Playback\VMS.Play.Engine.pas',
   UI.Common in 'src\UI\UI.Common.pas',
-  UI.List in 'src\UI\UI.List.pas' {FrameList: TFrame},
-  UI.Player in 'src\UI\UI.Player.pas' {FramePlayer: TFrame},
-  UI.Thumbs in 'src\UI\UI.Thumbs.pas',
-  UI.Editor in 'src\UI\UI.Editor.pas' {FrameEditor: TFrame},
-  UI.Editor.Paths in 'src\UI\UI.Editor.Paths.pas',
-  UI.Import in 'src\UI\UI.Import.pas',
-  UI.Days in 'src\UI\UI.Days.pas',
-  UI.Timeline in 'src\UI\UI.Timeline.pas',
-  UI.Events in 'src\UI\UI.Events.pas';
+  VMS.Live.Ring in 'src\Api\VMS.Live.Ring.pas',
+  VMS.Win.Edge in 'src\Win\VMS.Win.Edge.pas',
+  VMS.Local.Server in 'src\Api\VMS.Local.Server.pas',
+  VMS.App.Servers in 'src\App\VMS.App.Servers.pas',
+  // A MESMA unit gerada que o vmsserver serve: uma pagina, dois hospedeiros.
+  Vms.Server.Player.Html in 'vms\src\Api\Vms.Server.Player.Html.pas',
+  Vms.Server.Favicon.Svg in 'vms\src\Api\Vms.Server.Favicon.Svg.pas',
+  Vms.Server.UiFiles in 'vms\src\Api\Vms.Server.UiFiles.pas',
+  Vms.Server.Player.Js in 'vms\src\Api\Vms.Server.Player.Js.pas',
+  Vms.Server.Reader.Js in 'vms\src\Api\Vms.Server.Reader.Js.pas',
+  Vms.Server.Ui.Html in 'vms\src\Api\Vms.Server.Ui.Html.pas',
+  Vms.Server.App.Html in 'vms\src\Api\Vms.Server.App.Html.pas',
+  Vms.Server.Events.Html in 'vms\src\Api\Vms.Server.Events.Html.pas',
+  UI.Shell in 'src\UI\UI.Shell.pas';
 
 {$R *.res}
 

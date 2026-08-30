@@ -78,6 +78,21 @@ begin
 
   if Versao = SCHEMA_VERSION then
   begin
+    // Em dia quanto a TABELAS, o que nao quer dizer em dia quanto a AJUSTES.
+    // Uma versao nova do vmsserver pode trazer chaves novas em `setting`, e o
+    // banco criado antes dela nao as tem. Como o bloco e INSERT OR IGNORE, ele
+    // acrescenta o que falta e nao toca no que o usuario mudou.
+    //
+    // Sem isto a chave nova nunca existia, e como a gravacao de ajuste e um
+    // UPDATE, gravar nela nao dava erro nem gravava nada -- foi o que aconteceu
+    // com auth.hash: "senha definida" e nada no banco.
+    try
+      Db.ExecScript(SettingsSeedSql);
+    except
+      on E: Exception do
+        if Logger <> nil then
+          Logger.Warn('db', 'nao consegui semear ajustes novos: ' + E.Message);
+    end;
     if Logger <> nil then
       Logger.Info('db', Format('esquema v%d, em dia', [Versao]));
     Exit;

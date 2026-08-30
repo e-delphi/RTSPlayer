@@ -267,6 +267,13 @@
         <DCCReference Include="src\Db\Vms.Db.Schema.pas"/>
         <DCCReference Include="src\Db\Vms.Db.Config.pas"/>
         <DCCReference Include="src\Analytics\Vms.Analytics.StoreDb.pas"/>
+        <DCCReference Include="src\Analytics\Vms.Analytics.Probe.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.Ui.Html.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.Player.Html.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.Player.Js.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.Reader.Js.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.App.Html.pas"/>
+        <DCCReference Include="src\Api\Vms.Server.Events.Html.pas"/>
         <DCCReference Include="src\App\Vms.Server.Config.pas"/>
         <DCCReference Include="src\App\Vms.Server.Composition.pas"/>
         <BuildConfiguration Include="Base">

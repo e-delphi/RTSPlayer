@@ -47,11 +47,31 @@
 <%services%>
         <!-- Our activity is a subclass of the built-in NativeActivity framework class.
              This will take care of integrating with our NDK code. -->
+        <!-- windowSoftInputMode=adjustResize: com o padrao (adjustPan) a
+             janela nao encolhe quando o teclado sobe. Ele fica POR CIMA, e o
+             campo que se esta digitando some atras dele. Com resize a area
+             util diminui e o WebView acompanha. -->
+        <!-- Tema preto, e daqui, e nao do styles.xml.
+
+             O styles.xml e styles-v21.xml que o Delphi gera saem com
+             Theme.Material.Light.NoActionBar, cujo windowBackground e #FAFAFA:
+             e essa a cor que o sistema pinta na janela enquanto o processo
+             sobe, antes de existir formulario, WebView ou pagina. Editar
+             aqueles arquivos nao adianta, eles sao SAIDA de build e a IDE os
+             reescreve a cada compilacao.
+
+             O tema declarado na activity vence o da application, e este arquivo
+             e fonte do projeto: a IDE so substitui os %placeholders% dele.
+             Theme.Black.NoTitleBar da janela preta; e como ele nao e da familia
+             Material, nao pinta as barras do sistema por conta propria, entao a
+             de cima fica preta tambem. -->
         <activity
             android:name="com.embarcadero.firemonkey.FMXNativeActivity"
             android:exported="true"
             android:label="%activityLabel%"
+            android:theme="@android:style/Theme.Black.NoTitleBar"
             android:configChanges="orientation|keyboard|keyboardHidden|screenSize|screenLayout|uiMode"
+            android:windowSoftInputMode="adjustResize"
             android:launchMode="singleTask">
             <!-- Tell NativeActivity the name of our .so -->
             <meta-data android:name="android.app.lib_name" android:value="%libNameValue%" />

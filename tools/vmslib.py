@@ -526,6 +526,95 @@ def parse_h264_sps(nal):
                 width=width, height=height)
 
 
+def parse_h265_sps(nal):
+    """Dimensoes e perfil do SPS de H.265. O NAL header do HEVC tem 2 bytes.
+
+    Existe porque o cabecalho do .vms guarda 0x0 para video, e no H.265 nao ha
+    outro lugar de onde tirar a resolucao verdadeira. Foi escrito quando o mesmo
+    quadro decodificou como 2560x1440 no Edge e 2304x1088 num WebView, e so o
+    SPS podia dizer qual dos dois estava certo.
+
+    Le ate a janela de conformidade e para: o resto do SPS nao interessa aqui.
+    """
+    b = _Bits(nal[2:])
+    b.u(4)                                   # sps_video_parameter_set_id
+    max_sub = b.u(3)                         # sps_max_sub_layers_minus1
+    b.u(1)                                   # sps_temporal_id_nesting_flag
+
+    # profile_tier_level
+    profile_space = b.u(2)
+    tier = b.u(1)
+    profile_idc = b.u(5)
+    compat = 0
+    for _ in range(32):
+        compat = (compat << 1) | b.u(1)
+    # 4 flags nomeados + 43 reservados + 1 = 48 bits de restricoes
+    restricoes = 0
+    for _ in range(48):
+        restricoes = (restricoes << 1) | b.u(1)
+    level = b.u(8)
+
+    perfil_sub, nivel_sub = [], []
+    for _ in range(max_sub):
+        perfil_sub.append(b.u(1))
+        nivel_sub.append(b.u(1))
+    if max_sub > 0:
+        for _ in range(max_sub, 8):
+            b.u(2)                           # reserved_zero_2bits
+    for i in range(max_sub):
+        if perfil_sub[i]:
+            b.u(88)
+        if nivel_sub[i]:
+            b.u(8)
+
+    b.ue()                                   # sps_seq_parameter_set_id
+    chroma = b.ue()
+    if chroma == 3:
+        b.u(1)                               # separate_colour_plane_flag
+    largura = b.ue()
+    altura = b.ue()
+
+    # A janela de conformidade e o recorte de exibicao: e a diferenca entre o
+    # quadro codificado (multiplo do tamanho de CTU) e o que se ve.
+    cortes = [0, 0, 0, 0]
+    if b.u(1):
+        cortes = [b.ue(), b.ue(), b.ue(), b.ue()]
+    sub_w = 2 if chroma in (1, 2) else 1
+    sub_h = 2 if chroma == 1 else 1
+
+    return dict(profile_space=profile_space, tier=tier, profile_idc=profile_idc,
+                compat=compat, constraints=restricoes, level=level,
+                chroma=chroma,
+                coded_width=largura, coded_height=altura,
+                width=largura - sub_w * (cortes[0] + cortes[1]),
+                height=altura - sub_h * (cortes[2] + cortes[3]))
+
+
+def h265_codec_string(sps):
+    """A cadeia `hev1.*` que descreve ESTE fluxo, no formato do RFC 6381.
+
+    hev1 (e nao hvc1) porque o .vms guarda Annex-B com os parameter sets no
+    fluxo, ou prefixaveis a partir do extradata -- nos dois casos sem hvcC.
+    """
+    espaco = ['', 'A', 'B', 'C'][sps['profile_space']]
+    # A compatibilidade vai com os bits invertidos, em hexa, sem zeros a frente.
+    rev = 0
+    for i in range(32):
+        rev = (rev << 1) | ((sps['compat'] >> i) & 1)
+    partes = ['hev1',
+              '%s%d' % (espaco, sps['profile_idc']),
+              '%X' % rev,
+              '%s%d' % ('H' if sps['tier'] else 'L', sps['level'])]
+    # Os seis bytes de restricao, do mais significativo para o menos, sem os
+    # zeros do fim -- que e o que a norma manda omitir.
+    bytes_restricao = [(sps['constraints'] >> (40 - 8 * i)) & 0xFF
+                       for i in range(6)]
+    while bytes_restricao and bytes_restricao[-1] == 0:
+        bytes_restricao.pop()
+    partes += ['%02X' % v for v in bytes_restricao]
+    return '.'.join(partes)
+
+
 def parse_h264_pps(nal):
     b = _Bits(nal[1:])
     pps_id = b.ue()

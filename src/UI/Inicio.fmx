@@ -2,8 +2,10 @@ object Form1: TForm1
   Left = 0
   Top = 0
   Caption = 'Player RTSP'
-  ClientHeight = 640
-  ClientWidth = 360
+  ClientHeight = 790
+  ClientWidth = 460
+  Fill.Color = claBlack
+  Fill.Kind = Solid
   FormFactor.Width = 360
   FormFactor.Height = 640
   FormFactor.Devices = [Desktop]

@@ -19,6 +19,10 @@ const
 // O script inteiro, para o TFDScript executar de uma vez.
 function SchemaSql: string;
 
+// So o bloco de padroes do `setting`. E INSERT OR IGNORE: rodar de novo nao
+// mexe no que o usuario ja mudou, e acrescenta o que a versao nova trouxe.
+function SettingsSeedSql: string;
+
 implementation
 
 uses
@@ -26,7 +30,7 @@ uses
   System.Classes;
 
 const
-  LINHAS: array[0..176] of string = (
+  LINHAS: array[0..182] of string = (
     'PRAGMA foreign_keys = ON;',
     '',
     'CREATE TABLE db_meta (',
@@ -183,6 +187,12 @@ const
     '  (''live.maxBufferMB'',             ''32'',          0),',
     '',
     '  (''api.enabled'',                  ''1'',           0),',
+    '',
+    '  (''auth.enabled'',                 ''1'',           0),',
+    '  (''auth.user'',                    ''admin'',       0),',
+    '',
+    '  (''auth.hash'',                    '''',            0),',
+    '  (''auth.sessionHours'',            ''720'',         0),',
     '  (''api.maxBlocksPerRequest'',      ''32'',          0),',
     '',
     '  (''analytics.enabled'',            ''0'',           0),',
@@ -206,14 +216,14 @@ const
     'PRAGMA user_version = 1;'
   );
 
-function SchemaSql: string;
+function Junta(De, Ate: Integer): string;
 var
   SB: TStringBuilder;
   I: Integer;
 begin
   SB := TStringBuilder.Create;
   try
-    for I := Low(LINHAS) to High(LINHAS) do
+    for I := De to Ate do
     begin
       SB.Append(LINHAS[I]);
       SB.Append(sLineBreak);
@@ -222,6 +232,16 @@ begin
   finally
     SB.Free;
   end;
+end;
+
+function SchemaSql: string;
+begin
+  Result := Junta(Low(LINHAS), High(LINHAS));
+end;
+
+function SettingsSeedSql: string;
+begin
+  Result := Junta(131, 180);
 end;
 
 end.

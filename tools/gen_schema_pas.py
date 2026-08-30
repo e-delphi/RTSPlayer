@@ -75,6 +75,21 @@ def main():
             print('   ', l)
         return 1
 
+    # Onde comeca e onde acaba o bloco de padroes. O EnsureSchema executa so
+    # ele quando o banco ja existe: assim um ajuste novo, acrescentado por uma
+    # versao nova, aparece em quem ja tinha o banco criado. Sem isto a chave
+    # nova simplesmente nunca existia, e um UPDATE nela nao gravava nada.
+    ini = fim = -1
+    for i, l in enumerate(linhas):
+        if ini < 0 and l.upper().startswith('INSERT OR IGNORE INTO SETTING'):
+            ini = i
+        elif ini >= 0 and l.rstrip().endswith(';'):
+            fim = i
+            break
+    if ini < 0 or fim < 0:
+        print('ERRO: nao achei o bloco INSERT OR IGNORE INTO setting')
+        return 1
+
     corpo = []
     for i, l in enumerate(linhas):
         virgula = ',' if i < len(linhas) - 1 else ''
@@ -101,6 +116,10 @@ const
 // O script inteiro, para o TFDScript executar de uma vez.
 function SchemaSql: string;
 
+// So o bloco de padroes do `setting`. E INSERT OR IGNORE: rodar de novo nao
+// mexe no que o usuario ja mudou, e acrescenta o que a versao nova trouxe.
+function SettingsSeedSql: string;
+
 implementation
 
 uses
@@ -112,14 +131,14 @@ const
 %s
   );
 
-function SchemaSql: string;
+function Junta(De, Ate: Integer): string;
 var
   SB: TStringBuilder;
   I: Integer;
 begin
   SB := TStringBuilder.Create;
   try
-    for I := Low(LINHAS) to High(LINHAS) do
+    for I := De to Ate do
     begin
       SB.Append(LINHAS[I]);
       SB.Append(sLineBreak);
@@ -130,8 +149,18 @@ begin
   end;
 end;
 
+function SchemaSql: string;
+begin
+  Result := Junta(Low(LINHAS), High(LINHAS));
+end;
+
+function SettingsSeedSql: string;
+begin
+  Result := Junta(%d, %d);
+end;
+
 end.
-''' % (len(linhas) - 1, '\n'.join(corpo))
+''' % (len(linhas) - 1, '\n'.join(corpo), ini, fim)
 
     # utf-8 no arquivo: os COMENTARIOS da unit tem acento, como em todo o
     # projeto. O que precisa ser ASCII sao os LITERAIS, e isso ja foi

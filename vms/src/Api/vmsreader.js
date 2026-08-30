@@ -1,0 +1,456 @@
+// Leitor de .vms em JavaScript.
+//
+// Porte de tools/vmslib.py, que por sua vez segue VMS.Rec.Format.pas. Mudou o
+// formato la, muda nos tres. O layout esta documentado no cabecalho do
+// vmslib.py; o resumo do que este arquivo le:
+//
+//   header: 'VMS1' | version(2) | header_size(4) | creation_unix_ms(8)
+//           | uri_len(2)+uri | video: present(1) codec(1) timescale(4) w(2) h(2)
+//           + extradata_len(4)+extradata
+//           | audio: present(1) codec(1) rate(4) ch(1) bits(1) timescale(4)
+//           + extradata_len(4)+extradata | crc32(4)
+//   bloco:  'BLK\x01' | block_size(4) | seq(4) | start_unix_ms(8)
+//           | sample_count(4) | index_size(4) | index | payload | crc32(4)
+//   indice: track_id(1) flags(1) pts(8) payload_offset(4) payload_size(4)
+//
+// Inteiros em little-endian. track_id 0 = video, 1 = audio. flags bit 0 =
+// keyframe.
+//
+// ## Por que ler o container aqui, e nao converter no servidor
+//
+// Porque nao e preciso. O formato ja existe e ja e o protocolo: /api/media
+// devolve header + blocos crus, e o WebCodecs come Annex-B direto (medido). Um
+// empacotador fMP4 do lado Pascal seria trabalho para chegar no mesmo lugar --
+// e ainda assim nao resolveria o audio, que e G.711 e nenhum navegador toca
+// dentro de MP4.
+//
+// ## O que este leitor NAO faz
+//
+// Nao valida CRC. O Pascal e o Python validam porque cuidam da integridade do
+// arquivo; aqui os bytes vieram por HTTP, ja com verificacao embaixo, e gastar
+// CPU de celular recalculando CRC-32 de cada bloco nao compra nada.
+//
+// Nao le VIDX nem rodape: quem acha o instante e o servidor, na rota /api/media.
+// Aqui so se percorre para a frente o que chegou.
+
+"use strict";
+
+var VMS = (function () {
+
+  var MAGIC_FILE = 0x31534D56;     // 'VMS1' lido como u32 little-endian
+  var MAGIC_BLOCK = 0x014B4C42;    // 'BLK\x01'
+  var MAGIC_FOOTER = 0x464F4556;   // 'VEOF'
+  var MAGIC_ANCHOR = 0x434E4142;   // 'BANC'
+
+  var BLOCK_HEADER_SIZE = 28;
+  var INDEX_ENTRY_SIZE = 18;
+  var ANCHOR_SIZE = 20;
+
+  var FLAG_KEYFRAME = 0x01;
+
+  var VIDEO_CODECS = { 0: "nenhum", 1: "H264", 2: "H265", 3: "MJPEG" };
+  var AUDIO_CODECS = { 0: "nenhum", 1: "PCM", 2: "AAC", 3: "G711U",
+                       4: "G711A", 5: "G726-16", 6: "G726-24",
+                       7: "G726-32", 8: "G726-40" };
+
+  // Os instantes do .vms sao unix em milissegundos, entao passam de 2^32 e
+  // exigem 64 bits. BigInt seria correto e seria lento no laco de cada sample;
+  // Number aguenta inteiro exato ate 2^53, e um carimbo de tempo em ms so
+  // chegaria la no ano 287396. A perda de precisao nao existe nesta faixa.
+  function i64(dv, o) {
+    var lo = dv.getUint32(o, true);
+    var hi = dv.getInt32(o + 4, true);
+    return hi * 4294967296 + lo;
+  }
+
+  function lerHeader(dv, bytes) {
+    if (dv.byteLength < 10 || dv.getUint32(0, true) !== MAGIC_FILE)
+      throw new Error("nao e um .vms");
+
+    var h = { version: dv.getUint16(4, true), size: dv.getUint32(6, true) };
+    var o = 10;
+    h.creationMs = i64(dv, o); o += 8;
+    var uriLen = dv.getUint16(o, true); o += 2;
+    h.uri = new TextDecoder().decode(
+      new Uint8Array(bytes.buffer, bytes.byteOffset + o, uriLen));
+    o += uriLen;
+
+    var v = {};
+    v.present = bytes[o] !== 0; o += 1;
+    v.codec = bytes[o]; o += 1;
+    v.codecName = VIDEO_CODECS[v.codec] || ("?" + v.codec);
+    v.timescale = dv.getUint32(o, true); o += 4;
+    v.width = dv.getUint16(o, true); o += 2;
+    v.height = dv.getUint16(o, true); o += 2;
+    var n = dv.getUint32(o, true); o += 4;
+    v.extradata = bytes.subarray(o, o + n); o += n;
+    h.video = v;
+
+    var a = {};
+    a.present = bytes[o] !== 0; o += 1;
+    a.codec = bytes[o]; o += 1;
+    a.codecName = AUDIO_CODECS[a.codec] || ("?" + a.codec);
+    a.sampleRate = dv.getUint32(o, true); o += 4;
+    a.channels = bytes[o]; o += 1;
+    a.bits = bytes[o]; o += 1;
+    a.timescale = dv.getUint32(o, true); o += 4;
+    n = dv.getUint32(o, true); o += 4;
+    a.extradata = bytes.subarray(o, o + n); o += n;
+    h.audio = a;
+
+    return h;
+  }
+
+  // Percorre os blocos a partir do fim do header. Para no rodape, no primeiro
+  // magic invalido ou num bloco cortado -- que e o que se ve num arquivo ainda
+  // sendo gravado, e nao e erro.
+  function lerBlocos(dv, bytes, header) {
+    var blocos = [];
+    var o = header.size;
+
+    while (o + BLOCK_HEADER_SIZE <= bytes.length) {
+      var magic = dv.getUint32(o, true);
+      if (magic === MAGIC_FOOTER) break;
+      if (magic !== MAGIC_BLOCK) break;
+
+      var size = dv.getUint32(o + 4, true);
+      if (size < BLOCK_HEADER_SIZE || o + size > bytes.length) break;
+
+      var b = {
+        seq: dv.getUint32(o + 8, true),
+        startMs: i64(dv, o + 12),
+        videoAnchorMs: 0,
+        audioAnchorMs: 0,
+        samples: []
+      };
+      var count = dv.getUint32(o + 20, true);
+      var indexSize = dv.getUint32(o + 24, true);
+
+      var p = o + BLOCK_HEADER_SIZE;
+      var payload = p + indexSize;
+
+      // A ancora A/V vem DEPOIS das entradas de sample, ainda dentro da area de
+      // indice. Quem nao a conhece percorre so `count` entradas e acha o
+      // payload por indexSize, ignorando estes bytes -- e por isso ela pode
+      // existir sem quebrar leitor antigo.
+      var ancora = p + count * INDEX_ENTRY_SIZE;
+      if (indexSize >= count * INDEX_ENTRY_SIZE + ANCHOR_SIZE &&
+          ancora + ANCHOR_SIZE <= bytes.length &&
+          dv.getUint32(ancora, true) === MAGIC_ANCHOR) {
+        b.videoAnchorMs = i64(dv, ancora + 4);
+        b.audioAnchorMs = i64(dv, ancora + 12);
+      }
+
+      // O relogio de parede de cada sample, pela MESMA regra do
+      // VMS.Play.Engine.pas (procurar por VideoAnchorMs):
+      //
+      //   wallMs = ancora[trilha] + (pts - primeiroPts[trilha]) * 1000 / timescale
+      //
+      // Tres detalhes que custam caro se esquecidos:
+      //
+      //   * o `pts` NAO e unix ms -- e a escala da trilha, e video costuma
+      //     numerar em 90 kHz enquanto o audio numera na taxa de amostragem.
+      //     Subtrair um do outro da instante absurdo.
+      //   * a origem reinicia A CADA BLOCO, e nao no arquivo.
+      //   * a ancora e por trilha; sem ela vale o StartUnixMs do bloco.
+      var primeiroPts = [0, 0], temPrimeiro = [false, false];
+      var ancoras = [b.videoAnchorMs || b.startMs, b.audioAnchorMs || b.startMs];
+      var escalas = [header.video.timescale || 1000,
+                     header.audio.timescale || header.audio.sampleRate || 1000];
+
+      for (var i = 0; i < count; i++) {
+        if (p + INDEX_ENTRY_SIZE > o + size) break;
+        var tid = bytes[p];
+        var flags = bytes[p + 1];
+        var pts = i64(dv, p + 2);
+        var off = dv.getUint32(p + 10, true);
+        var sz = dv.getUint32(p + 14, true);
+        p += INDEX_ENTRY_SIZE;
+        if (tid > 1) continue;              // o formato so tem video(0) e audio(1)
+
+        if (!temPrimeiro[tid]) { primeiroPts[tid] = pts; temPrimeiro[tid] = true; }
+        var wall = ancoras[tid] +
+                   Math.round((pts - primeiroPts[tid]) * 1000 / escalas[tid]);
+
+        // subarray, e nao slice: nao copia. Um bloco pode ter 1 MB, e copiar
+        // cada sample dobraria a memoria por fragmento sem motivo.
+        b.samples.push({
+          trackId: tid,
+          flags: flags,
+          keyframe: (flags & FLAG_KEYFRAME) !== 0,
+          isVideo: tid === 0,
+          isAudio: tid === 1,
+          pts: pts,                          // cru, na escala da trilha
+          wallMs: wall,                      // unix ms -- e o que o player usa
+          data: bytes.subarray(payload + off, payload + off + sz)
+        });
+      }
+
+      blocos.push(b);
+      o += size;
+    }
+    return blocos;
+  }
+
+  // Le um fragmento inteiro (header + blocos), como /api/media devolve.
+  function ler(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    var header = lerHeader(dv, bytes);
+    return { header: header, blocos: lerBlocos(dv, bytes, header) };
+  }
+
+  // Todos os samples de video, em ordem, achatados dos blocos. E o que o
+  // decodificador quer: ele nao tem nocao de bloco.
+  function samplesDeVideo(frag) {
+    var fora = [];
+    frag.blocos.forEach(function (b) {
+      b.samples.forEach(function (s) { if (s.isVideo) fora.push(s); });
+    });
+    return fora;
+  }
+
+  function samplesDeAudio(frag) {
+    var fora = [];
+    frag.blocos.forEach(function (b) {
+      b.samples.forEach(function (s) { if (s.isAudio) fora.push(s); });
+    });
+    return fora;
+  }
+
+  // A cadeia de codec para o VideoDecoder, no formato do RFC 6381.
+  //
+  // Sai do SPS, e nao de um palpite: declarar nivel a menos do que o fluxo pede
+  // NAO da erro -- o decodificador de hardware aceita e devolve quadro menor,
+  // calado. Foi assim que 2560x1440 virou 1934x1088 num aparelho.
+  //
+  // Formas avc3/hev1, e nao avc1/hvc1: sao as que significam Annex-B com os
+  // parameter sets no fluxo, que e como o .vms guarda. Assim nao e preciso
+  // montar avcC/hvcC nem passar `description`.
+  function cadeiaCodec(codecName, sps) {
+    if (codecName === "H264") {
+      if (!sps) return "avc3.4D401F";
+      return "avc3." + hex2(sps.profile) + hex2(sps.constraint) + hex2(sps.level);
+    }
+    if (codecName === "H265") {
+      if (!sps) return "hev1.1.6.L150";
+      var espaco = ["", "A", "B", "C"][sps.profileSpace] || "";
+      var rev = 0;
+      for (var i = 0; i < 32; i++) rev = (rev << 1) | ((sps.compat >>> i) & 1);
+      var partes = ["hev1", espaco + sps.profileIdc,
+                    (rev >>> 0).toString(16).toUpperCase(),
+                    (sps.tier ? "H" : "L") + sps.level];
+      var restr = [];
+      for (i = 0; i < 6; i++)
+        restr.push(Math.floor(sps.constraints / Math.pow(2, 40 - 8 * i)) & 0xFF);
+      while (restr.length && restr[restr.length - 1] === 0) restr.pop();
+      restr.forEach(function (v) { partes.push(hex2(v)); });
+      return partes.join(".");
+    }
+    return "";
+  }
+
+  function hex2(v) {
+    var s = (v & 0xFF).toString(16).toUpperCase();
+    return s.length < 2 ? "0" + s : s;
+  }
+
+  // ------------------------------------------------------------------ NAL
+
+  // Separa as NALs de um fluxo Annex-B. Aceita start code de 3 e de 4 bytes.
+  function separarAnnexB(buf) {
+    var fora = [], i = 0, n = buf.length, ini = -1;
+    while (i + 2 < n) {
+      if (buf[i] === 0 && buf[i + 1] === 0 &&
+          (buf[i + 2] === 1 || (buf[i + 2] === 0 && i + 3 < n && buf[i + 3] === 1))) {
+        var tam = buf[i + 2] === 1 ? 3 : 4;
+        if (ini >= 0) fora.push(buf.subarray(ini, i));
+        ini = i + tam;
+        i += tam;
+      } else i++;
+    }
+    if (ini >= 0 && ini < n) fora.push(buf.subarray(ini, n));
+    return fora;
+  }
+
+  function tipoNal(nal, codecName) {
+    if (!nal || !nal.length) return -1;
+    return codecName === "H265" ? (nal[0] >> 1) & 0x3F : nal[0] & 0x1F;
+  }
+
+  function ehParameterSet(nal, codecName) {
+    var t = tipoNal(nal, codecName);
+    return codecName === "H265" ? (t >= 32 && t <= 34) : (t === 7 || t === 8);
+  }
+
+  // Um AU tem parameter sets dentro? A ayla manda; a frente nao -- nela o AU e
+  // so a fatia, e VPS/SPS/PPS vivem no extradata do header. Como o extradata
+  // tambem e Annex-B, resolver e concatenar.
+  function temParameterSet(au, codecName) {
+    var nals = separarAnnexB(au);
+    for (var i = 0; i < nals.length; i++)
+      if (ehParameterSet(nals[i], codecName)) return true;
+    return false;
+  }
+
+  // --------------------------------------------------------------- SPS
+
+  // Leitor de bits com remocao do emulation prevention (00 00 03). Sem isso o
+  // SPS le errado em qualquer fluxo que tenha essa sequencia -- e ela aparece.
+  function Bits(d) {
+    var out = [], i = 0;
+    while (i < d.length) {
+      if (i + 2 < d.length && d[i] === 0 && d[i + 1] === 0 && d[i + 2] === 3) {
+        out.push(0, 0); i += 3;
+      } else { out.push(d[i]); i++; }
+    }
+    this.d = out;
+    this.p = 0;
+  }
+  Bits.prototype.u = function (n) {
+    var v = 0;
+    for (var i = 0; i < n; i++) {
+      if ((this.p >> 3) >= this.d.length) throw new Error("bitstream curto");
+      v = v * 2 + ((this.d[this.p >> 3] >> (7 - (this.p & 7))) & 1);
+      this.p++;
+    }
+    return v;
+  };
+  Bits.prototype.ue = function () {
+    var z = 0;
+    while (this.u(1) === 0) { z++; if (z > 32) throw new Error("exp-golomb"); }
+    return (Math.pow(2, z) - 1) + (z ? this.u(z) : 0);
+  };
+  Bits.prototype.se = function () {
+    var k = this.ue();
+    return (k % 2) ? (k + 1) / 2 : -(k / 2);
+  };
+
+  var H264_HIGH = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+
+  function parseH264Sps(nal) {
+    var b = new Bits(nal.subarray(1));
+    var profile = b.u(8), constraint = b.u(8), level = b.u(8);
+    b.ue();                                   // sps_id
+    var chroma = 1;
+    if (H264_HIGH.indexOf(profile) >= 0) {
+      chroma = b.ue();
+      if (chroma === 3) b.u(1);
+      b.ue(); b.ue(); b.u(1);
+      if (b.u(1)) {                           // scaling matrix
+        var n = (chroma !== 3) ? 8 : 12;
+        for (var i = 0; i < n; i++) if (b.u(1)) {
+          var last = 8, nxt = 8, m = (i < 6) ? 16 : 64;
+          for (var j = 0; j < m; j++) {
+            if (nxt) nxt = ((last + b.se() + 256) % 256);
+            last = nxt || last;
+          }
+        }
+      }
+    }
+    b.ue();                                   // log2_max_frame_num
+    var poc = b.ue();
+    if (poc === 0) b.ue();
+    else if (poc === 1) {
+      b.u(1); b.se(); b.se();
+      var k = b.ue();
+      for (var q = 0; q < k; q++) b.se();
+    }
+    b.ue();                                   // num_ref_frames
+    b.u(1);                                   // gaps_allowed
+    var mbsW = b.ue() + 1, mapH = b.ue() + 1;
+    var frameMbsOnly = b.u(1);
+    if (!frameMbsOnly) b.u(1);
+    b.u(1);                                   // direct_8x8
+    var crop = [0, 0, 0, 0];
+    if (b.u(1)) crop = [b.ue(), b.ue(), b.ue(), b.ue()];
+    return {
+      profile: profile, constraint: constraint, level: level,
+      width: mbsW * 16 - (crop[0] + crop[1]) * 2,
+      height: mapH * 16 * (2 - frameMbsOnly) - (crop[2] + crop[3]) * 2
+    };
+  }
+
+  function parseH265Sps(nal) {
+    var b = new Bits(nal.subarray(2));        // o NAL header do HEVC tem 2 bytes
+    b.u(4);                                   // sps_video_parameter_set_id
+    var maxSub = b.u(3);
+    b.u(1);                                   // temporal_id_nesting
+
+    var profileSpace = b.u(2), tier = b.u(1), profileIdc = b.u(5);
+    var compat = 0;
+    for (var i = 0; i < 32; i++) compat = compat * 2 + b.u(1);
+    // 4 flags nomeados + 43 reservados + 1 = 48 bits de restricoes. Passa de
+    // 2^32, entao acumula em Number (exato ate 2^53) e nao com deslocamento.
+    var constraints = 0;
+    for (i = 0; i < 48; i++) constraints = constraints * 2 + b.u(1);
+    var level = b.u(8);
+
+    var perfilSub = [], nivelSub = [];
+    for (i = 0; i < maxSub; i++) { perfilSub.push(b.u(1)); nivelSub.push(b.u(1)); }
+    if (maxSub > 0) for (i = maxSub; i < 8; i++) b.u(2);
+    for (i = 0; i < maxSub; i++) {
+      if (perfilSub[i]) b.u(88);
+      if (nivelSub[i]) b.u(8);
+    }
+
+    b.ue();                                   // sps_seq_parameter_set_id
+    var chroma = b.ue();
+    if (chroma === 3) b.u(1);
+    var largura = b.ue(), altura = b.ue();
+    var cortes = [0, 0, 0, 0];
+    if (b.u(1)) cortes = [b.ue(), b.ue(), b.ue(), b.ue()];
+    var subW = (chroma === 1 || chroma === 2) ? 2 : 1;
+    var subH = (chroma === 1) ? 2 : 1;
+
+    return {
+      profileSpace: profileSpace, tier: tier, profileIdc: profileIdc,
+      compat: compat, constraints: constraints, level: level,
+      codedWidth: largura, codedHeight: altura,
+      width: largura - subW * (cortes[0] + cortes[1]),
+      height: altura - subH * (cortes[2] + cortes[3])
+    };
+  }
+
+  // Acha o SPS onde ele estiver: dentro do AU (ayla) ou no extradata do
+  // cabecalho (frente). Devolve null se nao houver.
+  function acharSps(au, extradata, codecName) {
+    var fontes = [au, extradata];
+    var alvo = codecName === "H265" ? 33 : 7;
+    for (var f = 0; f < fontes.length; f++) {
+      if (!fontes[f] || !fontes[f].length) continue;
+      var nals = separarAnnexB(fontes[f]);
+      for (var i = 0; i < nals.length; i++) {
+        if (tipoNal(nals[i], codecName) !== alvo) continue;
+        try {
+          return codecName === "H265" ? parseH265Sps(nals[i])
+                                      : parseH264Sps(nals[i]);
+        } catch (e) { /* SPS cortado: tenta a proxima fonte */ }
+      }
+    }
+    return null;
+  }
+
+  function concatenar(a, b) {
+    var o = new Uint8Array(a.length + b.length);
+    o.set(a, 0); o.set(b, a.length);
+    return o;
+  }
+
+  return {
+    ler: ler,
+    lerHeader: lerHeader,
+    samplesDeVideo: samplesDeVideo,
+    samplesDeAudio: samplesDeAudio,
+    cadeiaCodec: cadeiaCodec,
+    separarAnnexB: separarAnnexB,
+    tipoNal: tipoNal,
+    ehParameterSet: ehParameterSet,
+    temParameterSet: temParameterSet,
+    parseH264Sps: parseH264Sps,
+    parseH265Sps: parseH265Sps,
+    acharSps: acharSps,
+    concatenar: concatenar,
+    FLAG_KEYFRAME: FLAG_KEYFRAME
+  };
+})();

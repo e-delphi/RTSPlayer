@@ -3,6 +3,20 @@ unit VMS.Android.MemoLogger;
 // Logger que acumula as linhas num buffer thread-safe. A UI (timer) drena via
 // Drain() e joga no TMemo. Evita marshaling/lifetime: os logs chegam na thread
 // de rede; só strings cruzam a fronteira.
+//
+// ## O espelho no logcat
+//
+// No Android cada linha sai TAMBÉM pelo logcat, com a tag `VMS`. O buffer só
+// existe dentro do app: para ver o que aconteceu era preciso estar com o
+// aparelho na mão, olhando a tela. Pelo logcat o mesmo log sai por cabo:
+//
+//     adb logcat -s VMS
+//     adb logcat -s VMS:W        (só avisos e erros)
+//     adb logcat -c              (limpa antes de reproduzir o problema)
+//
+// A tag é fixa e curta de propósito: `-s VMS` filtra tudo do app e nada mais.
+// O nível vai no texto e também na prioridade da linha, então dá para filtrar
+// pelos dois caminhos.
 
 interface
 
@@ -33,6 +47,32 @@ type
 
 implementation
 
+{$IFDEF ANDROID}
+uses
+  Androidapi.Log;
+
+const
+  TAG_LOGCAT: MarshaledAString = 'VMS';
+
+// A mesma linha, no logcat. UTF8String porque o __android_log_write recebe
+// bytes: passar UnicodeString direto sairia truncado no primeiro caractere.
+procedure ParaLogcat(Level: TLogLevel; const Linha: string);
+var
+  Prio: android_LogPriority;
+  U: UTF8String;
+begin
+  case Level of
+    llDebug: Prio := android_LogPriority.ANDROID_LOG_DEBUG;
+    llWarn:  Prio := android_LogPriority.ANDROID_LOG_WARN;
+    llError: Prio := android_LogPriority.ANDROID_LOG_ERROR;
+  else
+    Prio := android_LogPriority.ANDROID_LOG_INFO;
+  end;
+  U := UTF8String(Linha);
+  __android_log_write(Prio, TAG_LOGCAT, MarshaledAString(PAnsiChar(U)));
+end;
+{$ENDIF}
+
 constructor TMemoLogger.Create;
 begin
   inherited Create;
@@ -53,6 +93,11 @@ var
   Line: string;
 begin
   Line := Format('%s %s: %s', [LogLevelToStr(Level), Tag, Msg]);
+{$IFDEF ANDROID}
+  // Fora do lock: escrever no logcat é uma chamada de sistema, e segurar o
+  // buffer durante ela atrasaria as threads de rede que também logam.
+  ParaLogcat(Level, Line);
+{$ENDIF}
   FLock.Enter;
   try
     FBuffer.Add(Line);

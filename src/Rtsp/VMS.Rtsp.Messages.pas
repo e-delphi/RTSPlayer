@@ -295,10 +295,12 @@ function StatusTextForCode(Code: Integer): string;
 begin
   case Code of
     200: Result := 'OK';
+    204: Result := 'No Content';
     400: Result := 'Bad Request';
     401: Result := 'Unauthorized';
     404: Result := 'Not Found';
     405: Result := 'Method Not Allowed';
+    416: Result := 'Range Not Satisfiable';
     454: Result := 'Session Not Found';
     455: Result := 'Method Not Valid in This State';
     456: Result := 'Header Field Not Valid for Resource';

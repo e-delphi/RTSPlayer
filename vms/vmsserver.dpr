@@ -131,6 +131,17 @@ uses
   Vms.Db.Schema in 'src\Db\Vms.Db.Schema.pas',
   Vms.Db.Config in 'src\Db\Vms.Db.Config.pas',
   Vms.Analytics.StoreDb in 'src\Analytics\Vms.Analytics.StoreDb.pas',
+  Vms.Analytics.Probe in 'src\Analytics\Vms.Analytics.Probe.pas',
+  Vms.Server.Ui.Html in 'src\Api\Vms.Server.Ui.Html.pas',
+  Vms.Server.Player.Html in 'src\Api\Vms.Server.Player.Html.pas',
+  Vms.Server.Favicon.Svg in 'src\Api\Vms.Server.Favicon.Svg.pas',
+  Vms.Server.UiFiles in 'src\Api\Vms.Server.UiFiles.pas',
+  Vms.Server.Login.Html in 'src\Api\Vms.Server.Login.Html.pas',
+  Vms.Server.Auth in 'src\Api\Vms.Server.Auth.pas',
+  Vms.Server.Player.Js in 'src\Api\Vms.Server.Player.Js.pas',
+  Vms.Server.Reader.Js in 'src\Api\Vms.Server.Reader.Js.pas',
+  Vms.Server.App.Html in 'src\Api\Vms.Server.App.Html.pas',
+  Vms.Server.Events.Html in 'src\Api\Vms.Server.Events.Html.pas',
   Vms.Server.Config in 'src\App\Vms.Server.Config.pas',
   Vms.Server.Composition in 'src\App\Vms.Server.Composition.pas';
 
@@ -326,7 +337,8 @@ begin
       Analytics := BuildAnalytics(AnalyticsCfg, Db, CameraNames, Cache,
                                   Clock, Logger, GStopEvent);
       Api := TApiRouter.Create(ApiCfg, CameraNames, Cache, Hub, Thumbs,
-                               Analytics.Events, Db, Logger);
+                               Analytics.Events, Db,
+                               BuildMotionProbe(Cache, Logger), Logger);
       // Nao e o mesmo aviso da API: aquele fala de baixar gravacao, este fala
       // de SQL livre. Quem alcanca esta porta le camera_endpoint.password, que
       // guarda as senhas das cameras em texto, e pode apagar qualquer tabela.
@@ -363,7 +375,11 @@ begin
             if App.Cameras[I].Enabled then
               Logger.Info('main', Format('  rtsp://<host>:%d/live/%s', [RtspPort, App.Cameras[I].Name]));
           if Api <> nil then
+          begin
             Logger.Info('main', Format('  http://<host>:%d/api/cameras', [RtspPort]));
+            Logger.Info('main', Format('  http://<host>:%d/ui/motion  (sintonia do movimento)',
+              [RtspPort]));
+          end;
           Logger.Info('main', 'No ar. Ctrl+C para parar.');
 
           while GStopEvent.WaitFor(500) <> wrSignaled do ;

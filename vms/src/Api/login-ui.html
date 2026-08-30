@@ -1,0 +1,155 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<title>VMS</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<!--
+  A tela de entrada do vmsserver.
+
+  Duas telas no mesmo arquivo, porque sao o mesmo momento visto de dois estados:
+  numa instalacao nova ainda nao HA senha, e mandar digitar uma que nao existe
+  seria um beco. O /api/auth/status diz em qual dos dois se esta.
+
+  Definir a senha so e possivel do proprio computador (o servidor recusa de
+  fora enquanto nao houver uma). E de proposito: se qualquer um pudesse definir
+  a primeira senha, o primeiro a chegar ficaria dono do servidor.
+-->
+<style>
+  /* Os mesmos tokens da casca do app (ver app-ui.html): esta pagina e a
+     primeira coisa que se ve do servidor, e nao pode ser de outra epoca. */
+  :root { --bg:#121212; --sup:#1a1a1a; --sup2:#282828; --bor:#3f4447;
+          --txt:#e6e6e6; --dim:#c2c7c9; --az:#8ed0f0; --sobre-az:#00344a; }
+  * { -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--txt);
+               font:400 15px/22px Roboto, system-ui, "Segoe UI", sans-serif; }
+  /* A altura util encolhe quando o teclado sobe; sem isso o formulario fica
+     centrado na tela INTEIRA, e o campo de senha vai parar atras do teclado. */
+  body { height:var(--alturaUtil, 100%); }
+  body { display:flex; align-items:center; justify-content:center; padding:20px;
+         box-sizing:border-box; }
+  .caixa { width:100%; max-width:360px; }
+  h1 { font:400 24px/32px Roboto, system-ui, sans-serif; margin:0 0 6px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:20px; line-height:1.5; }
+  label { display:block; margin-bottom:12px; color:var(--dim); font-size:12px; }
+  input { display:block; width:100%; box-sizing:border-box; margin-top:4px;
+          background:var(--sup2); color:var(--txt); border:1px solid var(--bor);
+          border-radius:4px; padding:12px; font:inherit; }
+  input:focus { outline:none; border-color:var(--az); }
+  button { width:100%; background:var(--az); color:var(--sobre-az); border:0;
+           border-radius:20px; min-height:40px; padding:11px;
+           font:500 14px/20px Roboto, system-ui, sans-serif;
+           cursor:pointer; margin-top:10px; }
+  button[disabled] { opacity:.5; cursor:default; }
+  .msg { min-height:18px; font-size:13px; margin-top:12px; }
+  .err { color:#ffb4ab; }
+  .ok { color:#7ee2a8; }
+</style>
+
+<div class="caixa">
+  <h1 id="tit">VMS</h1>
+  <div class="sub" id="sub">carregando...</div>
+
+  <form id="f" style="display:none">
+    <label>Usu&aacute;rio<input id="u" autocomplete="username" value="admin"></label>
+    <label id="l-senha">Senha<input id="p" type="password"
+      autocomplete="current-password"></label>
+    <label id="l-conf" style="display:none">Repita a senha<input id="p2"
+      type="password" autocomplete="new-password"></label>
+    <button id="b" type="submit">Entrar</button>
+  </form>
+
+  <div class="msg" id="msg"></div>
+</div>
+
+<script>
+function $(id) { return document.getElementById(id); }
+
+// A area que sobra com o teclado aberto. Mesmo motivo da casca do app: o
+// teclado do Android se sobrepoe em vez de empurrar.
+(function () {
+  var vv = window.visualViewport;
+  if (!vv) return;
+  function ajustar() {
+    document.documentElement.style.setProperty(
+      "--alturaUtil", Math.round(vv.height) + "px");
+  }
+  vv.addEventListener("resize", ajustar);
+  vv.addEventListener("scroll", ajustar);
+  ajustar();
+})();
+var definindo = false;
+
+function dizer(texto, classe) {
+  $("msg").className = "msg " + (classe || "");
+  $("msg").textContent = texto;
+}
+
+fetch("/api/auth/status").then(function (r) { return r.json(); })
+  .then(function (j) {
+    if (j.authenticated) { location.href = "/"; return; }
+    definindo = !!j.needsSetup;
+    $("f").style.display = "";
+    if (definindo) {
+      $("tit").textContent = "Defina uma senha";
+      $("sub").textContent = j.local
+        ? "Este servidor ainda n\u00e3o tem senha. Escolha uma com pelo menos " +
+          "8 caracteres."
+        : "Este servidor ainda n\u00e3o tem senha, e ela s\u00f3 pode ser " +
+          "definida no pr\u00f3prio computador dele.";
+      $("l-conf").style.display = "";
+      $("p").setAttribute("autocomplete", "new-password");
+      $("b").textContent = "Definir senha";
+      if (!j.local) { $("b").disabled = true; }
+    } else {
+      $("tit").textContent = "Entrar";
+      $("sub").textContent = "Este servidor pede usu\u00e1rio e senha.";
+    }
+  })
+  .catch(function () {
+    dizer("n\u00e3o consegui falar com o servidor", "err");
+  });
+
+$("f").onsubmit = function (ev) {
+  ev.preventDefault();
+  var u = $("u").value.trim(), p = $("p").value;
+  if (!p) { dizer("informe a senha", "err"); return; }
+  if (definindo) {
+    if (p.length < 8) { dizer("ao menos 8 caracteres", "err"); return; }
+    if (p !== $("p2").value) { dizer("as duas senhas n\u00e3o batem", "err"); return; }
+  }
+  $("b").disabled = true;
+  dizer(definindo ? "definindo..." : "entrando...");
+
+  var rota = definindo ? "/api/auth/password" : "/api/auth/login";
+  fetch(rota, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user: u, password: p })
+  }).then(function (r) {
+    return r.json().then(function (j) {
+      if (!r.ok) throw new Error(j.error || ("erro " + r.status));
+      return j;
+    });
+  }).then(function () {
+    // Depois de DEFINIR a senha ainda falta entrar com ela: definir nao abre
+    // sessao, de proposito -- quem define e quem esta no computador, e quem
+    // entra pode ser outro.
+    if (definindo) {
+      definindo = false;
+      $("tit").textContent = "Entrar";
+      $("sub").textContent = "Senha definida. Entre com ela.";
+      $("l-conf").style.display = "none";
+      $("p").value = "";
+      $("p2").value = "";
+      $("b").textContent = "Entrar";
+      $("b").disabled = false;
+      dizer("senha definida", "ok");
+      return;
+    }
+    location.href = "/";
+  }).catch(function (e) {
+    $("b").disabled = false;
+    dizer(String(e.message || e), "err");
+  });
+};
+</script>

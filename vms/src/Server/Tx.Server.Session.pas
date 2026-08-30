@@ -305,22 +305,36 @@ end;
 
 // Cabeçalho e corpo numa tomada só do lock. Em duas, um quadro RTP de um PLAY
 // em andamento nesta mesma conexão poderia entrar no meio da resposta HTTP.
+// Um Extra que ja diga Cache-Control manda mais do que o padrao da casa.
+function TemCacheControl(const Extra: TArray<string>): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to High(Extra) do
+    if StartsText('Cache-Control:', Extra[I]) then Exit(True);
+  Result := False;
+end;
+
 procedure TTxSession.SendHttpBytes(const Head, Body: TBytes);
 var
-  IdbHead, IdbBody: TIdBytes;
+  Tudo: TIdBytes;
 begin
-  SetLength(IdbHead, Length(Head));
+  // Cabeçalho e corpo num ÚNICO write, de propósito.
+  //
+  // Em dois writes o Nagle segura o segundo esperando o ACK do primeiro, e o
+  // outro lado só manda esse ACK depois do atraso dele (dezenas de ms). Media:
+  // toda resposta da API custava ~55 ms fixos, sem nada a ver com a consulta --
+  // 5 pedidos na mesma conexao levavam 303 ms, e cada consulta em si levava 1.
+  SetLength(Tudo, Length(Head) + Length(Body));
   if Length(Head) > 0 then
-    Move(Head[0], IdbHead[0], Length(Head));
-  SetLength(IdbBody, Length(Body));
+    Move(Head[0], Tudo[0], Length(Head));
   if Length(Body) > 0 then
-    Move(Body[0], IdbBody[0], Length(Body));
+    Move(Body[0], Tudo[Length(Head)], Length(Body));
   FWriteLock.Enter;
   try
     try
-      FContext.Connection.IOHandler.Write(IdbHead);
-      if Length(IdbBody) > 0 then
-        FContext.Connection.IOHandler.Write(IdbBody);
+      if Length(Tudo) > 0 then
+        FContext.Connection.IOHandler.Write(Tudo);
     except
       on E: Exception do
       begin
@@ -352,10 +366,17 @@ begin
   try
     Sb.AppendFormat('HTTP/1.1 %d %s'#13#10, [Resp.Status, StatusTextForCode(Resp.Status)]);
     Sb.AppendFormat('Content-Type: %s'#13#10, [Resp.ContentType]);
-    Sb.AppendFormat('Content-Length: %d'#13#10, [Length(Resp.Body)]);
+    // 204 é "não há corpo", e não "o corpo tem zero byte": pela RFC 7230 ele
+    // não leva Content-Length. Mandar mesmo assim funciona na maioria dos
+    // clientes e trava em proxy rigoroso -- e o ao vivo do próprio servidor
+    // passa por um, quando o acesso vem pelo Tailscale.
+    if Resp.Status <> 204 then
+      Sb.AppendFormat('Content-Length: %d'#13#10, [Length(Resp.Body)]);
     // Gravação muda o tempo todo (o arquivo do dia cresce): resposta guardada
-    // em cache seria resposta errada.
-    Sb.Append('Cache-Control: no-store'#13#10);
+    // em cache seria resposta errada. Quem tem exceção -- o ícone -- manda o
+    // próprio Cache-Control em Extra, e aí este não vai.
+    if not TemCacheControl(Resp.Extra) then
+      Sb.Append('Cache-Control: no-store'#13#10);
     for I := 0 to High(Resp.Extra) do
       Sb.Append(Resp.Extra[I]).Append(#13#10);
     if KeepAlive then
@@ -375,6 +396,7 @@ end;
 procedure TTxSession.HandleHttpRequest(Req: TRtspRequest);
 var
   Resp: TApiResponse;
+  ApiReq: TApiRequest;
 begin
   if FApi = nil then
   begin
@@ -382,8 +404,19 @@ begin
     SendApiResponse(Req, Resp);
     Exit;
   end;
-  // O corpo vai junto por causa do POST /api/sql, unica rota que o usa.
-  Resp := FApi.Handle(Req.Method, Req.Uri, Req.Body);
+  // Os cabeçalhos vão junto porque o porteiro precisa deles: Authorization
+  // (o app) e Cookie (o navegador). O IP de quem chamou decide a saída de
+  // emergência da instalação sem senha, e o X-Forwarded-Proto diz se há TLS na
+  // frente -- é ele que decide se o cookie sai marcado como Secure.
+  ApiReq := Default(TApiRequest);
+  ApiReq.Method := Req.Method;
+  ApiReq.Uri := Req.Uri;
+  ApiReq.Body := Req.Body;
+  ApiReq.Authorization := Req.Headers.Get('Authorization');
+  ApiReq.Cookie := Req.Headers.Get('Cookie');
+  ApiReq.ForwardedProto := Req.Headers.Get('X-Forwarded-Proto');
+  ApiReq.PeerIP := FContext.Binding.PeerIP;
+  Resp := FApi.Handle(ApiReq);
   SendApiResponse(Req, Resp);
 end;
 

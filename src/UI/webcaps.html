@@ -1,0 +1,313 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sondagem WebCodecs</title>
+<!--
+  Sonda de capacidade do navegador, para decidir ANTES de escrever codigo se o
+  caminho WebCodecs existe no aparelho.
+
+  Duas perguntas, que sao independentes e costumam ser confundidas:
+
+    1. CONTEXTO SEGURO. `VideoDecoder` so existe se isSecureContext for true.
+       Isso depende da URL da PAGINA, e nao da requisicao: https://, localhost,
+       127.0.0.1 e file:// valem; http://192.168.x.x NAO vale.
+    2. SUPORTE AO CODEC. Mesmo com WebCodecs presente, H.265 no Chrome depende
+       de decodificacao por hardware e pode simplesmente nao haver.
+
+  Como rodar o teste que importa (o WebView do app, e nao o Chrome):
+
+      WebBrowser1.LoadFromStrings(WebCapsHtml, 'https://vms.local/');
+
+  A base https:// e o truque: vira loadDataWithBaseURL no Android, e a origem
+  da pagina passa a ser https://vms.local -- contexto seguro sem servidor
+  nenhum. Abrir este arquivo no Chrome do celular (file://) tambem da contexto
+  seguro, mas ai se testa o CHROME, e nao o WebView, que e atualizado a parte.
+
+  ASCII puro no fonte: acento por entidade HTML. Repare que toda a escrita de
+  texto com acento aqui vai por innerHTML, onde entidade funciona; o que vai por
+  textContent e sem acento de proposito, porque la a entidade apareceria crua.
+-->
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#121212; color:#e8e8e8;
+         font:15px/1.5 system-ui, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; padding:14px; }
+  h1 { font-size:17px; margin:0 0 12px; font-weight:600; }
+  h2 { font-size:13px; margin:22px 0 8px; font-weight:600; color:#9a9a9a;
+       text-transform:uppercase; letter-spacing:.06em; }
+  .vered { border-radius:10px; padding:14px; font-size:15px; line-height:1.45;
+           border:1px solid #2f2f2f; background:#1e1e1e; }
+  .vered b.tit { display:block; font-size:19px; margin-bottom:6px; }
+  .ok   { border-color:#1e6b3a; background:#14251b; }
+  .ok b.tit { color:#4ade80; }
+  .nao  { border-color:#7a2b25; background:#241615; }
+  .nao b.tit { color:#f87171; }
+  .meio { border-color:#7a5b1e; background:#241f12; }
+  .meio b.tit { color:#fbbf24; }
+  .vered code { background:#00000055; padding:1px 5px; border-radius:4px;
+                font-size:13px; }
+  .card { background:#1e1e1e; border:1px solid #2f2f2f; border-radius:10px;
+          padding:10px 12px; margin-bottom:8px; }
+  .amb { display:flex; justify-content:space-between; gap:10px; padding:4px 0;
+         border-bottom:1px solid #262626; font-size:13px; }
+  .amb:last-child { border-bottom:0; }
+  .amb span:first-child { color:#9a9a9a; white-space:nowrap; }
+  .amb span:last-child { font-family:ui-monospace, Consolas, monospace;
+                         text-align:right; word-break:break-all; }
+  .cod { display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+         margin-bottom:4px; }
+  .cod code { font-size:13px; color:#e8e8e8; background:#262626;
+              padding:2px 6px; border-radius:4px; }
+  .nota { color:#8a8a8a; font-size:12px; }
+  .tags { display:flex; gap:6px; margin-top:7px; flex-wrap:wrap; }
+  .tag { font-size:11px; padding:2px 8px; border-radius:20px;
+         border:1px solid #3a3a3a; color:#9a9a9a; }
+  .t-sim { border-color:#1e6b3a; background:#14251b; color:#4ade80; }
+  .t-nao { border-color:#5a2622; background:#1f1413; color:#f87171; }
+  .t-err { border-color:#7a5b1e; background:#241f12; color:#fbbf24; }
+  button { background:#2d9cdb; color:#fff; border:0; border-radius:6px;
+           padding:9px 16px; font:inherit; cursor:pointer; margin-right:8px; }
+  button.sec { background:#333; }
+  pre { background:#0d0d0d; border:1px solid #2f2f2f; border-radius:8px;
+        padding:10px; font-size:11px; overflow-x:auto; white-space:pre-wrap;
+        word-break:break-all; user-select:all; }
+</style>
+
+<div class="wrap">
+  <h1>Sondagem WebCodecs &mdash; VMS</h1>
+  <div id="vered" class="vered"><b class="tit">Sondando...</b></div>
+
+  <h2>Ambiente</h2>
+  <div class="card" id="amb"></div>
+
+  <h2>Codecs</h2>
+  <div id="codecs"></div>
+
+  <h2>Resultado em texto</h2>
+  <p class="nota">Selecione e copie, ou use o bot&atilde;o.</p>
+  <button id="copiar">Copiar</button>
+  <button id="denovo" class="sec">Sondar de novo</button>
+  <pre id="txt">...</pre>
+</div>
+
+<script>
+"use strict";
+
+// As duas cameras, com os codecs que cada uma pode estar entregando.
+//
+// Repare no avc3/hev1 contra avc1/hvc1: NAO e detalhe cosmetico. Pelo registro
+// de codecs do WebCodecs, avc1/hvc1 descrevem fluxo com tamanho por NAL e
+// exigem o `description` (o avcC/hvcC montado do SPS/PPS); avc3/hev1 descrevem
+// Annex-B com os parameter sets no proprio fluxo -- que e exatamente como o
+// .vms guarda. Se so a forma avc1/hvc1 passar aqui, o trabalho de montar o
+// avcC/hvcC entra no orcamento; se avc3/hev1 passar, os bytes vao direto.
+var CODECS = [
+  { cam:"ayla",   fam:"H.264", s:"avc3.42E01E",      nota:"Baseline 3.0, Annex-B" },
+  { cam:"ayla",   fam:"H.264", s:"avc3.4D401F",      nota:"Main 3.1, Annex-B (o mais provavel da ayla)" },
+  { cam:"ayla",   fam:"H.264", s:"avc3.64001F",      nota:"High 3.1, Annex-B" },
+  { cam:"ayla",   fam:"H.264", s:"avc1.4D401F",      nota:"Main 3.1, AVCC -- exige description" },
+  { cam:"frente", fam:"H.265", s:"hev1.1.6.L93.B0",  nota:"Main 3.1, Annex-B" },
+  { cam:"frente", fam:"H.265", s:"hev1.1.6.L120.B0", nota:"Main 4.0, Annex-B (o mais provavel da frente)" },
+  { cam:"frente", fam:"H.265", s:"hev1.1.6.L123.B0", nota:"Main 4.1, Annex-B" },
+  { cam:"frente", fam:"H.265", s:"hvc1.1.6.L120.B0", nota:"Main 4.0, hvcC -- exige description" }
+];
+
+function $(id) { return document.getElementById(id); }
+
+function linhas(alvo, pares) {
+  alvo.innerHTML = "";
+  pares.forEach(function (p) {
+    var d = document.createElement("div");
+    d.className = "amb";
+    var a = document.createElement("span"); a.textContent = p[0];
+    var b = document.createElement("span"); b.textContent = p[1];
+    d.appendChild(a); d.appendChild(b); alvo.appendChild(d);
+  });
+}
+
+// O "; wv)" no userAgent e o que separa WebView de navegador. Importa porque o
+// WebView do sistema e atualizado a parte do Chrome: um pode ter WebCodecs e o
+// outro nao, no mesmo aparelho.
+function versaoChromium() {
+  var m = /Chrome\/([\d.]+)/.exec(navigator.userAgent);
+  if (!m) return "nao identificada";
+  return m[1] + (/;\s*wv\)/.test(navigator.userAgent) ? "  (WebView)"
+                                                      : "  (navegador)");
+}
+
+// Uma pergunta ao decodificador. Devolve sempre e nunca lanca: string de codec
+// invalida joga TypeError, e "invalida" tambem e resposta.
+function perguntar(codec, acel) {
+  if (typeof VideoDecoder === "undefined")
+    return Promise.resolve({ r: "sem-api" });
+  var cfg = { codec: codec, codedWidth: 1920, codedHeight: 1080,
+              hardwareAcceleration: acel };
+  try {
+    return VideoDecoder.isConfigSupported(cfg).then(function (res) {
+      return { r: (res && res.supported) ? "sim" : "nao" };
+    }).catch(function (e) {
+      return { r: "erro", msg: String((e && e.name) || e) };
+    });
+  } catch (e) {
+    return Promise.resolve({ r: "erro", msg: String((e && e.name) || e) });
+  }
+}
+
+// O plano B: sem WebCodecs ainda da para tocar remuxando para fMP4 e entregando
+// por MediaSource. Vale medir na mesma passada -- se WebCodecs faltar, esta
+// coluna ja diz se ha caminho ou se nao ha caminho nenhum.
+function mse(codec) {
+  try {
+    if (typeof MediaSource === "undefined") return "sem-api";
+    return MediaSource.isTypeSupported('video/mp4; codecs="' + codec + '"')
+      ? "sim" : "nao";
+  } catch (e) { return "erro"; }
+}
+
+function tag(rotulo, r) {
+  var cls = (r === "sim") ? "t-sim" : ((r === "nao") ? "t-nao" : "t-err");
+  return '<span class="tag ' + cls + '">' + rotulo + ": " + r + "</span>";
+}
+
+var texto = [];
+function reg(s) { texto.push(s); }
+
+function sondar() {
+  texto = [];
+  var seguro = (window.isSecureContext === true);
+  var temDec = (typeof VideoDecoder !== "undefined");
+
+  linhas($("amb"), [
+    ["origem", location.origin || "(nula)"],
+    ["protocolo", location.protocol],
+    ["isSecureContext", String(seguro)],
+    ["VideoDecoder", temDec ? "existe" : "AUSENTE"],
+    ["VideoEncoder", (typeof VideoEncoder !== "undefined") ? "existe" : "ausente"],
+    ["MediaSource", (typeof MediaSource !== "undefined") ? "existe" : "ausente"],
+    ["Chromium", versaoChromium()],
+    ["tela", screen.width + "x" + screen.height +
+             " @" + (window.devicePixelRatio || 1)],
+    ["userAgent", navigator.userAgent]
+  ]);
+
+  reg("== SONDAGEM WEBCODECS ==");
+  reg("origem          : " + (location.origin || "(nula)"));
+  reg("protocolo       : " + location.protocol);
+  reg("isSecureContext : " + seguro);
+  reg("VideoDecoder    : " + temDec);
+  reg("MediaSource     : " + (typeof MediaSource !== "undefined"));
+  reg("Chromium        : " + versaoChromium());
+  reg("userAgent       : " + navigator.userAgent);
+  reg("");
+
+  var alvo = $("codecs");
+  alvo.innerHTML = "";
+
+  // Uma promessa por codec, e o cartao so nasce quando a resposta chega. Sao
+  // perguntas independentes: uma falhar nao pode derrubar as outras.
+  var promessas = CODECS.map(function (c) {
+    return Promise.all([perguntar(c.s, "prefer-hardware"),
+                        perguntar(c.s, "prefer-software")])
+      .then(function (rs) {
+        var m = mse(c.s);
+        var div = document.createElement("div");
+        div.className = "card";
+        div.innerHTML =
+          '<div class="cod"><code>' + c.s + '</code>' +
+          '<span class="nota">' + c.cam + " &middot; " + c.fam + "</span></div>" +
+          '<div class="nota">' + c.nota + "</div>" +
+          '<div class="tags">' + tag("hardware", rs[0].r) +
+          tag("software", rs[1].r) + tag("MSE/fMP4", m) + "</div>";
+        alvo.appendChild(div);
+        reg(c.cam + "  " + c.s +
+            "  hw=" + rs[0].r + "  sw=" + rs[1].r + "  mse=" + m);
+        return { c: c, hw: rs[0].r, sw: rs[1].r, mse: m };
+      });
+  });
+
+  Promise.all(promessas).then(function (todos) {
+    veredito(seguro, temDec, todos);
+    $("txt").textContent = texto.join("\n");
+  });
+}
+
+function veredito(seguro, temDec, todos) {
+  var v = $("vered");
+
+  // Ordem importa: sem contexto seguro a ausencia de VideoDecoder nao prova
+  // nada sobre o aparelho, e dizer "nao suporta" ali seria mentira.
+  if (!seguro) {
+    v.className = "vered nao";
+    v.innerHTML = '<b class="tit">Sem contexto seguro</b>' +
+      "A p&aacute;gina foi aberta em <code>" + location.protocol +
+      "</code>, e a&iacute; <code>VideoDecoder</code> nem chega a existir &mdash; " +
+      "independente de o aparelho suportar ou n&atilde;o. <b>Este teste n&atilde;o " +
+      "vale.</b> Recarregue com <code>LoadFromStrings(html, " +
+      "'https://vms.local/')</code>, ou sirva por <code>127.0.0.1</code>.";
+    return;
+  }
+  if (!temDec) {
+    v.className = "vered nao";
+    v.innerHTML = '<b class="tit">WebCodecs n&atilde;o existe aqui</b>' +
+      "Contexto seguro OK, mas n&atilde;o h&aacute; <code>VideoDecoder</code>. " +
+      "Este WebView &eacute; velho demais (WebCodecs veio no Chromium 94) ou foi " +
+      "compilado sem ele. Olhe a coluna <b>MSE/fMP4</b> abaixo: se ela disser " +
+      "sim, o caminho &eacute; remuxar no servidor em vez de decodificar na " +
+      "p&aacute;gina.";
+    return;
+  }
+
+  function resumo(cam) {
+    var r = { hw:false, sw:false, mse:false, annexb:false };
+    todos.forEach(function (t) {
+      if (t.c.cam !== cam) return;
+      var ab = /^(avc3|hev1)/.test(t.c.s);
+      if (t.hw === "sim") { r.hw = true; if (ab) r.annexb = true; }
+      if (t.sw === "sim") { r.sw = true; if (ab) r.annexb = true; }
+      if (t.mse === "sim") r.mse = true;
+    });
+    return r;
+  }
+
+  function frase(nome, fam, r) {
+    var cab = "<b>" + nome + "</b> (" + fam + "): ";
+    if (!r.hw && !r.sw) {
+      return cab + "<b>n&atilde;o decodifica</b> por WebCodecs" +
+        (r.mse ? " &mdash; mas o MSE/fMP4 aceita, ent&atilde;o d&aacute; para " +
+                 "tocar remuxando no servidor." : ", e o MSE tamb&eacute;m n&atilde;o.");
+    }
+    return cab + "<b>OK</b>" + (r.hw ? " por hardware" : " (s&oacute; software)") +
+      (r.annexb ? ", aceitando <b>Annex-B direto</b> &mdash; os bytes do " +
+                  ".vms v&atilde;o sem convers&atilde;o."
+                : " &mdash; mas <b>s&oacute;</b> na forma avc1/hvc1, ent&atilde;o " +
+                  "vai ser preciso montar o avcC/hvcC a partir do SPS/PPS.");
+  }
+
+  var a = resumo("ayla"), f = resumo("frente");
+  var okA = (a.hw || a.sw), okF = (f.hw || f.sw);
+  v.className = "vered " + ((okA && okF) ? "ok" : (okA || okF) ? "meio" : "nao");
+  v.innerHTML = '<b class="tit">' +
+    ((okA && okF) ? "WebCodecs serve para as duas c&acirc;meras"
+                  : (okA || okF) ? "WebCodecs serve s&oacute; em parte"
+                                 : "WebCodecs existe, mas n&atilde;o para os seus codecs") +
+    "</b>" + frase("ayla", "H.264", a) + "<br>" + frase("frente", "H.265", f);
+
+  reg("");
+  reg("VEREDITO ayla   : " + (okA ? ("ok" + (a.hw ? "/hw" : "/sw") +
+      (a.annexb ? " annex-b" : " so avc1")) : "nao") + "   mse=" + a.mse);
+  reg("VEREDITO frente : " + (okF ? ("ok" + (f.hw ? "/hw" : "/sw") +
+      (f.annexb ? " annex-b" : " so hvc1")) : "nao") + "   mse=" + f.mse);
+}
+
+$("denovo").onclick = sondar;
+$("copiar").onclick = function () {
+  var t = $("txt").textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    navigator.clipboard.writeText(t).then(function () {
+      $("copiar").textContent = "Copiado";
+      setTimeout(function () { $("copiar").textContent = "Copiar"; }, 1500);
+    }).catch(function () { alert(t); });
+  else alert(t);
+};
+sondar();
+</script>
