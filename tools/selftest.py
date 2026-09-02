@@ -773,6 +773,97 @@ def teste_movimento(pasta):
           'score %.4f' % r['score'])
 
 
+def teste_grade_e_delta(pasta):
+    # Os dois ajustes da tela de sintonia servem a coisas DIFERENTES, e é fácil
+    # confundi-los: um filtra movimento pequeno, o outro filtra deslocamento de
+    # brilho. Aqui a diferença fica medida, e não argumentada.
+    print('grade e delta por célula')
+    W, H = 160, 90
+
+    def com(grade=1.0, delta=0):
+        return eventlib.Motion(threshold=0.004, grid_scale=grade,
+                               cell_delta=delta)
+
+    def vulto(x0, y0, x1, y1):
+        q = eventlib.gray_frame(W, H, 100)
+        eventlib.paint(q, W, H, x0, y0, x1, y1, 220)
+        return q
+
+    check('a grade encolhe pelo lado, com piso',
+          eventlib.grade_de(1.0) == (64, 36) and
+          eventlib.grade_de(0.5) == (32, 18) and
+          eventlib.grade_de(0.25) == (16, 9) and
+          eventlib.grade_de(0.01) == (8, 5))
+
+    # ---- 1. grade grossa contra movimento PEQUENO
+    #
+    # O que decide não é o tamanho do vulto sozinho: é se ele levanta a MÉDIA
+    # da célula até o delta. Um vulto de 4x4 pixels com contraste moderado
+    # (+40) enche células da grade fina, mas numa célula de 10x10 da grade
+    # grossa vira +6 e não chega ao delta.
+    fina, grossa = com(), com(grade=0.25)
+    fina.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    grossa.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    pequeno = eventlib.gray_frame(W, H, 100)
+    eventlib.paint(pequeno, W, H, 80, 44, 84, 48, 140)
+    rf = fina.feed(3000, pequeno, W, H)
+    rg = grossa.feed(3000, pequeno, W, H)
+    check('movimento pequeno acende na grade fina', rf['score'] > 0,
+          'score %.4f' % rf['score'])
+    check('e some na grade grossa', rg['score'] == 0,
+          'score %.4f' % rg['score'])
+
+    # ---- 1b. e o que a grade grossa NÃO faz
+    #
+    # Medido, contra a intuição: um vulto pequeno e MUITO claro sobrevive à
+    # média, e como o score é a fração de células acesas, ele passa a ocupar
+    # uma fração MAIOR da grade grossa -- 1 de 144 é mais que 4 de 2304. Grade
+    # grossa não é "menos sensível" em geral; ela é cega para pouco contraste.
+    fina, grossa = com(), com(grade=0.25)
+    fina.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    grossa.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    berrante = vulto(80, 44, 84, 48)          # +120 nos mesmos 4x4 pixels
+    rf = fina.feed(3000, berrante, W, H)
+    rg = grossa.feed(3000, berrante, W, H)
+    check('vulto pequeno e muito claro atravessa a grade grossa',
+          rg['score'] > 0, 'score %.4f' % rg['score'])
+    check('e nela chega a pesar MAIS, porque o score é fração de células',
+          rg['score'] > rf['score'],
+          'fina %.4f, grossa %.4f' % (rf['score'], rg['score']))
+
+    # ---- 2. mas a grade NÃO ajuda contra deslocamento de brilho
+    #
+    # É o caso do ganho automático da câmera com infravermelho: a cena inteira
+    # clareia alguns níveis de uma vez. Toda célula anda junto, e mediar mais
+    # pixels não muda nada -- a média desloca junto.
+    fina, grossa = com(), com(grade=0.25)
+    fina.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    grossa.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    claro = eventlib.gray_frame(W, H, 118)          # +18, acima do delta padrão
+    rf = fina.feed(3000, claro, W, H)
+    rg = grossa.feed(3000, claro, W, H)
+    check('brilho subindo acende a grade fina inteira', rf['score'] == 1.0,
+          'score %.4f' % rf['score'])
+    check('e a grossa inteira também: a grade não filtra isso',
+          rg['score'] == 1.0, 'score %.4f' % rg['score'])
+
+    # ---- 3. o delta por célula é o que filtra
+    surdo = com(delta=24)
+    surdo.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    r = surdo.feed(3000, eventlib.gray_frame(W, H, 118), W, H)
+    check('com delta 24 o mesmo salto de brilho não move nada',
+          r['score'] == 0, 'score %.4f' % r['score'])
+
+    # ---- 4. e o preço dele: movimento de pouco contraste some junto
+    surdo2 = com(delta=24)
+    surdo2.feed(1000, eventlib.gray_frame(W, H, 100), W, H)
+    fraco = eventlib.gray_frame(W, H, 100)
+    eventlib.paint(fraco, W, H, 40, 20, 120, 70, 118)   # vulto de +18 só
+    r = surdo2.feed(3000, fraco, W, H)
+    check('mas um vulto de pouco contraste some junto com ele',
+          r['score'] == 0, 'score %.4f' % r['score'])
+
+
 def teste_agregacao_eventos(pasta):
     print('agregação de avistamentos em eventos')
     base = 1755950000000
@@ -891,6 +982,7 @@ def main():
         teste_eventos_formato(pasta)
         teste_eventos_consulta(pasta)
         teste_movimento(pasta)
+        teste_grade_e_delta(pasta)
         teste_agregacao_eventos(pasta)
     finally:
         shutil.rmtree(pasta, ignore_errors=True)

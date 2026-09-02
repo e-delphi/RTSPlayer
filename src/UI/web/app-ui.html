@@ -2096,15 +2096,20 @@ $("f-excluir").onclick = function () {
 // A sintonia abre JA no trecho que estava na tela: a camera aberta e uma
 // janela em volta da posicao atual. E a diferenca entre "sintonize alguma
 // coisa" e "sintonize isto que acabou de passar".
-var JANELA_MOV_MS = 15 * 60 * 1000;
+// A janela que o app pede a tela de sintonia.
+//
+// Curta, e terminando NA posicao em vez de centrada nela: centrada, metade da
+// janela caia depois do instante aberto -- e ao vivo isso e o futuro, onde nao
+// ha gravacao nenhuma. O grafico abria com metade vazia e o cabecalho dizendo
+// um periodo que nunca foi o analisado.
+var JANELA_MOV_MS = 3 * 60 * 1000;
 
 function abrirSintonia() {
   var u = "/ui/motion";
   if (camAtual && posAtual) {
-    var meia = JANELA_MOV_MS / 2;
     u += "?camera=" + encodeURIComponent(camAtual) +
-         "&fromMs=" + Math.round(posAtual - meia) +
-         "&toMs=" + Math.round(posAtual + meia);
+         "&fromMs=" + Math.round(posAtual - JANELA_MOV_MS) +
+         "&toMs=" + Math.round(posAtual);
   }
   else if (camAtual)
     u += "?camera=" + encodeURIComponent(camAtual);

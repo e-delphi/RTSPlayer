@@ -70,16 +70,8 @@ uses
   Vms.Analytics.Types,
   Vms.Analytics.Intf,
   Vms.Db.Intf,
-  Vms.Server.Ui.Html,
-  Vms.Server.Events.Html,
-  Vms.Server.App.Html,
-  Vms.Server.Player.Html,
-  Vms.Server.Favicon.Svg,
   Vms.Server.UiFiles,
-  Vms.Server.Login.Html,
   Vms.Server.Auth,
-  Vms.Server.Player.Js,
-  Vms.Server.Reader.Js,
   Vms.Server.Media;
 
 const
@@ -199,7 +191,9 @@ type
     function RespostaDeAcesso(const Req: TApiRequest;
                               Acesso: TAcesso): TApiResponse;
     function HandlePlayerUi: TApiResponse;
-    function HandleJs(const NomeArquivo, Codigo: string): TApiResponse;
+    function HandleUiArquivo(const NomeArquivo,
+                             TipoConteudo: string): TApiResponse;
+    function HandleJs(const NomeArquivo: string): TApiResponse;
   public
     // O cache e a fonte de miniaturas vêm de fora, e o roteador não é dono de
     // nenhum dos dois: quem os cria é a composição, que é o único lugar que
@@ -431,11 +425,20 @@ begin
   FMedia := TMediaBuilder.Create(FCache, FConfig.MaxBlocksPerRequest, ALogger);
   FAuth := TAutenticador.Create;
   RecarregarAuth;
-  // Uma pasta `ui` esquecida ao lado do executável mudaria a interface sem
-  // nenhum outro sinal. Dizer isso na subida é o sinal.
-  if UiDirAtivo and (FLogger <> nil) then
-    FLogger.Info('api', 'servindo a interface de ' + UiDir +
-                        ' (o que estiver la substitui o embutido)');
+  // A interface E a pasta: faltando ela, ou um arquivo dela, não há tela
+  // nenhuma. Dizer isso na subida evita descobrir pelo navegador, com uma
+  // página em branco e nenhuma pista.
+  if FLogger <> nil then
+  begin
+    if not UiDirAtivo then
+      FLogger.Error('api', 'sem a pasta da interface: ' + UiExplicacao +
+                           ' -- as telas não vão abrir')
+    else if UiFaltando <> '' then
+      FLogger.Warn('api', 'faltam na interface (' + UiExplicacao + '): ' +
+                          UiFaltando)
+    else
+      FLogger.Info('api', 'interface em ' + UiExplicacao);
+  end;
 end;
 
 destructor TApiRouter.Destroy;
@@ -658,9 +661,9 @@ begin
     // embutidos nela, porque também servirão às próximas páginas -- e assim o
     // navegador os guarda em cache uma vez só.
     if SameText(Path, UI_PREFIX + 'vmsreader.js') then
-      Exit(HandleJs('vmsreader.js', VmsReaderJs));
+      Exit(HandleJs('vmsreader.js'));
     if SameText(Path, UI_PREFIX + 'player.js') then
-      Exit(HandleJs('player.js', PlayerJs));
+      Exit(HandleJs('player.js'));
     // POST existe por uma rota só: SQL longo não cabe confortável numa query
     // string. Todo o resto continua sendo leitura, e recusa POST.
     if SameText(Path, API_PREFIX + 'sql') then
@@ -938,11 +941,28 @@ end;
 
 // A casca do app: câmeras, dias e reprodução numa página só. A mesma que o
 // servidor local do aparelho serve -- e por isso ela só usa caminho relativo.
+// Uma pagina da pasta `ui`, ou 404 dizendo qual arquivo falta e onde ele era
+// esperado.
+//
+// Nao ha copia embutida para cair: a pasta E a interface. Entao a falta de um
+// arquivo tem de aparecer com nome e endereco -- tela em branco sem explicacao
+// era o pior desfecho possivel.
+function TApiRouter.HandleUiArquivo(const NomeArquivo,
+  TipoConteudo: string): TApiResponse;
+var
+  Texto: string;
+begin
+  Texto := UiTexto(NomeArquivo);
+  if Texto = '' then
+    Exit(TApiResponse.Error(404, 'nao achei ' + NomeArquivo + ' em ' + UiDir));
+  Result.Status := 200;
+  Result.ContentType := TipoConteudo;
+  Result.Body := TEncoding.UTF8.GetBytes(Texto);
+end;
+
 function TApiRouter.HandleAppUi: TApiResponse;
 begin
-  Result.Status := 200;
-  Result.ContentType := 'text/html; charset=utf-8';
-  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('app-ui.html', AppUiHtml));
+  Result := HandleUiArquivo('app-ui.html', 'text/html; charset=utf-8');
 end;
 
 // O player de gravação em HTML. Toca `.vms` direto, sem conversão aqui: o
@@ -950,9 +970,7 @@ end;
 // no arquivo. O formato que já existe continua sendo o protocolo.
 function TApiRouter.HandleLoginUi: TApiResponse;
 begin
-  Result.Status := 200;
-  Result.ContentType := 'text/html; charset=utf-8';
-  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('login-ui.html', LoginUiHtml));
+  Result := HandleUiArquivo('login-ui.html', 'text/html; charset=utf-8');
 end;
 
 function TApiRouter.HandleAuthStatus(const Req: TApiRequest): TApiResponse;
@@ -1102,9 +1120,8 @@ end;
 
 function TApiRouter.HandleFavicon: TApiResponse;
 begin
-  Result.Status := 200;
-  Result.ContentType := 'image/svg+xml';
-  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('favicon.svg', FaviconSvg));
+  Result := HandleUiArquivo('favicon.svg', 'image/svg+xml');
+  if Result.Status <> 200 then Exit;
   // O ícone não muda entre versões do executável; deixar o navegador guardá-lo
   // evita um pedido por aba aberta.
   Result.Extra := TArray<string>.Create('Cache-Control: public, max-age=86400');
@@ -1112,16 +1129,13 @@ end;
 
 function TApiRouter.HandlePlayerUi: TApiResponse;
 begin
-  Result.Status := 200;
-  Result.ContentType := 'text/html; charset=utf-8';
-  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('player-ui.html', PlayerUiHtml));
+  Result := HandleUiArquivo('player-ui.html', 'text/html; charset=utf-8');
 end;
 
-function TApiRouter.HandleJs(const NomeArquivo, Codigo: string): TApiResponse;
+function TApiRouter.HandleJs(const NomeArquivo: string): TApiResponse;
 begin
-  Result.Status := 200;
-  Result.ContentType := 'application/javascript; charset=utf-8';
-  Result.Body := TEncoding.UTF8.GetBytes(UiTexto(NomeArquivo, Codigo));
+  Result := HandleUiArquivo(NomeArquivo,
+                            'application/javascript; charset=utf-8');
 end;
 
 // A faixa de eventos que o app mostra embaixo do vídeo.
@@ -1132,9 +1146,7 @@ end;
 // tentando buscar http -- conteúdo misto, que o navegador bloqueia.
 function TApiRouter.HandleEventsUi: TApiResponse;
 begin
-  Result.Status := 200;
-  Result.ContentType := 'text/html; charset=utf-8';
-  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('events-ui.html', EventsUiHtml));
+  Result := HandleUiArquivo('events-ui.html', 'text/html; charset=utf-8');
 end;
 
 // Todos os parâmetros, em ordem. São poucas dezenas de linhas, então não há
@@ -1259,15 +1271,14 @@ begin
   Result := TApiResponse.FromJson(Root);
 end;
 
-// A página de sintonia do movimento. Vem embutida no executável (ver
-// Vms.Server.Ui.Html), então não há arquivo solto para faltar.
+// A página de sintonia do movimento, servida da pasta `ui` como as outras.
 function TApiRouter.HandleMotionUi: TApiResponse;
 begin
   Result.Status := 200;
   Result.ContentType := 'text/html; charset=utf-8';
   // Sem cache, mas isso já vem de graca: o TTxSession poe Cache-Control:
   // no-store em TODA resposta HTTP, e repetir aqui daria o cabecalho em dobro.
-  Result.Body := TEncoding.UTF8.GetBytes(UiTexto('motion-ui.html', MotionUiHtml));
+  Result := HandleUiArquivo('motion-ui.html', 'text/html; charset=utf-8');
 end;
 
 // O ENSAIO: reprocessa um trecho real com os parâmetros do pedido e devolve o
@@ -1283,7 +1294,8 @@ function TApiRouter.HandleMotionProbe(const Query: string): TApiResponse;
 var
   Camera: string;
   FromMs, ToMs, StepMs: Int64;
-  Limiar, Cena: Double;
+  Limiar, Cena, Grade: Double;
+  Delta: Integer;
   Amostras: TMotionSamples;
   Root, Item, Caixa: TJSONObject;
   Arr: TJSONArray;
@@ -1307,10 +1319,17 @@ begin
                           TFormatSettings.Invariant);
   Cena := StrToFloatDef(QueryValue(Query, 'sceneThreshold'), 0.85,
                         TFormatSettings.Invariant);
+  // Vazios = grade cheia e delta padrao. Cliente antigo nao manda os dois, e
+  // nada muda para ele.
+  Grade := StrToFloatDef(QueryValue(Query, 'gridScale'), 1.0,
+                         TFormatSettings.Invariant);
+  if (Grade <= 0) or (Grade > 1) then Grade := 1.0;
+  Delta := Integer(QueryInt(Query, 'cellDelta', 0));
+  if (Delta < 0) or (Delta > 255) then Delta := 0;
 
   Comeco := Now;
-  Amostras := FProbe.Run(Camera, FromMs, ToMs, StepMs, Limiar, Cena,
-                         Integer(QueryInt(Query, 'max', 0)));
+  Amostras := FProbe.Run(Camera, FromMs, ToMs, StepMs, Limiar, Cena, Grade,
+                         Delta, Integer(QueryInt(Query, 'max', 0)));
 
   Root := TJSONObject.Create;
   Arr := TJSONArray.Create;
@@ -1320,7 +1339,13 @@ begin
   Root.AddPair('stepMs', TJSONNumber.Create(StepMs));
   Root.AddPair('threshold', TJSONNumber.Create(Limiar));
   Root.AddPair('sceneThreshold', TJSONNumber.Create(Cena));
+  Root.AddPair('gridScale', TJSONNumber.Create(Grade));
+  Root.AddPair('cellDelta', TJSONNumber.Create(Delta));
   Root.AddPair('count', TJSONNumber.Create(Length(Amostras)));
+  // Por que o percurso terminou. A pagina so mostra isto quando o trecho
+  // analisado saiu menor que o pedido -- e ai e a diferenca entre "a gravacao
+  // acaba aqui" e um defeito.
+  Root.AddPair('walkEnd', FProbe.MotivoDoFim);
   Root.AddPair('elapsedMs', TJSONNumber.Create(MilliSecondsBetween(Now, Comeco)));
   Root.AddPair('samples', Arr);
   for I := 0 to High(Amostras) do

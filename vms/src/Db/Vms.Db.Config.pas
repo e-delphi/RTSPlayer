@@ -293,6 +293,8 @@ begin
   GravaInt('analytics.stepMs', AAnalytics.StepMs);
   GravaNum('analytics.motionThreshold', AAnalytics.MotionThreshold);
   GravaNum('analytics.sceneChangeThreshold', AAnalytics.SceneChangeThreshold);
+  GravaNum('analytics.gridScale', AAnalytics.GridScale);
+  GravaInt('analytics.cellDelta', AAnalytics.CellDelta);
   GravaInt('analytics.mergeGapMs', AAnalytics.MergeGapMs);
   GravaInt('analytics.maxEventMs', AAnalytics.MaxEventMs);
   GravaInt('analytics.backfillHours', AAnalytics.BackfillMs div 3600000);
@@ -564,6 +566,12 @@ begin
   FAnalytics.StepMs := Int('analytics.stepMs', 2000);
   FAnalytics.MotionThreshold := Num('analytics.motionThreshold', 0.006);
   FAnalytics.SceneChangeThreshold := Num('analytics.sceneChangeThreshold', 0.85);
+  FAnalytics.GridScale := Num('analytics.gridScale', 1.0);
+  if (FAnalytics.GridScale <= 0) or (FAnalytics.GridScale > 1) then
+    FAnalytics.GridScale := 1.0;
+  FAnalytics.CellDelta := Int('analytics.cellDelta', 0);
+  if (FAnalytics.CellDelta < 0) or (FAnalytics.CellDelta > 255) then
+    FAnalytics.CellDelta := 0;
   FAnalytics.MergeGapMs := Int('analytics.mergeGapMs', 8000);
   FAnalytics.MaxEventMs := Int('analytics.maxEventMs', 300000);
   FAnalytics.BackfillMs := Int('analytics.backfillHours', 6) * 3600000;

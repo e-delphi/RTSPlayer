@@ -95,6 +95,13 @@
     <PropertyGroup Condition="'$(Base)'!=''">
         <DCC_DcuOutput>.\dcu\$(Platform)\$(Config)</DCC_DcuOutput>
         <DCC_ExeOutput>.\bin\$(Platform)\$(Config)</DCC_ExeOutput>
+        <PostBuildEvent><![CDATA[if "$(Platform)"=="Android" exit /b 0
+if "$(Platform)"=="Android64" exit /b 0
+rmdir "$(OUTPUTDIR)ui" 2>nul
+robocopy "$(PROJECTDIR)\src\UI\web" "$(OUTPUTDIR)ui" /MIR /NJH /NJS /NDL /NFL /NP
+if errorlevel 8 exit /b 1
+exit /b 0
+$(PostBuildEvent)]]></PostBuildEvent>
         <DCC_E>false</DCC_E>
         <DCC_N>false</DCC_N>
         <DCC_S>false</DCC_S>
@@ -294,6 +301,10 @@
         <DCCReference Include="src\App\VMS.App.Composition.pas"/>
         <DCCReference Include="src\App\VMS.App.Config.pas"/>
         <DCCReference Include="src\App\VMS.App.Logger.pas"/>
+        <DCCReference Include="src\App\VMS.App.Decodificacao.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.Jpeg.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.JNIUtil.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.VideoDecoder.pas"/>
         <DCCReference Include="src\App\VMS.App.Encerrar.pas"/>
         <DCCReference Include="src\App\VMS.App.ScreenAwake.pas"/>
         <DCCReference Include="src\Depacketizer\VMS.Depk.AAC.pas"/>
@@ -322,6 +333,7 @@
         <DCCReference Include="src\Recording\VMS.Rec.Crc32.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Format.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Paths.pas"/>
+        <DCCReference Include="src\Recording\VMS.Rec.Reader.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Writer.pas"/>
         <DCCReference Include="src\Recording\VMS.Rec.Sidecar.pas"/>
         <DCCReference Include="src\Rtp\VMS.Rtp.Demux.pas"/>
@@ -339,14 +351,7 @@
         <DCCReference Include="src\Win\VMS.Win.Edge.pas"/>
         <DCCReference Include="src\Api\VMS.Local.Server.pas"/>
         <DCCReference Include="src\App\VMS.App.Servers.pas"/>
-        <DCCReference Include="vms\src\Api\Vms.Server.Player.Html.pas"/>
-        <DCCReference Include="vms\src\Api\Vms.Server.Favicon.Svg.pas"/>
         <DCCReference Include="vms\src\Api\Vms.Server.UiFiles.pas"/>
-        <DCCReference Include="vms\src\Api\Vms.Server.Player.Js.pas"/>
-        <DCCReference Include="vms\src\Api\Vms.Server.Reader.Js.pas"/>
-        <DCCReference Include="vms\src\Api\Vms.Server.Ui.Html.pas"/>
-        <DCCReference Include="vms\src\Api\Vms.Server.App.Html.pas"/>
-        <DCCReference Include="vms\src\Api\Vms.Server.Events.Html.pas"/>
         <DCCReference Include="src\UI\UI.Shell.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
@@ -1084,6 +1089,102 @@
                     <Platform Name="Win64">
                         <RemoteDir>Assets\</RemoteDir>
                         <RemoteName>Logo44x44.png</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\app-ui.html" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>app-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>app-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\events-ui.html" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>events-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>events-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\favicon.svg" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>favicon.svg</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>favicon.svg</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\login-ui.html" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>login-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>login-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\motion-ui.html" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>motion-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>motion-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\player-ui.html" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>player-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>player-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\player.js" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>player.js</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>player.js</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\vmsreader.js" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>vmsreader.js</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>vmsreader.js</RemoteName>
                         <Overwrite>true</Overwrite>
                     </Platform>
                 </DeployFile>
@@ -2050,4 +2151,68 @@
     <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
     <Import Project="$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj" Condition="Exists('$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj')"/>
     <Import Project="$(MSBuildProjectName).deployproj" Condition="Exists('$(MSBuildProjectName).deployproj')"/>
+    <PropertyGroup Condition="'$(Config)'=='Debug' And '$(Platform)'=='Android'">
+        <PreBuildEvent/>
+        <PreBuildEventIgnoreExitCode>False</PreBuildEventIgnoreExitCode>
+        <PreLinkEvent/>
+        <PreLinkEventIgnoreExitCode>False</PreLinkEventIgnoreExitCode>
+        <PostBuildEvent>if &quot;$(Platform)&quot;==&quot;Android&quot; exit /b 0&amp;&amp;if &quot;$(Platform)&quot;==&quot;Android64&quot; exit /b 0&amp;&amp;rmdir &quot;$(OUTPUTDIR)ui&quot; 2&gt;nul&amp;&amp;robocopy &quot;$(PROJECTDIR)\src\UI\web&quot; &quot;$(OUTPUTDIR)ui&quot; /MIR /NJH /NJS /NDL /NFL /NP&amp;&amp;if errorlevel 8 exit /b 1&amp;&amp;exit /b 0</PostBuildEvent>
+        <PostBuildEventIgnoreExitCode>False</PostBuildEventIgnoreExitCode>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Config)'=='Debug' And '$(Platform)'=='Android64'">
+        <PreBuildEvent/>
+        <PreBuildEventIgnoreExitCode>False</PreBuildEventIgnoreExitCode>
+        <PreLinkEvent/>
+        <PreLinkEventIgnoreExitCode>False</PreLinkEventIgnoreExitCode>
+        <PostBuildEvent>if &quot;$(Platform)&quot;==&quot;Android&quot; exit /b 0&amp;&amp;if &quot;$(Platform)&quot;==&quot;Android64&quot; exit /b 0&amp;&amp;rmdir &quot;$(OUTPUTDIR)ui&quot; 2&gt;nul&amp;&amp;robocopy &quot;$(PROJECTDIR)\src\UI\web&quot; &quot;$(OUTPUTDIR)ui&quot; /MIR /NJH /NJS /NDL /NFL /NP&amp;&amp;if errorlevel 8 exit /b 1&amp;&amp;exit /b 0</PostBuildEvent>
+        <PostBuildEventIgnoreExitCode>False</PostBuildEventIgnoreExitCode>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Config)'=='Debug' And '$(Platform)'=='Win32'">
+        <PreBuildEvent/>
+        <PreBuildEventIgnoreExitCode>False</PreBuildEventIgnoreExitCode>
+        <PreLinkEvent/>
+        <PreLinkEventIgnoreExitCode>False</PreLinkEventIgnoreExitCode>
+        <PostBuildEvent>if &quot;$(Platform)&quot;==&quot;Android&quot; exit /b 0&amp;&amp;if &quot;$(Platform)&quot;==&quot;Android64&quot; exit /b 0&amp;&amp;rmdir &quot;$(OUTPUTDIR)ui&quot; 2&gt;nul&amp;&amp;robocopy &quot;$(PROJECTDIR)\src\UI\web&quot; &quot;$(OUTPUTDIR)ui&quot; /MIR /NJH /NJS /NDL /NFL /NP&amp;&amp;if errorlevel 8 exit /b 1&amp;&amp;exit /b 0</PostBuildEvent>
+        <PostBuildEventIgnoreExitCode>False</PostBuildEventIgnoreExitCode>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Config)'=='Debug' And '$(Platform)'=='Win64'">
+        <PreBuildEvent/>
+        <PreBuildEventIgnoreExitCode>False</PreBuildEventIgnoreExitCode>
+        <PreLinkEvent/>
+        <PreLinkEventIgnoreExitCode>False</PreLinkEventIgnoreExitCode>
+        <PostBuildEvent>if &quot;$(Platform)&quot;==&quot;Android&quot; exit /b 0&amp;&amp;if &quot;$(Platform)&quot;==&quot;Android64&quot; exit /b 0&amp;&amp;rmdir &quot;$(OUTPUTDIR)ui&quot; 2&gt;nul&amp;&amp;robocopy &quot;$(PROJECTDIR)\src\UI\web&quot; &quot;$(OUTPUTDIR)ui&quot; /MIR /NJH /NJS /NDL /NFL /NP&amp;&amp;if errorlevel 8 exit /b 1&amp;&amp;exit /b 0</PostBuildEvent>
+        <PostBuildEventIgnoreExitCode>False</PostBuildEventIgnoreExitCode>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Config)'=='Release' And '$(Platform)'=='Android'">
+        <PreBuildEvent/>
+        <PreBuildEventIgnoreExitCode>False</PreBuildEventIgnoreExitCode>
+        <PreLinkEvent/>
+        <PreLinkEventIgnoreExitCode>False</PreLinkEventIgnoreExitCode>
+        <PostBuildEvent>if &quot;$(Platform)&quot;==&quot;Android&quot; exit /b 0&amp;&amp;if &quot;$(Platform)&quot;==&quot;Android64&quot; exit /b 0&amp;&amp;rmdir &quot;$(OUTPUTDIR)ui&quot; 2&gt;nul&amp;&amp;robocopy &quot;$(PROJECTDIR)\src\UI\web&quot; &quot;$(OUTPUTDIR)ui&quot; /MIR /NJH /NJS /NDL /NFL /NP&amp;&amp;if errorlevel 8 exit /b 1&amp;&amp;exit /b 0</PostBuildEvent>
+        <PostBuildEventIgnoreExitCode>False</PostBuildEventIgnoreExitCode>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Config)'=='Release' And '$(Platform)'=='Android64'">
+        <PreBuildEvent/>
+        <PreBuildEventIgnoreExitCode>False</PreBuildEventIgnoreExitCode>
+        <PreLinkEvent/>
+        <PreLinkEventIgnoreExitCode>False</PreLinkEventIgnoreExitCode>
+        <PostBuildEvent>if &quot;$(Platform)&quot;==&quot;Android&quot; exit /b 0&amp;&amp;if &quot;$(Platform)&quot;==&quot;Android64&quot; exit /b 0&amp;&amp;rmdir &quot;$(OUTPUTDIR)ui&quot; 2&gt;nul&amp;&amp;robocopy &quot;$(PROJECTDIR)\src\UI\web&quot; &quot;$(OUTPUTDIR)ui&quot; /MIR /NJH /NJS /NDL /NFL /NP&amp;&amp;if errorlevel 8 exit /b 1&amp;&amp;exit /b 0</PostBuildEvent>
+        <PostBuildEventIgnoreExitCode>False</PostBuildEventIgnoreExitCode>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Config)'=='Release' And '$(Platform)'=='Win32'">
+        <PreBuildEvent/>
+        <PreBuildEventIgnoreExitCode>False</PreBuildEventIgnoreExitCode>
+        <PreLinkEvent/>
+        <PreLinkEventIgnoreExitCode>False</PreLinkEventIgnoreExitCode>
+        <PostBuildEvent>if &quot;$(Platform)&quot;==&quot;Android&quot; exit /b 0&amp;&amp;if &quot;$(Platform)&quot;==&quot;Android64&quot; exit /b 0&amp;&amp;rmdir &quot;$(OUTPUTDIR)ui&quot; 2&gt;nul&amp;&amp;robocopy &quot;$(PROJECTDIR)\src\UI\web&quot; &quot;$(OUTPUTDIR)ui&quot; /MIR /NJH /NJS /NDL /NFL /NP&amp;&amp;if errorlevel 8 exit /b 1&amp;&amp;exit /b 0</PostBuildEvent>
+        <PostBuildEventIgnoreExitCode>False</PostBuildEventIgnoreExitCode>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(Config)'=='Release' And '$(Platform)'=='Win64'">
+        <PreBuildEvent/>
+        <PreBuildEventIgnoreExitCode>False</PreBuildEventIgnoreExitCode>
+        <PreLinkEvent/>
+        <PreLinkEventIgnoreExitCode>False</PreLinkEventIgnoreExitCode>
+        <PostBuildEvent>if &quot;$(Platform)&quot;==&quot;Android&quot; exit /b 0&amp;&amp;if &quot;$(Platform)&quot;==&quot;Android64&quot; exit /b 0&amp;&amp;rmdir &quot;$(OUTPUTDIR)ui&quot; 2&gt;nul&amp;&amp;robocopy &quot;$(PROJECTDIR)\src\UI\web&quot; &quot;$(OUTPUTDIR)ui&quot; /MIR /NJH /NJS /NDL /NFL /NP&amp;&amp;if errorlevel 8 exit /b 1&amp;&amp;exit /b 0</PostBuildEvent>
+        <PostBuildEventIgnoreExitCode>False</PostBuildEventIgnoreExitCode>
+    </PropertyGroup>
 </Project>

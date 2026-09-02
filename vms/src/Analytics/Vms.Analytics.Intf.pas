@@ -45,6 +45,28 @@ type
   end;
   TObjectHits = TArray<TObjectHit>;
 
+  // Um percurso pela gravacao entregando quadros no ritmo pedido, e nao no do
+  // GOP. Ver Vms.Analytics.Frames para o porque de existir e o que custa.
+  IFrameWalk = interface
+    ['{3A6C82D1-4E97-4B05-9F13-8D2E7A0C6B44}']
+    // False = acabou a janela, acabou a gravacao, ou nao ha mais quadro.
+    function Next(out Img: TRgbImage; out Ms: Int64): Boolean;
+    // Por que o Next parou. Sao tres coisas MUITO diferentes -- chegou ao fim
+    // do pedido, a gravacao acabou antes, ou algo deu errado no meio -- e de
+    // fora nao havia como distinguir: o ensaio simplesmente vinha curto, e a
+    // tela desenhava o pedido inteiro com metade vazia. Vazio antes do fim.
+    function MotivoDoFim: string;
+  end;
+
+  IFrameWalkSource = interface
+    ['{9E14B7A0-2D6F-4C83-B5E1-0A73C6F8D291}']
+    // nil = nao da para percorrer aqui (sem decodificador, ou sem gravacao no
+    // trecho). Quem chama cai no caminho de keyframe.
+    function Walk(const Camera: string; FromMs, ToMs, StepMs: Int64;
+                  MaxW, MaxH: Integer): IFrameWalk;
+    function Available: Boolean;
+  end;
+
   // Mexeu?
   //
   // Tem estado (compara com o que veio antes), entao e UM POR CAMERA e nao pode
@@ -125,9 +147,16 @@ type
   // distinguir "nada se moveu" de "o limiar comeu".
   IMotionProbe = interface
     ['{6D0F3A21-8B54-4C97-A1E6-2F7B9C4D0538}']
+    // GridScale e CellDelta seguem o TAnalyticsConfig, e o ensaio precisa dos
+    // dois: sem eles ele mediria com uma grade e um delta diferentes dos da
+    // producao, e o limiar ajustado aqui nao valeria la.
     function Run(const Camera: string; FromMs, ToMs, StepMs: Int64;
-                 Threshold, SceneThreshold: Single;
-                 MaxSamples: Integer): TMotionSamples;
+                 Threshold, SceneThreshold, GridScale: Single;
+                 CellDelta, MaxSamples: Integer): TMotionSamples;
+    // Por que o ultimo Run terminou onde terminou; vale ate o proximo Run.
+    // Ver o MotivoDoFim do IFrameWalk: um ensaio curto pode ser a gravacao
+    // acabando ou um defeito, e de fora os dois eram identicos.
+    function MotivoDoFim: string;
     function Available: Boolean;
   end;
 

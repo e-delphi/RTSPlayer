@@ -74,6 +74,28 @@ type
     // refazia a referencia, e os ~20 s seguintes ficavam cegos. Era a causa de
     // "quase nao detecta mais nada".
     SceneChangeThreshold: Single;
+    // O lado da grade de decisao, como fracao da grade cheia de 64x36
+    // (1 = 64x36, 0.5 = 32x18, 0.25 = 16x9).
+    //
+    // Grade mais grossa cega o detector para o que tem POUCO CONTRASTE: um
+    // vulto pequeno precisa levantar a media de uma celula quatro vezes maior.
+    // Nao e "menos sensivel" em geral -- medido no selftest, um vulto pequeno e
+    // muito claro atravessa a grade grossa e ate pesa MAIS nela, porque o score
+    // e a fracao de celulas acesas (1 de 144 > 4 de 2304).
+    //
+    // Nao adianta reduzir a imagem antes disto: o detector ja reduz tudo a esta
+    // grade, e reduzir duas vezes so faria media de media.
+    GridScale: Single;
+    // Quanto o cinza medio de uma celula precisa mudar, em 0..255, para ela
+    // contar como mexida. 0 = o padrao do detector (14).
+    //
+    // E este o numero que responde pela oscilacao de brilho: quando o ganho
+    // automatico da camera com infravermelho clareia a cena inteira, TODAS as
+    // celulas andam juntas alguns niveis -- reduzir a imagem nao ajuda nisso,
+    // porque a media desloca junto. Subir o delta e o que faz o detector
+    // ignorar esse deslocamento; o preco e nao ver movimento de pouco
+    // contraste.
+    CellDelta: Integer;
     // Intervalo minimo entre duas passadas da rede. A rede e cara; o movimento
     // e barato. Este numero e o que separa os dois custos.
     ObjectMinIntervalMs: Int64;
@@ -172,6 +194,8 @@ begin
   Result.StepMs := 2000;
   Result.MotionThreshold := 0.006;
   Result.SceneChangeThreshold := 0.85;
+  Result.GridScale := 1.0;
+  Result.CellDelta := 0;
   Result.ObjectMinIntervalMs := 5000;
   Result.ObjectIdleIntervalMs := 60000;
   Result.ObjectThreshold := 0.35;
@@ -189,6 +213,10 @@ begin
   if not Enabled then Exit('desligada');
   Result := Format('1 quadro a cada %d ms, movimento > %.1f%%',
     [StepMs, MotionThreshold * 100]);
+  if GridScale < 0.999 then
+    Result := Result + Format(', grade em %.0f%%', [GridScale * 100]);
+  if CellDelta > 0 then
+    Result := Result + Format(', delta %d', [CellDelta]);
   if ModelPath <> '' then
     Result := Result + Format(', objetos por %s (min %.0f%%, no maximo 1 a cada %d ms)',
       [ExtractFileName(ModelPath), ObjectThreshold * 100, ObjectMinIntervalMs])

@@ -43,6 +43,10 @@ type
     FThreshold: Single;         // fracao de celulas para valer movimento
     FSceneThreshold: Single;
     FCellDelta: Integer;        // diferenca de luma que faz uma celula "mexer"
+    // A grade em uso. Nao e constante: com 32x18 cada celula cobre quatro das
+    // de 64x36, e o que acendia uma agora tem de levantar a media de quatro --
+    // o que filtra e o POUCO CONTRASTE, e nao o tamanho em si. Ver GRID_W.
+    FGridW, FGridH, FGridCells: Integer;
     FBg: TArray<Integer>;       // fundo, luma * 256 (ponto fixo)
     FCur: TArray<Byte>;
     FHasBg: Boolean;
@@ -53,7 +57,13 @@ type
   public
     // Threshold e SceneThreshold sao fracoes 0..1. MaxGapMs e a distancia no
     // tempo a partir da qual dois quadros deixam de ser comparaveis.
-    constructor Create(AThreshold, ASceneThreshold: Single; AMaxGapMs: Int64);
+    //
+    // AGridScale encolhe o lado da grade (1 = 64x36, 0.5 = 32x18, 0.25 = 16x9);
+    // ACellDelta e quanto o cinza medio de uma celula precisa mudar, em 0..255,
+    // e 0 usa o padrao. Os dois sao filtros contra coisas diferentes: a grade
+    // contra movimento pequeno, o delta contra oscilacao de brilho.
+    constructor Create(AThreshold, ASceneThreshold: Single; AMaxGapMs: Int64;
+                       AGridScale: Single = 1.0; ACellDelta: Integer = 0);
     { IMotionDetector }
     function Feed(Ms: Int64; const Img: TRgbImage): TMotionResult;
     procedure Reset;
@@ -68,6 +78,10 @@ const
   GRID_W = 64;
   GRID_H = 36;
   GRID_CELLS = GRID_W * GRID_H;
+  // O menor lado que ainda descreve alguma coisa. Abaixo disto a grade vira um
+  // punhado de celulas e qualquer sombra cobre uma fracao enorme dela.
+  GRID_MIN_W = 8;
+  GRID_MIN_H = 5;
   // Quanto o fundo anda na direcao do quadro atual a cada analise, em 1/256.
   // 26/256 ~ 10%: com um quadro a cada 2 s, o fundo leva ~20 s para absorver
   // uma mudanca permanente. Rapido o bastante para a luz do entardecer, lento
@@ -79,16 +93,32 @@ const
   CELL_DELTA = 14;
 
 constructor TFrameDiffMotionDetector.Create(AThreshold, ASceneThreshold: Single;
-  AMaxGapMs: Int64);
+  AMaxGapMs: Int64; AGridScale: Single; ACellDelta: Integer);
 begin
   inherited Create;
   FThreshold := AThreshold;
   if FThreshold <= 0 then FThreshold := 0.012;
   FSceneThreshold := ASceneThreshold;
   if FSceneThreshold <= FThreshold then FSceneThreshold := 0.55;
-  FCellDelta := CELL_DELTA;
+  FCellDelta := ACellDelta;
+  if (FCellDelta <= 0) or (FCellDelta > 255) then FCellDelta := CELL_DELTA;
   FMaxGapMs := AMaxGapMs;
   if FMaxGapMs <= 0 then FMaxGapMs := 15000;
+
+  FGridW := GRID_W;
+  FGridH := GRID_H;
+  if (AGridScale > 0) and (AGridScale < 1) then
+  begin
+    FGridW := Round(GRID_W * AGridScale);
+    FGridH := Round(GRID_H * AGridScale);
+  end;
+  if FGridW < GRID_MIN_W then FGridW := GRID_MIN_W;
+  if FGridH < GRID_MIN_H then FGridH := GRID_MIN_H;
+  FGridCells := FGridW * FGridH;
+
+  // Os vetores nascem no tamanho MAXIMO e so os primeiros FGridCells sao
+  // usados: assim o Downsample continua podendo usar vetores de pilha de
+  // tamanho fixo, sem alocar nada por quadro analisado.
   SetLength(FBg, GRID_CELLS);
   SetLength(FCur, GRID_CELLS);
 end;
@@ -115,13 +145,13 @@ begin
   P := PByte(Img.Pixels);
   for Y := 0 to Img.Height - 1 do
   begin
-    GY := (Y * GRID_H) div Img.Height;
-    if GY >= GRID_H then GY := GRID_H - 1;
-    Base := GY * GRID_W;
+    GY := (Y * FGridH) div Img.Height;
+    if GY >= FGridH then GY := FGridH - 1;
+    Base := GY * FGridW;
     for X := 0 to Img.Width - 1 do
     begin
-      GX := (X * GRID_W) div Img.Width;
-      if GX >= GRID_W then GX := GRID_W - 1;
+      GX := (X * FGridW) div Img.Width;
+      if GX >= FGridW then GX := FGridW - 1;
       // Luma inteira da BT.601 com pesos 77/150/29 sobre 256. Nao precisa ser
       // colorimetricamente exata: o que importa e ser a MESMA conta em todos os
       // quadros, e ponto fixo evita centenas de milhares de conversoes para
@@ -132,7 +162,7 @@ begin
       Inc(Contas[Base + GX]);
     end;
   end;
-  for Cel := 0 to GRID_CELLS - 1 do
+  for Cel := 0 to FGridCells - 1 do
     if Contas[Cel] > 0 then
       FCur[Cel] := Byte(Somas[Cel] div Contas[Cel])
     else
@@ -143,7 +173,7 @@ procedure TFrameDiffMotionDetector.SeedBackground;
 var
   I: Integer;
 begin
-  for I := 0 to GRID_CELLS - 1 do
+  for I := 0 to FGridCells - 1 do
     FBg[I] := Integer(FCur[I]) shl 8;
   FHasBg := True;
 end;
@@ -176,21 +206,21 @@ begin
   end;
 
   Movidas := 0;
-  MinX := GRID_W; MinY := GRID_H; MaxX := -1; MaxY := -1;
-  for I := 0 to GRID_CELLS - 1 do
+  MinX := FGridW; MinY := FGridH; MaxX := -1; MaxY := -1;
+  for I := 0 to FGridCells - 1 do
   begin
     Diff := Abs(Integer(FCur[I]) - (FBg[I] shr 8));
     if Diff < FCellDelta then Continue;
     Inc(Movidas);
-    GX := I mod GRID_W;
-    GY := I div GRID_W;
+    GX := I mod FGridW;
+    GY := I div FGridW;
     if GX < MinX then MinX := GX;
     if GX > MaxX then MaxX := GX;
     if GY < MinY then MinY := GY;
     if GY > MaxY then MaxY := GY;
   end;
 
-  Fracao := Movidas / GRID_CELLS;
+  Fracao := Movidas / FGridCells;
   Result.Score := Fracao;
 
   if Fracao >= FSceneThreshold then
@@ -205,7 +235,7 @@ begin
 
   // O fundo so anda quando NAO houve mudanca brusca: absorver o quadro em que
   // alguem esta passando ensinaria a pessoa ao fundo.
-  for I := 0 to GRID_CELLS - 1 do
+  for I := 0 to FGridCells - 1 do
     FBg[I] := FBg[I] + ((Integer(FCur[I]) shl 8) - FBg[I]) * BG_ALPHA div 256;
 
   if Fracao < FThreshold then Exit;
@@ -213,8 +243,8 @@ begin
   Result.Moved := True;
   // A caixa vai ate a borda EXTERNA da ultima celula (+1), senao uma regiao de
   // uma celula so sairia com largura zero.
-  Result.Box := TEventBox.FromLTRB(MinX / GRID_W, MinY / GRID_H,
-                                   (MaxX + 1) / GRID_W, (MaxY + 1) / GRID_H);
+  Result.Box := TEventBox.FromLTRB(MinX / FGridW, MinY / FGridH,
+                                   (MaxX + 1) / FGridW, (MaxY + 1) / FGridH);
 end;
 
 end.

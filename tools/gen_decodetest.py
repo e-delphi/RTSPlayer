@@ -3,13 +3,13 @@
 
     python tools/grabau.py --json quadros.json <fontes...>
     python tools/gen_decodetest.py quadros.json
-    python tools/gen_ui_pas.py
+    (nada mais: o arquivo e servido direto)
 
 A pagina resultante NAO fala com a rede: os quadros vao embutidos em base64.
 E de proposito -- o que se quer medir e o decodificador, e uma falha de rede no
 meio so produziria duvida sobre qual das duas coisas quebrou.
 
-O .html gerado e ASCII puro (exigencia do gen_ui_pas.py): acento por entidade na
+O .html gerado e ASCII puro, por habito desta base: acento por entidade na
 marcacao, e por escape unicode nas strings de JavaScript que vao para
 textContent.
 """

@@ -136,6 +136,7 @@ def query(events, from_ms, to_ms, name=None, kind=None, min_score=0.0):
 
 GRID_W, GRID_H = 64, 36
 GRID_CELLS = GRID_W * GRID_H
+GRID_MIN_W, GRID_MIN_H = 8, 5
 BG_ALPHA = 26
 CELL_DELTA = 14
 
@@ -152,28 +153,45 @@ def paint(buf, w, h, x0, y0, x1, y1, value):
             buf[p] = buf[p + 1] = buf[p + 2] = value
 
 
-def _downsample(buf, w, h):
-    somas = [0] * GRID_CELLS
-    contas = [0] * GRID_CELLS
+def grade_de(escala):
+    """O lado da grade para uma escala, com o mesmo piso do detector."""
+    gw, gh = GRID_W, GRID_H
+    if 0 < escala < 1:
+        gw = int(round(GRID_W * escala))
+        gh = int(round(GRID_H * escala))
+    return max(gw, GRID_MIN_W), max(gh, GRID_MIN_H)
+
+
+def _downsample(buf, w, h, gw=GRID_W, gh=GRID_H):
+    n = gw * gh
+    somas = [0] * n
+    contas = [0] * n
     for y in range(h):
-        gy = min(GRID_H - 1, (y * GRID_H) // h)
-        base = gy * GRID_W
+        gy = min(gh - 1, (y * gh) // h)
+        base = gy * gw
         for x in range(w):
-            gx = min(GRID_W - 1, (x * GRID_W) // w)
+            gx = min(gw - 1, (x * gw) // w)
             p = (y * w + x) * 3
             luma = (77 * buf[p] + 150 * buf[p + 1] + 29 * buf[p + 2]) >> 8
             somas[base + gx] += luma
             contas[base + gx] += 1
-    return [(somas[i] // contas[i]) if contas[i] else 0 for i in range(GRID_CELLS)]
+    return [(somas[i] // contas[i]) if contas[i] else 0 for i in range(n)]
 
 
 class Motion(object):
     """O TFrameDiffMotionDetector, escrito de novo a partir do contrato."""
 
-    def __init__(self, threshold=0.012, scene=0.55, max_gap_ms=8000):
+    def __init__(self, threshold=0.012, scene=0.55, max_gap_ms=8000,
+                 grid_scale=1.0, cell_delta=0):
         self.threshold = threshold
         self.scene = scene
         self.max_gap_ms = max_gap_ms
+        # Os dois filtros, contra coisas diferentes: a grade contra movimento
+        # pequeno, o delta contra deslocamento de brilho. Ver o cabecalho de
+        # Vms.Analytics.Motion.
+        self.gw, self.gh = grade_de(grid_scale)
+        self.cells = self.gw * self.gh
+        self.cell_delta = cell_delta if 0 < cell_delta <= 255 else CELL_DELTA
         self.bg = None
         self.last_ms = 0
 
@@ -184,7 +202,7 @@ class Motion(object):
     def feed(self, ms, buf, w, h):
         saltou = self.last_ms > 0 and abs(ms - self.last_ms) > self.max_gap_ms
         self.last_ms = ms
-        cur = _downsample(buf, w, h)
+        cur = _downsample(buf, w, h, self.gw, self.gh)
 
         if self.bg is None or saltou:
             self.bg = [c << 8 for c in cur]
@@ -192,9 +210,9 @@ class Motion(object):
 
         movidas = []
         for i, c in enumerate(cur):
-            if abs(c - (self.bg[i] >> 8)) >= CELL_DELTA:
+            if abs(c - (self.bg[i] >> 8)) >= self.cell_delta:
                 movidas.append(i)
-        frac = len(movidas) / float(GRID_CELLS)
+        frac = len(movidas) / float(self.cells)
 
         if frac >= self.scene:
             self.bg = [c << 8 for c in cur]
@@ -206,10 +224,10 @@ class Motion(object):
         if frac < self.threshold:
             return {'moved': False, 'score': frac, 'scene': False, 'box': None}
 
-        xs = [i % GRID_W for i in movidas]
-        ys = [i // GRID_W for i in movidas]
-        box = (min(xs) / GRID_W, min(ys) / GRID_H,
-               (max(xs) + 1) / GRID_W, (max(ys) + 1) / GRID_H)
+        xs = [i % self.gw for i in movidas]
+        ys = [i // self.gw for i in movidas]
+        box = (min(xs) / self.gw, min(ys) / self.gh,
+               (max(xs) + 1) / self.gw, (max(ys) + 1) / self.gh)
         return {'moved': True, 'score': frac, 'scene': False, 'box': box}
 
 

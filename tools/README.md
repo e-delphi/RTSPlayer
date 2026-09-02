@@ -149,3 +149,77 @@ layout se resolve apagando as gravações.
 
 O `vmsdump` confere o índice contra a varredura, entrada por entrada — é o teste
 que pega erro de formato antes de ele virar bug de playback.
+
+## Onde a interface mora
+
+O HTML e o JavaScript das telas são **fonte**, moram em `src/UI/web`, e o que os
+servidores servem é o arquivo — não uma cópia dele embutida no executável.
+
+Já foi ao contrário: um gerador convertia as páginas em units Pascal, compiladas
+junto. O programa ficava um arquivo só, e cada linha de CSS custava gerar a
+unit, recompilar e reabrir. Pior, havia duas verdades possíveis para a mesma
+tela — o arquivo e a cópia da última compilação — e nada avisava quando
+divergiam. Agora há uma verdade só; o preço é a pasta ter de acompanhar o
+executável.
+
+Quem lê é o `Vms.Server.UiFiles`, e vale para os dois servidores. Faltando a
+pasta, ou um arquivo dela, o servidor diz isso no log ao subir e a rota responde
+404 com o nome do arquivo e o caminho onde ele era esperado — tela em branco sem
+explicação seria o pior desfecho.
+
+A pasta é procurada em duas ordens:
+
+| ordem | onde | para quê |
+|---|---|---|
+| 1 | o que a variável `VMS_UI_DIR` apontar | a máquina de quem desenvolve |
+| 2 | `ui` ao lado do executável (Windows) ou a pasta interna do app (Android) | todo o resto |
+
+**A variável** aponta direto para `src/UI/web`, e aí a interface servida é o
+fonte: editar e recarregar, sem cópia no meio e sem compilar. Ela ganha da pasta
+de propósito — fosse ao contrário, nunca valeria na máquina de desenvolvimento,
+que é justamente onde a pasta sempre existe. E como é da máquina, e não do
+projeto, quem instala o programa não tem nada a desligar.
+
+```powershell
+setx VMS_UI_DIR "C:\caminho\do\repo\src\UI\web"
+```
+
+O `setx` só vale para processos abertos DEPOIS dele: fechar e reabrir a IDE faz
+parte. Apontando para uma pasta que não existe, ela é ignorada e o servidor diz
+isso no log da subida — um erro de digitação não pode trocar a interface inteira
+em silêncio.
+
+Uma variável serve aos dois programas: o vmsserver e o rtsplayer rodando no
+Windows leem a mesma.
+
+**A pasta `ui`** é o que vale em qualquer outra máquina. No vmsserver ela é
+preenchida pelo pós-build a cada compilação, com `robocopy /MIR` — espelho, e
+não acréscimo: arquivo que sumiu da origem some do destino também, e não fica
+sendo servido depois de renomeado.
+
+```
+rmdir "$(OUTPUTDIR)ui" 2>nul
+robocopy "$(PROJECTDIR)\..\src\UI\web" "$(OUTPUTDIR)ui" /MIR /NJH /NJS /NDL /NFL /NP
+if errorlevel 8 exit /b 1
+exit /b 0
+```
+
+Três detalhes que parecem sobra e não são: as duas barras (`$(OUTPUTDIR)` sempre
+termina em barra e `$(PROJECTDIR)` nunca); o `rmdir` **sem** `/S`, que desfaz uma
+junção antiga sem tocar no alvo — com `/S` ele poderia levar os fontes junto; e o
+`if errorlevel 8`, porque o robocopy devolve 1 quando copia algo, e sem
+normalizar isso uma cópia bem-sucedida reprovaria o build.
+
+No **Android** a pasta é a interna do app (`TPath.GetDocumentsPath` +
+`\ui`), e quem coloca os arquivos lá é o *Deployment* do projeto: adicione os
+oito de `src/UI/web` com **Remote Path** `assets\internal\ui\`. O
+Delphi os deposita na instalação, e é de lá que a leitura acima os pega. Os
+arquivos continuam sendo arquivos -- não há identificador para manter, e a fonte
+continua sendo `src/UI/web`.
+
+Ao lado do executável, no Android, seria uma pasta do sistema onde nada se
+escreve -- por isso o mecanismo simplesmente não existia no aparelho antes
+disto.
+
+A leitura é **arquivo a arquivo**: uma pasta com só o `motion-ui.html` dentro
+vale para ele e deixa os outros virem de onde vinham.

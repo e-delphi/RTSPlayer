@@ -52,6 +52,11 @@ type
     FCamera: string;
     FKeyframes: IKeyframeSource;
     FGrabber: IFrameGrabber;
+    // O percurso: decodifica a sequencia e entrega quadro no ritmo do StepMs,
+    // em vez de um por GOP. Ver Vms.Analytics.Frames.
+    FWalk: IFrameWalkSource;
+    FPasseio: IFrameWalk;
+    FPasseioAte: Int64;
     FAnalyzer: IFrameAnalyzer;
     // Interface, e nao a classe: e o que permitiu trocar arquivo por banco sem
     // tocar em nada aqui dentro.
@@ -76,13 +81,16 @@ type
     function TargetMs: Int64;
     // Um quadro. False = nao havia gravacao dali para frente.
     function Step(out Avancou: Boolean): Boolean;
+    function StepPercurso(out Avancou: Boolean): Boolean;
     procedure SaveProgress;
     procedure Log(const Msg: string);
   protected
     procedure Execute; override;
   public
     constructor Create(const ACamera: string; const AKeyframes: IKeyframeSource;
-                       const AGrabber: IFrameGrabber; const AAnalyzer: IFrameAnalyzer;
+                       const AGrabber: IFrameGrabber;
+                       const AWalk: IFrameWalkSource;
+                       const AAnalyzer: IFrameAnalyzer;
                        const AProgress: IAnalysisProgress; ACache: TVmsIndexCache;
                        const ACfg: TAnalyticsConfig; const AClock: IClock;
                        const ALogger: ILogger; AStop: TEvent);
@@ -94,8 +102,9 @@ const
   // Tamanho maximo do quadro entregue aos detectores. 640 e o lado que os
   // modelos YOLO usam na entrada; mandar 1080p faria o preprocessador reduzir
   // de qualquer jeito, depois de o decodificador ter pago por cada pixel.
+  // Um so: a reducao mantem a proporcao, entao o teto e do LADO maior. Eram
+  // dois nomes para o mesmo 640, e depois da escala um deles ficaria sobrando.
   FRAME_MAX_W = 640;
-  FRAME_MAX_H = 640;
   // Quanto dorme quando a analise alcancou o presente.
   IDLE_MS = 5000;
   // De quantos em quantos quadros o progresso vai para o disco.
@@ -104,6 +113,11 @@ const
   // buraco de gravacao, troca de arquivo depois de reconexao. Comparar os dois
   // lados de um buraco acusaria movimento em toda retomada.
   JUMP_MS = 15000;
+  // De quanto em quanto se abre um percurso. Nao e o passo da analise: e o
+  // tamanho do PEDACO que fica com um arquivo e um decodificador na mao.
+  // Curto o bastante para o worker salvar progresso e ceder a vez com
+  // frequencia; longo o bastante para nao pagar a abertura a cada quadro.
+  PERCURSO_MS = 30000;
 
 // A hora local de um instante, so para o log dizer algo que alguem consiga ler.
 // Nao vem do Vms.Server.Api de proposito: o worker nao deve depender da camada
@@ -115,6 +129,7 @@ end;
 
 constructor TAnalyticsWorker.Create(const ACamera: string;
   const AKeyframes: IKeyframeSource; const AGrabber: IFrameGrabber;
+  const AWalk: IFrameWalkSource;
   const AAnalyzer: IFrameAnalyzer; const AProgress: IAnalysisProgress;
   ACache: TVmsIndexCache; const ACfg: TAnalyticsConfig; const AClock: IClock;
   const ALogger: ILogger; AStop: TEvent);
@@ -125,6 +140,7 @@ begin
   FCamera := ACamera;
   FKeyframes := AKeyframes;
   FGrabber := AGrabber;
+  FWalk := AWalk;
   FAnalyzer := AAnalyzer;
   FProgress := AProgress;
   FCache := ACache;
@@ -191,6 +207,66 @@ begin
   FSalvoEmMs := FAtMs;
 end;
 
+// Um quadro do percurso.
+//
+// Em pedacos, e nao um percurso aberto do comeco ao fim: ele segura um arquivo
+// e um decodificador, e o worker precisa poder parar, salvar progresso e ceder
+// a vez entre um trecho e outro. Quando o pedaco acaba, abre-se o seguinte de
+// onde parou.
+function TAnalyticsWorker.StepPercurso(out Avancou: Boolean): Boolean;
+var
+  Img: TRgbImage;
+  Ms: Int64;
+begin
+  Avancou := False;
+  Result := True;
+  if FPasseio = nil then
+  begin
+    FPasseioAte := FAtMs + PERCURSO_MS;
+    FPasseio := FWalk.Walk(FCamera, FAtMs, FPasseioAte, FCfg.StepMs,
+                           FRAME_MAX_W, FRAME_MAX_W);
+    // Sem percurso aqui e sem gravacao neste trecho: anda e tenta adiante. O
+    // laco de fora e quem decide parar.
+    if FPasseio = nil then
+    begin
+      FAtMs := FPasseioAte;
+      Avancou := True;
+      Exit;
+    end;
+  end;
+
+  if not FPasseio.Next(Img, Ms) then
+  begin
+    FPasseio := nil;
+    FAtMs := Max(FAtMs, FPasseioAte);
+    Avancou := True;
+    Exit;
+  end;
+
+  // Saltou: buraco de gravacao. A referencia de movimento nao vale mais do
+  // outro lado do buraco.
+  if (FLastFrameMs > 0) and ((Ms - FLastFrameMs) > JUMP_MS) then
+  begin
+    FAnalyzer.Flush;
+    FAnalyzer.Rewind;
+  end;
+
+  if Img.IsValid then
+  begin
+    FAnalyzer.Feed(Ms, Img);
+    Inc(FFrames);
+  end
+  else
+  begin
+    Inc(FFalhas);
+    Inc(FFalhasLote);
+  end;
+
+  FLastFrameMs := Ms;
+  FAtMs := Max(FAtMs, Ms + 1);
+  Avancou := True;
+end;
+
 function TAnalyticsWorker.Step(out Avancou: Boolean): Boolean;
 var
   AU, Extra: TBytes;
@@ -198,6 +274,11 @@ var
   ActualMs: Int64;
   Img: TRgbImage;
 begin
+  // O percurso e o caminho normal; o keyframe e a reserva de quando nao ha
+  // decodificador de sequencia nesta maquina. Ver o cabecalho desta unit.
+  if (FWalk <> nil) and FWalk.Available then
+    Exit(StepPercurso(Avancou));
+
   Avancou := False;
   Result := FKeyframes.Grab(FCamera, FAtMs, AU, Extra, Codec, ActualMs);
   if not Result then Exit;
@@ -229,7 +310,7 @@ begin
     FAnalyzer.Rewind;
   end;
 
-  if FGrabber.Decode(AU, Extra, Codec, FRAME_MAX_W, FRAME_MAX_H, Img) and
+  if FGrabber.Decode(AU, Extra, Codec, FRAME_MAX_W, FRAME_MAX_W, Img) and
      Img.IsValid then
   begin
     FAnalyzer.Feed(ActualMs, Img);

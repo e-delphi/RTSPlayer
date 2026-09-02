@@ -6,7 +6,15 @@ html, css e js sem gerar unit nem recompilar: salvar e recarregar a pagina.
 
     python tools/ui_dev.py <pasta do executavel>
     python tools/ui_dev.py Win64/Debug          # o rtsplayer
-    python tools/ui_dev.py vms/Win64/Debug      # o vmsserver
+
+Copia, e nao atalho: serve para levar a interface a uma instalacao ja feita, ou
+a uma pasta de saida qualquer. Para MEXER, os dois caminhos sao melhores e nao
+passam por aqui -- o vmsserver cria sozinho, no pos-build, uma juncao de
+`bin/ui` para `src/UI/web`, e no Android um `adb push` para
+
+    /sdcard/Android/data/<pacote>/files/ui/
+
+deixa o arquivo empurrado valendo na proxima carga da pagina.
 
 Sem argumento, so lista os arquivos que a pasta aceita.
 
@@ -22,7 +30,7 @@ import sys
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
 RAIZ = os.path.join(AQUI, '..')
-FONTE = os.path.join(RAIZ, 'vms', 'src', 'Api')
+FONTE = os.path.join(RAIZ, 'src', 'UI', 'web')
 
 # Os nomes saem DO PASCAL, e nao de uma lista aqui.
 #

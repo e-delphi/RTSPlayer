@@ -12,6 +12,10 @@ uses
   VMS.App.Composition in 'src\App\VMS.App.Composition.pas',
   VMS.App.Config in 'src\App\VMS.App.Config.pas',
   VMS.App.Logger in 'src\App\VMS.App.Logger.pas',
+  VMS.App.Decodificacao in 'src\App\VMS.App.Decodificacao.pas',
+  VMS.Android.Jpeg in 'src\Android\VMS.Android.Jpeg.pas',
+  VMS.Android.JNIUtil in 'src\Android\VMS.Android.JNIUtil.pas',
+  VMS.Android.VideoDecoder in 'src\Android\VMS.Android.VideoDecoder.pas',
   VMS.App.Encerrar in 'src\App\VMS.App.Encerrar.pas',
   VMS.App.ScreenAwake in 'src\App\VMS.App.ScreenAwake.pas',
   VMS.Depk.AAC in 'src\Depacketizer\VMS.Depk.AAC.pas',
@@ -40,6 +44,7 @@ uses
   VMS.Rec.Crc32 in 'src\Recording\VMS.Rec.Crc32.pas',
   VMS.Rec.Format in 'src\Recording\VMS.Rec.Format.pas',
   VMS.Rec.Paths in 'src\Recording\VMS.Rec.Paths.pas',
+  VMS.Rec.Reader in 'src\Recording\VMS.Rec.Reader.pas',
   VMS.Rec.Writer in 'src\Recording\VMS.Rec.Writer.pas',
   VMS.Rec.Sidecar in 'src\Recording\VMS.Rec.Sidecar.pas',
   VMS.Rtp.Demux in 'src\Rtp\VMS.Rtp.Demux.pas',
@@ -57,15 +62,9 @@ uses
   VMS.Win.Edge in 'src\Win\VMS.Win.Edge.pas',
   VMS.Local.Server in 'src\Api\VMS.Local.Server.pas',
   VMS.App.Servers in 'src\App\VMS.App.Servers.pas',
-  // A MESMA unit gerada que o vmsserver serve: uma pagina, dois hospedeiros.
-  Vms.Server.Player.Html in 'vms\src\Api\Vms.Server.Player.Html.pas',
-  Vms.Server.Favicon.Svg in 'vms\src\Api\Vms.Server.Favicon.Svg.pas',
+  // A MESMA leitura de arquivo que o vmsserver usa: uma pasta, dois
+  // hospedeiros.
   Vms.Server.UiFiles in 'vms\src\Api\Vms.Server.UiFiles.pas',
-  Vms.Server.Player.Js in 'vms\src\Api\Vms.Server.Player.Js.pas',
-  Vms.Server.Reader.Js in 'vms\src\Api\Vms.Server.Reader.Js.pas',
-  Vms.Server.Ui.Html in 'vms\src\Api\Vms.Server.Ui.Html.pas',
-  Vms.Server.App.Html in 'vms\src\Api\Vms.Server.App.Html.pas',
-  Vms.Server.Events.Html in 'vms\src\Api\Vms.Server.Events.Html.pas',
   UI.Shell in 'src\UI\UI.Shell.pas';
 
 {$R *.res}

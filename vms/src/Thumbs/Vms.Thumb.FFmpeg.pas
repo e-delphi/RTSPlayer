@@ -37,7 +37,36 @@ uses
   Vms.Thumb.Intf;
 
 type
-  TFFmpegFrameGrabber = class(TInterfacedObject, IFrameGrabber)
+  // Um contexto de decodificacao que vive enquanto se percorre um trecho.
+  //
+  // O TFFmpegFrameGrabber abre e fecha um contexto por chamada, o que e certo
+  // para uma miniatura solta e inutil para uma sequencia: cada quadro P depende
+  // dos anteriores, e um contexto novo nao tem nenhum deles.
+  //
+  // Nao e thread-safe, e nao precisa ser: cada percurso tem o seu.
+  TFFmpegSequence = class(TInterfacedObject, IFrameSequence)
+  strict private
+    FCtx: PAVCodecContext;
+    FFrame: PAVFrame;
+    FPkt: PAVPacket;
+    FExtra: TBytes;
+    FCodec: TVideoCodec;
+    FMaxW, FMaxH: Integer;
+    FLogger: ILogger;
+    FTag: string;
+    function Converter(out Img: TRgbImage): Boolean;
+  public
+    constructor Create(Codec: TVideoCodec; const AExtra: TBytes;
+                       AMaxW, AMaxH: Integer; const ALogger: ILogger;
+                       const ATag: string);
+    destructor Destroy; override;
+    function Aberto: Boolean;
+    { IFrameSequence }
+    function Feed(const AU: TBytes; out Img: TRgbImage): Boolean;
+  end;
+
+  TFFmpegFrameGrabber = class(TInterfacedObject, IFrameGrabber,
+                              IFrameSequenceOpener)
   strict private
     FLogger: ILogger;
     FTag: string;
@@ -63,6 +92,9 @@ type
     function Decode(const AU, Extra: TBytes; Codec: TVideoCodec;
                     MaxW, MaxH: Integer; out Img: TRgbImage): Boolean;
     function Available: Boolean;
+    { IFrameSequenceOpener }
+    function OpenSequence(Codec: TVideoCodec; const Extra: TBytes;
+                          MaxW, MaxH: Integer): IFrameSequence;
   end;
 
 {$ENDIF}
@@ -282,6 +314,177 @@ begin
     if not Result then
       Img := Default(TRgbImage);
   end;
+end;
+
+{ TFFmpegSequence }
+
+constructor TFFmpegSequence.Create(Codec: TVideoCodec; const AExtra: TBytes;
+  AMaxW, AMaxH: Integer; const ALogger: ILogger; const ATag: string);
+var
+  Id: Integer;
+  AvCodec: PAVCodec;
+begin
+  inherited Create;
+  FCodec := Codec;
+  FExtra := Copy(AExtra);
+  FMaxW := AMaxW;
+  FMaxH := AMaxH;
+  FLogger := ALogger;
+  FTag := ATag;
+  if (FMaxW <= 0) or (FMaxH <= 0) then Exit;
+  Id := CodecIdOf(Codec);
+  if Id = 0 then Exit;
+  AvCodec := avcodec_find_decoder(Id);
+  if AvCodec = nil then Exit;
+  FCtx := avcodec_alloc_context3(AvCodec);
+  if FCtx = nil then Exit;
+  if avcodec_open2(FCtx, AvCodec, nil) < 0 then
+  begin
+    avcodec_free_context(@FCtx);
+    FCtx := nil;
+    Exit;
+  end;
+  FFrame := av_frame_alloc;
+  FPkt := av_packet_alloc;
+  if (FFrame = nil) or (FPkt = nil) then
+  begin
+    if FFrame <> nil then av_frame_free(@FFrame);
+    if FPkt <> nil then av_packet_free(@FPkt);
+    avcodec_free_context(@FCtx);
+    FCtx := nil;
+  end;
+end;
+
+destructor TFFmpegSequence.Destroy;
+begin
+  if FPkt <> nil then av_packet_free(@FPkt);
+  if FFrame <> nil then av_frame_free(@FFrame);
+  if FCtx <> nil then avcodec_free_context(@FCtx);
+  inherited;
+end;
+
+function TFFmpegSequence.Aberto: Boolean;
+begin
+  Result := (FCtx <> nil) and (FFrame <> nil) and (FPkt <> nil);
+end;
+
+// O quadro que saiu do decodificador vira RGB no tamanho pedido.
+//
+// O contexto de escala nasce e morre aqui, e nao junto com a sequencia: o
+// formato de pixel so se conhece depois do primeiro quadro, e uma camera que
+// troque de resolucao no meio (acontece, quando o formato muda e a gravacao
+// segue noutro arquivo) invalidaria um contexto guardado.
+function TFFmpegSequence.Converter(out Img: TRgbImage): Boolean;
+var
+  SrcW, SrcH, DstW, DstH: Integer;
+  Escala: Double;
+  Sws: SwsContext;
+  DstData: array[0..3] of PByte;
+  DstLines: array[0..3] of Integer;
+begin
+  Result := False;
+  Img := Default(TRgbImage);
+  SrcW := FFrame.width;
+  SrcH := FFrame.height;
+  if (SrcW <= 0) or (SrcH <= 0) then Exit;
+
+  Escala := Min(FMaxW / SrcW, FMaxH / SrcH);
+  if Escala > 1 then Escala := 1;
+  DstW := Max(2, Round(SrcW * Escala));
+  DstH := Max(2, Round(SrcH * Escala));
+  if Odd(DstW) then Inc(DstW);
+  if Odd(DstH) then Inc(DstH);
+
+  Sws := sws_getContext(SrcW, SrcH, FFrame.format, DstW, DstH,
+                        AV_PIX_FMT_RGB24, SWS_BICUBIC, nil, nil, nil);
+  if Sws = nil then Exit;
+  try
+    Img.Width := DstW;
+    Img.Height := DstH;
+    SetLength(Img.Pixels, DstW * DstH * 3);
+    DstData[0] := @Img.Pixels[0]; DstData[1] := nil;
+    DstData[2] := nil;            DstData[3] := nil;
+    DstLines[0] := DstW * 3;      DstLines[1] := 0;
+    DstLines[2] := 0;             DstLines[3] := 0;
+    Result := sws_scale(Sws, @FFrame.data[0], @FFrame.linesize[0], 0, SrcH,
+                        @DstData[0], @DstLines[0]) > 0;
+  finally
+    sws_freeContext(Sws);
+  end;
+  if not Result then
+    Img := Default(TRgbImage);
+end;
+
+// Entrega um AU e recolhe o quadro, se saiu um.
+//
+// Sem flush aqui, ao contrario do Decode de miniatura: mandar um pacote nil
+// para drenar SINALIZA FIM DE FLUXO, e depois disso o contexto nao aceita mais
+// nada. Numa sequencia isso mataria o percurso no primeiro quadro que
+// demorasse a sair. Quadro que nao saiu agora sai no proximo Feed, que e como o
+// decodificador funciona quando ha reordenacao.
+function TFFmpegSequence.Feed(const AU: TBytes; out Img: TRgbImage): Boolean;
+var
+  Buf: TBytes;
+  InLen, Ret: Integer;
+begin
+  Result := False;
+  Img := Default(TRgbImage);
+  if (not Aberto) or (Length(AU) = 0) then Exit;
+  try
+    // Os parameter sets vao na frente quando o AU nao os traz -- mesma regra do
+    // Decode. Em avc3/hev1 eles vem no proprio fluxo e isto nao acontece.
+    if (Length(FExtra) > 0) and (not HasParameterSets(AU, FCodec)) then
+    begin
+      InLen := Length(FExtra) + Length(AU);
+      SetLength(Buf, InLen + AV_INPUT_BUFFER_PADDING_SIZE);
+      Move(FExtra[0], Buf[0], Length(FExtra));
+      Move(AU[0], Buf[Length(FExtra)], Length(AU));
+    end
+    else
+    begin
+      InLen := Length(AU);
+      SetLength(Buf, InLen + AV_INPUT_BUFFER_PADDING_SIZE);
+      Move(AU[0], Buf[0], InLen);
+    end;
+    FillChar(Buf[InLen], AV_INPUT_BUFFER_PADDING_SIZE, 0);
+
+    FPkt.data := PByte(@Buf[0]);
+    FPkt.size := InLen;
+    Ret := avcodec_send_packet(FCtx, FPkt);
+    FPkt.data := nil;
+    FPkt.size := 0;
+    // Pacote recusado nao e o fim: um AU corrompido no meio da gravacao nao
+    // pode interromper o percurso inteiro.
+    if Ret < 0 then Exit;
+    if avcodec_receive_frame(FCtx, FFrame) < 0 then Exit;
+    Result := Converter(Img);
+  except
+    on E: Exception do
+    begin
+      Result := False;
+      Img := Default(TRgbImage);
+      if FLogger <> nil then
+        FLogger.Warn(FTag, 'sequencia: ' + E.Message);
+    end;
+  end;
+end;
+
+function TFFmpegFrameGrabber.OpenSequence(Codec: TVideoCodec;
+  const Extra: TBytes; MaxW, MaxH: Integer): IFrameSequence;
+var
+  Seq: TFFmpegSequence;
+begin
+  Result := nil;
+  if not Available then Exit;
+  Seq := TFFmpegSequence.Create(Codec, Extra, MaxW, MaxH, FLogger, FTag);
+  // nil, e nao um objeto que nao decodifica: quem chama tem de poder cair no
+  // caminho de keyframe sem descobrir isso quadro a quadro.
+  if not Seq.Aberto then
+  begin
+    Seq.Free;
+    Exit;
+  end;
+  Result := Seq;
 end;
 
 {$ENDIF}

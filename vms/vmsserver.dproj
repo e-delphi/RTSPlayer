@@ -83,6 +83,10 @@
         <Icns_MainIcns>$(BDS)\bin\delphi_PROJECTICNS.icns</Icns_MainIcns>
         <DCC_ExeOutput>.\bin</DCC_ExeOutput>
         <DCC_DcuOutput>.\dcu</DCC_DcuOutput>
+        <PostBuildEvent>rmdir "$(OUTPUTDIR)ui" 2&gt;nul
+robocopy "$(PROJECTDIR)\..\src\UI\web" "$(OUTPUTDIR)ui" /MIR /NJH /NJS /NDL /NFL /NP
+if errorlevel 8 exit /b 1
+exit /b 0</PostBuildEvent>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Base_Android)'!=''">
         <VerInfo_Keys>package=com.embarcadero.$(MSBuildProjectName);label=$(MSBuildProjectName);versionCode=1;versionName=1.0.0;persistent=False;restoreAnyVersion=False;installLocation=auto;largeHeap=False;theme=TitleBar;hardwareAccelerated=true;apiKey=</VerInfo_Keys>
@@ -268,12 +272,6 @@
         <DCCReference Include="src\Db\Vms.Db.Config.pas"/>
         <DCCReference Include="src\Analytics\Vms.Analytics.StoreDb.pas"/>
         <DCCReference Include="src\Analytics\Vms.Analytics.Probe.pas"/>
-        <DCCReference Include="src\Api\Vms.Server.Ui.Html.pas"/>
-        <DCCReference Include="src\Api\Vms.Server.Player.Html.pas"/>
-        <DCCReference Include="src\Api\Vms.Server.Player.Js.pas"/>
-        <DCCReference Include="src\Api\Vms.Server.Reader.Js.pas"/>
-        <DCCReference Include="src\Api\Vms.Server.App.Html.pas"/>
-        <DCCReference Include="src\Api\Vms.Server.Events.Html.pas"/>
         <DCCReference Include="src\App\Vms.Server.Config.pas"/>
         <DCCReference Include="src\App\Vms.Server.Composition.pas"/>
         <BuildConfiguration Include="Base">

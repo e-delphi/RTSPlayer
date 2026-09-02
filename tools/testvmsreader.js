@@ -19,7 +19,7 @@ const path = require("path");
 // texto num escopo e a forma de usa-lo aqui sem sujar o arquivo com um
 // module.exports que nao serve para nada na pagina.
 const fonte = fs.readFileSync(
-  path.join(__dirname, "..", "vms", "src", "Api", "vmsreader.js"), "utf8");
+  path.join(__dirname, "..", "src", "UI", "web", "vmsreader.js"), "utf8");
 const VMS = eval(fonte + "; VMS");
 
 const esperadoPath = process.argv[2];

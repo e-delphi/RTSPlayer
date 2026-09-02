@@ -91,6 +91,16 @@ type
   TServidorDiagFunc = function: string of object;
   // "o voltar chegou na pagina ja na raiz": e para o app fechar.
   TSairProc = procedure of object;
+
+  // Decodificacao nativa, para o que o WebView nao da conta (ver
+  // VMS.App.Decodificacao). Devolve quantos samples ficaram pendentes, ou -1
+  // quando o fragmento nao serviu.
+  TDecodeAlimentarFunc = function(const Camera: string;
+                                  const Dados: TBytes): Integer of object;
+  // O proximo quadro, ja em JPEG, com o instante de parede dele.
+  TDecodeQuadroFunc = function(const Camera: string; out Jpeg: TBytes;
+                               out Ms: Int64): Boolean of object;
+  TDecodeReiniciarProc = procedure(const Camera: string) of object;
   // A credencial cadastrada para um servidor, quando ele pede uma.
   TServidorCredFunc = function(const Nome: string;
                                out Usuario, Senha: string): Boolean of object;
@@ -113,16 +123,19 @@ type
     FOnServidorCredencial: TServidorCredFunc;
     FOnServidorDiag: TServidorDiagFunc;
     FOnSair: TSairProc;
+    FOnDecodeAlimentar: TDecodeAlimentarFunc;
+    FOnDecodeQuadro: TDecodeQuadroFunc;
+    FOnDecodeReiniciar: TDecodeReiniciarProc;
     FLock: TCriticalSection;
     procedure Comando(AContext: TIdContext; ARequestInfo: TIdHTTPRequestInfo;
                       AResponseInfo: TIdHTTPResponseInfo);
+    procedure ServirDaPasta(AResponseInfo: TIdHTTPResponseInfo;
+                            const NomeArquivo, TipoConteudo: string);
     procedure ServirPagina(AResponseInfo: TIdHTTPResponseInfo;
-                           const NomeArquivo: string;
-                           const Html: string);
+                           const NomeArquivo: string);
     procedure ServirIcone(AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirJs(AResponseInfo: TIdHTTPResponseInfo;
-                       const NomeArquivo: string;
-                       const Codigo: string);
+                       const NomeArquivo: string);
     procedure ServirCameras(AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirConfig(AResponseInfo: TIdHTTPResponseInfo);
     procedure GravarConfig(ARequestInfo: TIdHTTPRequestInfo;
@@ -133,6 +146,10 @@ type
     procedure ServirSonda(ARequestInfo: TIdHTTPRequestInfo;
                           AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirSair(AResponseInfo: TIdHTTPResponseInfo);
+    procedure ServirDecodeAlimentar(ARequestInfo: TIdHTTPRequestInfo;
+                                    AResponseInfo: TIdHTTPResponseInfo);
+    procedure ServirDecodeQuadro(ARequestInfo: TIdHTTPRequestInfo;
+                                 AResponseInfo: TIdHTTPResponseInfo);
     procedure GravarServidores(ARequestInfo: TIdHTTPRequestInfo;
                                AResponseInfo: TIdHTTPResponseInfo);
     function UpstreamDaRequisicao(ARequestInfo: TIdHTTPRequestInfo): string;
@@ -177,6 +194,14 @@ type
                                                      write FOnServidorCredencial;
     // Como a pagina pede para o app fechar. Ver ServirSair.
     property OnSair: TSairProc read FOnSair write FOnSair;
+    // A decodificacao nativa. Sem elas, /api/decode responde 503 e a pagina
+    // sabe que este caminho nao existe aqui.
+    property OnDecodeAlimentar: TDecodeAlimentarFunc read FOnDecodeAlimentar
+                                                     write FOnDecodeAlimentar;
+    property OnDecodeQuadro: TDecodeQuadroFunc read FOnDecodeQuadro
+                                               write FOnDecodeQuadro;
+    property OnDecodeReiniciar: TDecodeReiniciarProc read FOnDecodeReiniciar
+                                                     write FOnDecodeReiniciar;
     property OnServidorDiag: TServidorDiagFunc read FOnServidorDiag
                                                write FOnServidorDiag;
   end;
@@ -184,15 +209,10 @@ type
 implementation
 
 uses
-  // As MESMAS páginas que o vmsserver serve: uma fonte, dois hospedeiros.
-  Vms.Server.Events.Html,
-  Vms.Server.App.Html,
-  Vms.Server.Ui.Html,   // a sintonia do detector de movimento
-  Vms.Server.Player.Html,
-  Vms.Server.Favicon.Svg,
+  // A MESMA leitura de arquivo que o vmsserver usa: uma pasta, dois
+  // hospedeiros, e as mesmas páginas para os dois.
   Vms.Server.UiFiles,
-  Vms.Server.Player.Js,
-  Vms.Server.Reader.Js;
+  IdURI;
 
 const
   // Quantas portas tentar a partir da base. Outro app pode estar na primeira, e
@@ -201,6 +221,28 @@ const
   // Teto do que se encaminha de uma vez. Miniatura e JSON cabem folgado; é uma
   // trava contra pedido absurdo, não um limite de projeto.
   MAX_ENCAMINHADO = 8 * 1024 * 1024;
+
+// O parametro vindo da QUERY, e nao do corpo.
+//
+// Num POST o Indy pode preencher Params a partir do CORPO, quando ele parece um
+// formulario -- e ai o `camera=` da URL simplesmente some. As rotas de
+// decodificacao levam o fragmento no corpo e o nome na URL, entao aqui a query
+// e lida direto, sem depender de como o corpo foi interpretado.
+function ParamDaQuery(ARequestInfo: TIdHTTPRequestInfo;
+  const Nome: string): string;
+var
+  Partes: TStringList;
+begin
+  Partes := TStringList.Create;
+  try
+    Partes.Delimiter := '&';
+    Partes.StrictDelimiter := True;
+    Partes.DelimitedText := ARequestInfo.QueryParams;
+    Result := TIdURI.URLDecode(Partes.Values[Nome]);
+  finally
+    Partes.Free;
+  end;
+end;
 
 constructor TLocalServer.Create(const ALogger: ILogger);
 begin
@@ -262,12 +304,17 @@ begin
       FHttp.KeepAlive := True;
       FHttp.Active := True;
       FLogger.Info('local', Format('interface local em %s', [BaseUrl]));
-      // Uma pasta `ui` ao lado do executavel substitui as paginas
-      // embutidas. Dizer isso na subida evita a confusao de editar um
-      // arquivo e nao entender por que a tela mudou (ou nao mudou).
-      if UiDirAtivo then
-        FLogger.Info('local', 'interface vindo de ' + UiDir +
-                              ' (substitui o que esta embutido)');
+      // A interface pode vir de tres lugares (ver Vms.Server.UiFiles). Dizer
+      // qual na subida evita a confusao de editar um arquivo e nao entender
+      // por que a tela mudou -- ou por que nao mudou.
+      if not UiDirAtivo then
+        FLogger.Error('local', 'sem a pasta da interface: ' + UiExplicacao +
+                               ' -- as telas nao vao abrir')
+      else if UiFaltando <> '' then
+        FLogger.Warn('local', 'faltam na interface (' + UiExplicacao + '): ' +
+                              UiFaltando)
+      else
+        FLogger.Info('local', 'interface em ' + UiExplicacao);
       Exit(True);
     except
       on E: Exception do
@@ -314,16 +361,36 @@ begin
   end;
 end;
 
-procedure TLocalServer.ServirPagina(AResponseInfo: TIdHTTPResponseInfo;
-  const NomeArquivo, Html: string);
+// Um arquivo da pasta `ui`, ou 404 dizendo qual falta e onde era esperado.
+//
+// Não há cópia embutida para cair: a pasta É a interface. Uma tela em branco
+// sem explicação seria o pior desfecho, ainda mais no aparelho, onde não se
+// olha a pasta com o dedo.
+procedure TLocalServer.ServirDaPasta(AResponseInfo: TIdHTTPResponseInfo;
+  const NomeArquivo, TipoConteudo: string);
+var
+  Texto: string;
 begin
+  Texto := UiTexto(NomeArquivo);
+  if Texto = '' then
+  begin
+    ResponderErro(AResponseInfo, 404,
+                  'nao achei ' + NomeArquivo + ' em ' + UiDir);
+    Exit;
+  end;
   AResponseInfo.ResponseNo := 200;
-  AResponseInfo.ContentType := 'text/html; charset=utf-8';
+  AResponseInfo.ContentType := TipoConteudo;
   AResponseInfo.CharSet := 'utf-8';
-  AResponseInfo.ContentText := UiTexto(NomeArquivo, Html);
-  // A página muda junto com o executável; versão velha presa no WebView seria
-  // confusão pura durante o desenvolvimento.
+  AResponseInfo.ContentText := Texto;
+  // Versão velha presa no WebView seria confusão pura: o arquivo pode ter
+  // mudado desde o último pedido.
   AResponseInfo.CacheControl := 'no-store';
+end;
+
+procedure TLocalServer.ServirPagina(AResponseInfo: TIdHTTPResponseInfo;
+  const NomeArquivo: string);
+begin
+  ServirDaPasta(AResponseInfo, NomeArquivo, 'text/html; charset=utf-8');
 end;
 
 // O cadastro deste aparelho, como texto JSON. Não passa pelo vmsserver: são as
@@ -451,6 +518,93 @@ begin
   FOnSair();
   AResponseInfo.ResponseNo := 204;
   AResponseInfo.ContentText := '';
+end;
+
+// A pagina entrega um fragmento .vms para o lado nativo decodificar.
+//
+// POST com o corpo em bytes -- o MESMO que /api/media devolveu para ela. Nao se
+// pede aqui de novo ao servidor: o download ja aconteceu, e repeti-lo dobraria o
+// trafego e duplicaria a logica de cursor que a pagina ja tem.
+procedure TLocalServer.ServirDecodeAlimentar(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo);
+var
+  Camera: string;
+  Dados: TBytes;
+  Pend: Integer;
+begin
+  if not Assigned(FOnDecodeAlimentar) then
+  begin
+    ResponderErro(AResponseInfo, 503, 'sem decodificacao nativa aqui');
+    Exit;
+  end;
+  Camera := ParamDaQuery(ARequestInfo, 'camera');
+  if Trim(Camera) = '' then
+  begin
+    ResponderErro(AResponseInfo, 400, 'informe camera');
+    Exit;
+  end;
+  if SameText(ParamDaQuery(ARequestInfo, 'reset'), '1') and
+     Assigned(FOnDecodeReiniciar) then
+    FOnDecodeReiniciar(Camera);
+
+  Dados := nil;
+  if ARequestInfo.PostStream <> nil then
+  begin
+    ARequestInfo.PostStream.Position := 0;
+    SetLength(Dados, ARequestInfo.PostStream.Size);
+    if Length(Dados) > 0 then
+      ARequestInfo.PostStream.ReadBuffer(Dados[0], Length(Dados));
+  end;
+
+  Pend := FOnDecodeAlimentar(Camera, Dados);
+  if Pend < 0 then
+  begin
+    ResponderErro(AResponseInfo, 415, 'fragmento ilegivel');
+    Exit;
+  end;
+  AResponseInfo.ResponseNo := 200;
+  AResponseInfo.ContentType := 'application/json; charset=utf-8';
+  AResponseInfo.ContentText := Format('{"pendentes":%d}', [Pend]);
+end;
+
+// O proximo quadro decodificado, em JPEG.
+//
+// Um de cada vez, e nao "o mais recente": quem tem o relogio da reproducao e a
+// pagina. Ver o cabecalho de VMS.App.Decodificacao.
+procedure TLocalServer.ServirDecodeQuadro(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo);
+var
+  Camera: string;
+  Jpeg: TBytes;
+  Ms: Int64;
+  Fluxo: TMemoryStream;
+begin
+  if not Assigned(FOnDecodeQuadro) then
+  begin
+    ResponderErro(AResponseInfo, 503, 'sem decodificacao nativa aqui');
+    Exit;
+  end;
+  Camera := ParamDaQuery(ARequestInfo, 'camera');
+  if Trim(Camera) = '' then
+  begin
+    ResponderErro(AResponseInfo, 400, 'informe camera');
+    Exit;
+  end;
+  if not FOnDecodeQuadro(Camera, Jpeg, Ms) then
+  begin
+    // 204: nao ha quadro AGORA. Nao e erro -- a pagina volta a pedir depois de
+    // mandar mais um fragmento.
+    AResponseInfo.ResponseNo := 204;
+    AResponseInfo.ContentText := '';
+    Exit;
+  end;
+  Fluxo := TMemoryStream.Create;
+  Fluxo.WriteBuffer(Jpeg[0], Length(Jpeg));
+  Fluxo.Position := 0;
+  AResponseInfo.ResponseNo := 200;
+  AResponseInfo.ContentType := 'image/jpeg';
+  AResponseInfo.CustomHeaders.AddValue('X-Vms-Frame-Ms', IntToStr(Ms));
+  AResponseInfo.ContentStream := Fluxo;   // o Indy libera
 end;
 
 procedure TLocalServer.ServirServidores(AResponseInfo: TIdHTTPResponseInfo);
@@ -582,22 +736,19 @@ begin
 end;
 
 procedure TLocalServer.ServirJs(AResponseInfo: TIdHTTPResponseInfo;
-  const NomeArquivo, Codigo: string);
+  const NomeArquivo: string);
 begin
-  AResponseInfo.ResponseNo := 200;
-  AResponseInfo.ContentType := 'application/javascript; charset=utf-8';
-  AResponseInfo.CharSet := 'utf-8';
-  AResponseInfo.ContentText := UiTexto(NomeArquivo, Codigo);
-  AResponseInfo.CacheControl := 'no-store';
+  ServirDaPasta(AResponseInfo, NomeArquivo,
+                'application/javascript; charset=utf-8');
 end;
 
 procedure TLocalServer.ServirIcone(AResponseInfo: TIdHTTPResponseInfo);
 begin
-  AResponseInfo.ResponseNo := 200;
-  AResponseInfo.ContentType := 'image/svg+xml';
-  AResponseInfo.CharSet := 'utf-8';
-  AResponseInfo.ContentText := UiTexto('favicon.svg', FaviconSvg);
-  AResponseInfo.CacheControl := 'public, max-age=86400';
+  ServirDaPasta(AResponseInfo, 'favicon.svg', 'image/svg+xml');
+  // O ícone não muda entre versões; deixar o navegador guardá-lo evita um
+  // pedido por aba aberta.
+  if AResponseInfo.ResponseNo = 200 then
+    AResponseInfo.CacheControl := 'public, max-age=86400';
 end;
 
 procedure TLocalServer.ServirCameras(AResponseInfo: TIdHTTPResponseInfo);
@@ -781,20 +932,20 @@ begin
   try
     // A raiz e a casca do app: e ela que o WebView abre.
     if (Caminho = '/') or (Caminho = '/ui/app') then
-      ServirPagina(AResponseInfo, 'app-ui.html', AppUiHtml)
+      ServirPagina(AResponseInfo, 'app-ui.html')
     else if Caminho = '/ui/events' then
-      ServirPagina(AResponseInfo, 'events-ui.html', EventsUiHtml)
+      ServirPagina(AResponseInfo, 'events-ui.html')
     // A sintonia do movimento. A página é a mesma do vmsserver, e o ensaio dela
     // (/api/motion/probe) é encaminhado para lá: quem tem gravacao e detector e
     // o servidor, nao o aparelho.
     else if Caminho = '/ui/motion' then
-      ServirPagina(AResponseInfo, 'motion-ui.html', MotionUiHtml)
+      ServirPagina(AResponseInfo, 'motion-ui.html')
     else if Caminho = '/ui/player' then
-      ServirPagina(AResponseInfo, 'player-ui.html', PlayerUiHtml)
+      ServirPagina(AResponseInfo, 'player-ui.html')
     else if Caminho = '/ui/vmsreader.js' then
-      ServirJs(AResponseInfo, 'vmsreader.js', VmsReaderJs)
+      ServirJs(AResponseInfo, 'vmsreader.js')
     else if Caminho = '/ui/player.js' then
-      ServirJs(AResponseInfo, 'player.js', PlayerJs)
+      ServirJs(AResponseInfo, 'player.js')
     // O icone da aba. As duas rotas devolvem o mesmo SVG: o <link> da pagina
     // pede a .svg, e a .ico e a que o navegador busca por conta propria.
     else if (Caminho = '/favicon.svg') or (Caminho = '/favicon.ico') then
@@ -812,6 +963,12 @@ begin
       ServirSonda(ARequestInfo, AResponseInfo)
     else if Caminho = '/api/app/sair' then
       ServirSair(AResponseInfo)
+    // O caminho de quem nao consegue decodificar na pagina: ela manda o
+    // fragmento e pede quadro por quadro, ja em JPEG.
+    else if Caminho = '/api/decode' then
+      ServirDecodeAlimentar(ARequestInfo, AResponseInfo)
+    else if Caminho = '/api/frame' then
+      ServirDecodeQuadro(ARequestInfo, AResponseInfo)
     else if Caminho = '/api/app/servers' then
     begin
       if SameText(ARequestInfo.Command, 'POST') then

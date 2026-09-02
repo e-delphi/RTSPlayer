@@ -49,6 +49,7 @@ uses
   VMS.Domain.Supervisor,
   VMS.App.Config,
   VMS.App.Composition,
+  VMS.App.Decodificacao,   // o que o WebView nao decodifica, o Delphi decodifica
   VMS.App.Encerrar,        // EncerrarProcesso: sair, no Android, e sair
   VMS.App.ScreenAwake,
   VMS.Local.Server,
@@ -63,6 +64,12 @@ type
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure SairPelaPagina;
+    // A ponte entre o servidor local e a decodificacao nativa.
+    function DecodeAlimentar(const Camera: string;
+                             const Dados: TBytes): Integer;
+    function DecodeQuadro(const Camera: string; out Jpeg: TBytes;
+                          out Ms: Int64): Boolean;
+    procedure DecodeReiniciar(const Camera: string);
   private
     FLogger: ILogger;
     FClock: IClock;
@@ -83,6 +90,8 @@ type
 
     // O ao vivo. O lock protege a troca de câmera, que vem das threads do Indy.
     FLiveLock: TCriticalSection;
+    // Decodifica o que o WebView recusa. Ver VMS.App.Decodificacao.
+    FDecodificacao: TDecodificacaoNativa;
     FLiveCam: string;
     FLiveRing: TLiveRing;
     FLiveSink: IMediaSink;    // segura a referência contada do anel
@@ -172,6 +181,15 @@ begin
   FLocal.OnSondarServidor := SondarServidor;
   FLocal.OnServidorDiag := DiagServidores;
   FLocal.OnSair := SairPelaPagina;
+  // Só existe no Android; no Windows o WebView2 decodifica o que precisamos, e
+  // o serviço responde que não está disponível.
+  FDecodificacao := TDecodificacaoNativa.Create(FLogger);
+  if FDecodificacao.Disponivel then
+  begin
+    FLocal.OnDecodeAlimentar := DecodeAlimentar;
+    FLocal.OnDecodeQuadro := DecodeQuadro;
+    FLocal.OnDecodeReiniciar := DecodeReiniciar;
+  end;
   FLocal.Start;
 
   FFrameShell := TFrameShell.Create(Self);
@@ -215,6 +233,7 @@ begin
     // Depois do FLocal, e não antes: é ele quem chama o registro, de dentro
     // das threads do Indy.
     FreeAndNil(FServidores);
+    FreeAndNil(FDecodificacao);
     FreeAndNil(FLiveLock);
     SetKeepScreenOn(False);
     FLogger.Info('sair', 'demolicao completa');
@@ -575,6 +594,31 @@ begin
   if FFrameShell <> nil then
     FFrameShell.Encerrar;
   Close;
+end;
+
+// A ponte com a decodificação nativa. Chamadas de threads do Indy; o serviço
+// tem lock próprio.
+function TForm1.DecodeAlimentar(const Camera: string;
+  const Dados: TBytes): Integer;
+begin
+  if FDecodificacao = nil then Exit(-1);
+  if not FDecodificacao.Alimentar(Camera, Dados) then Exit(-1);
+  Result := FDecodificacao.Pendentes(Camera);
+end;
+
+function TForm1.DecodeQuadro(const Camera: string; out Jpeg: TBytes;
+  out Ms: Int64): Boolean;
+begin
+  Jpeg := nil;
+  Ms := 0;
+  Result := (FDecodificacao <> nil) and
+            FDecodificacao.ProximoQuadro(Camera, 400, Jpeg, Ms);
+end;
+
+procedure TForm1.DecodeReiniciar(const Camera: string);
+begin
+  if FDecodificacao <> nil then
+    FDecodificacao.Reiniciar(Camera);
 end;
 
 // A página pediu para sair, por /api/app/sair.

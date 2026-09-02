@@ -108,8 +108,27 @@ var Player = (function () {
     this.reiniciarEstado();
   }
 
+  // O diario da sessao.
+  //
+  // Vai para o console -- que no WebView do Android o Chromium despeja no
+  // logcat -- e as ultimas linhas ficam guardadas para entrarem na mensagem de
+  // erro. Descobrir por que um fluxo nao decodifica exigia adb; agora a propria
+  // tela conta.
+  Player.prototype.diag = function (linha) {
+    if (!this.diario) this.diario = [];
+    this.diario.push(linha);
+    if (this.diario.length > 12) this.diario.shift();
+    try { console.log("[vms] " + linha); } catch (e) {}
+  };
+
   Player.prototype.reiniciarEstado = function () {
     this.fecharDecodificador();
+    if (this.quadroNativo && this.quadroNativo.img.close)
+      this.quadroNativo.img.close();
+    this.quadroNativo = null;
+    this.pedindoQuadro = false;
+    this.resetNativo = true;     // o decodificador nativo tambem volta ao zero
+    this.bufAtual = null;
     this.fila = [];              // quadros decodificados esperando a hora
     this.pendentes = [];         // samples de video ainda nao mandados
     this.audioPend = [];         // samples de audio ainda nao agendados
@@ -159,6 +178,22 @@ var Player = (function () {
     // nisso, porque a volta refaz o decodificador.
     this.tentouSoftware = false;
     this.usandoSoftware = false;
+    // Erros do decodificador desde que esta sessao comecou. Ver recuperarDoErro:
+    // a decisao de trocar de motor sai DAQUI, e nao da rajada.
+    this.errosNaSessao = 0;
+    // Quantos quadros o decodificador chegou a entregar. Zero num erro diz que
+    // ele recusou o fluxo desde o inicio, e nao que engasgou no meio.
+    this.quadrosVistos = 0;
+    // O caminho nativo: quando o navegador nao decodifica este fluxo, quem
+    // decodifica e o Delphi, e a pagina recebe JPEG. Ver decidirCaminho.
+    this.nativo = false;
+    this.quadroNativo = null;    // quadro ja baixado, esperando a hora dele
+    this.pedindoQuadro = false;
+    this.resetNativo = true;     // o proximo fragmento reinicia o decodificador
+    this.bufAtual = null;
+    this.avisouPrefixo = false;
+    this.ultimoErro = "";
+    this.diario = [];
     // Apaga o que estava desenhado. Sem isto, fechar uma camera e abrir outra
     // mostrava o ultimo quadro da PRIMEIRA ate o primeiro quadro da segunda ser
     // decodificado -- e por um segundo a tela dizia estar em outro lugar.
@@ -238,6 +273,11 @@ var Player = (function () {
       this.configurarVideo(frag);
     }
 
+    // Guardado para o caso de a resposta sobre o suporte chegar depois deste
+    // fragmento -- ver decidirCaminho.
+    this.bufAtual = buf;
+    if (this.nativo) this.mandarParaNativo(buf);
+
     var self = this;
     VMS.samplesDeVideo(frag).forEach(function (s) { self.pendentes.push(s); });
     if (frag.header.audio.present)
@@ -254,11 +294,233 @@ var Player = (function () {
     this.spsLargura = sps ? sps.width : v.width;
     this.spsAltura = sps ? sps.height : v.height;
 
-    // Sem parameter set no fluxo, o extradata do header entra na frente de cada
-    // keyframe. A frente e assim; a ayla nao precisa.
-    this.prefixar = kf ? !VMS.temParameterSet(kf.data, v.codecName) : false;
+    // Sem parameter set no fluxo, o extradata do header entra na frente do
+    // keyframe. Medido em disco: a ayla e a isis mandam SPS+PPS dentro do
+    // proprio keyframe, e a frente manda o IDR sozinho -- os VPS/SPS/PPS dela
+    // so existem no extradata do header (88 bytes).
+    //
+    // A decisao e por KEYFRAME, no alimentarDecodificador, e nao aqui. Aqui ela
+    // saia do PRIMEIRO fragmento: se ele chegasse sem keyframe nenhum, o
+    // prefixo ficava desligado para o resto da sessao e a frente entregava IDR
+    // sem parameter set -- que e exatamente um decodificador que erra sempre.
+    this.codecNome = v.codecName;
+    this.extradata = v.extradata;
 
+    this.decidirCaminho();
+
+    this.diag("configurando " + this.cadeia + " " + this.spsLargura + "x" +
+              this.spsAltura + "  extradata=" +
+              ((v.extradata && v.extradata.length) || 0) + "B" +
+              "  keyframe no 1o fragmento=" + (kf ? "sim" : "nao") +
+              (kf ? ("  parameter set no keyframe=" +
+                     (VMS.temParameterSet(kf.data, v.codecName) ? "sim" : "nao"))
+                  : ""));
+
+    // Ja se sabe que este navegador nao decodifica isto: nem abrir. Quando a
+    // resposta ainda nao chegou, o decodificador abre e o decidirCaminho o
+    // fecha assim que souber.
+    if (this.nativo) return;
+
+    this.adotarOQueJaSeSabe();
     this.abrirDecodificador(this.usandoSoftware);
+  };
+
+  // Este navegador decodifica ESTE fluxo, neste tamanho?
+  //
+  // A pergunta e feita ao mediaCapabilities, que -- ao contrario do
+  // isConfigSupported do WebCodecs -- leva o TAMANHO em conta. Medido num
+  // Android 14: para hev1.1.6.L150 ele responde `true` em 2048x1440 e `false`
+  // em 2560x1440, que e exatamente onde o decodificador falhava. O
+  // isConfigSupported dizia "sim" nos dois.
+  //
+  // Dizendo que nao, a decodificacao passa para o lado nativo, que alcanca o
+  // decodificador de software do sistema -- o navegador nao alcanca.
+  // Se o hardware ja falhou neste formato nesta pagina, comecar em software.
+  //
+  // Sem isto, toda vez que se abre a camera de novo -- e a cada troca de arquivo
+  // dentro da mesma sessao -- se repete a mesma sequencia de erros ate escalar,
+  // e o usuario ve "trecho ilegivel" antes de ver imagem.
+  Player.prototype.adotarOQueJaSeSabe = function () {
+    if (this.usandoSoftware) return;
+    if (!Player.softwareNecessario[this.chaveFormato()]) return;
+    this.usandoSoftware = true;
+    this.diag("hardware ja falhou neste formato; abrindo em software");
+  };
+
+  // O que identifica um formato para efeito de decodificacao: a cadeia e o
+  // tamanho. E por ele que se guarda o que ja se descobriu sobre este aparelho.
+  Player.prototype.chaveFormato = function () {
+    return this.cadeia + "|" + this.spsLargura + "x" + this.spsAltura;
+  };
+
+  Player.prototype.decidirCaminho = function () {
+    var self = this;
+    var chave = this.chaveFormato();
+
+    // A resposta fica guardada: um seek reconfigura o video e cairia aqui de
+    // novo, e a pergunta e assincrona -- no intervalo ate ela voltar o caminho
+    // do navegador seria usado outra vez, falhando outra vez.
+    if (Player.suporte.hasOwnProperty(chave)) {
+      this.nativo = !Player.suporte[chave];
+      if (this.nativo) this.fecharDecodificador();
+      return;
+    }
+    this.nativo = false;
+    if (!navigator.mediaCapabilities || !this.spsLargura) return;
+    var tipo = "video/mp4; codecs=\"" + this.cadeia + "\"";
+    navigator.mediaCapabilities.decodingInfo({
+      type: "media-source",
+      video: { contentType: tipo, width: this.spsLargura,
+               height: this.spsAltura, bitrate: 4000000, framerate: 15 }
+    }).then(function (r) {
+      if (r && r.supported) { Player.suporte[chave] = true; return; }
+      // Existe decodificacao nativa deste lado? Sem ela nao ha o que fazer, e e
+      // melhor tentar assim mesmo do que nao mostrar nada.
+      return fetch("/api/frame?camera=" +
+                   encodeURIComponent(self.chaveNativa()), { method: "GET" })
+        .then(function (rr) {
+          // 503 = o app sem decodificacao nativa; 404 = a pagina esta sendo
+          // servida pelo vmsserver, e nao pelo app. Nos dois casos nao ha para
+          // onde ir, e tentar pelo navegador mesmo assim e melhor que nada.
+          if (!rr.ok) {
+            Player.suporte[chave] = true;
+            self.diag("navegador nao decodifica isto e nao ha caminho nativo (" +
+                      rr.status + ")");
+            return;
+          }
+          Player.suporte[chave] = false;
+          self.nativo = true;
+          self.fecharDecodificador();
+          self.diag("navegador nao decodifica " + self.cadeia + " em " +
+                    self.spsLargura + "x" + self.spsAltura +
+                    "; decodificando no aparelho");
+          self.aoEstado("aviso", "decodificando no aparelho");
+          // O fragmento que provocou a pergunta ja chegou; sem reenvia-lo, a
+          // reproducao so comecaria no proximo -- e no historico pode nao haver
+          // proximo.
+          if (self.bufAtual) self.mandarParaNativo(self.bufAtual);
+        });
+    }).catch(function () {});
+  };
+
+  // O caminho nativo e SEMPRE do servidor local do app -- e ele quem tem o
+  // decodificador. Nao leva `server`: o fragmento ja veio de la e vai no corpo.
+  // "cadeia|LxA" -> o navegador decodifica isto? Vale para a pagina toda: a
+  // resposta e do aparelho, nao da sessao.
+  Player.suporte = {};
+
+  // "cadeia|LxA" -> o decodificador de hardware falhou aqui e o de software deu
+  // conta. Tambem vale para a pagina toda, e pelo mesmo motivo.
+  Player.softwareNecessario = {};
+
+  // ------------------------------------------------- decodificacao no aparelho
+  //
+  // Quando o navegador nao da conta, quem decodifica e o Delphi -- que alcanca o
+  // MediaCodec do sistema, incluindo o decodificador de software que o Chromium
+  // nao expoe. O desenho e o mais simples que funciona:
+  //
+  //   a pagina continua baixando os fragmentos .vms como sempre (isso nunca
+  //   falhou -- o que falhava era so decodificar), manda os BYTES para o
+  //   servidor local do app e pede um quadro de cada vez, em JPEG.
+  //
+  // Um de cada vez, e nao um fluxo: assim o relogio da reproducao continua sendo
+  // o da pagina, e velocidade, pausa e seek seguem valendo sem nada novo.
+
+  Player.prototype.mandarParaNativo = function (buf) {
+    var self = this;
+    var u = "/api/decode?camera=" + encodeURIComponent(this.chaveNativa()) +
+            (this.resetNativo ? "&reset=1" : "");
+    this.resetNativo = false;
+    // O tipo importa: sem ele o Indy pode achar que o corpo e um formulario,
+    // e ai ele some do PostStream e leva junto o camera= da URL.
+    fetch(u, { method: "POST", body: buf,
+               headers: { "Content-Type": "application/octet-stream" } })
+      .then(function (r) {
+        if (!r.ok) self.diag("nativo recusou o fragmento: " + r.status);
+      })
+      .catch(function (e) { self.diag("nativo: " + e); });
+  };
+
+  // Os samples ficam em `pendentes` so para a conta do buffer -- quem decodifica
+  // e o outro lado. Sao dispensados conforme os quadros saem de la.
+  Player.prototype.podarNativo = function (ms) {
+    while (this.pendentes.length && this.pendentes[0].wallMs <= ms)
+      this.pendentes.shift();
+  };
+
+  Player.prototype.pedirQuadroNativo = function () {
+    var self = this;
+    var ger = this.geracao;
+    this.pedindoQuadro = true;
+    fetch("/api/frame?camera=" + encodeURIComponent(this.chaveNativa()))
+      .then(function (r) {
+        if (r.status !== 200) return null;
+        var ms = parseInt(r.headers.get("X-Vms-Frame-Ms") || "0", 10);
+        return r.blob().then(function (b) {
+          return createImageBitmap(b).then(function (img) {
+            return { img: img, ms: ms };
+          });
+        });
+      })
+      .then(function (q) {
+        self.pedindoQuadro = false;
+        if (!q) return;
+        if (ger !== self.geracao) { q.img.close(); return; }   // houve seek
+        self.quadroNativo = q;
+      })
+      .catch(function (e) {
+        self.pedindoQuadro = false;
+        self.diag("quadro nativo: " + e);
+      });
+  };
+
+  // Mostra o quadro nativo quando a hora dele chega, e pede o proximo.
+  Player.prototype.bombearNativo = function (agora) {
+    var q = this.quadroNativo;
+    if (q) {
+      if (!this.epochMs) {
+        this.epochMs = q.ms;
+        // Mesma reancoragem do caminho do navegador: o que chegou manda.
+        if (Math.abs(q.ms - this.baseMs) > MAX_DESVIO_MS) {
+          this.baseMs = q.ms;
+          this.baseRelogio = this.relogio();
+          this.ultimoMs = q.ms;
+          this.aoEstado("reancorado", q.ms);
+        }
+      }
+      if (this.instanteDe(q.ms) > agora) return;   // ainda nao e a hora
+      this.quadroNativo = null;
+      if (!this.exibidoMs || q.ms > this.exibidoMs) {
+        if (!this.mediuQuadro) {
+          this.mediuQuadro = true;
+          this.quadroLargura = q.img.width;
+          this.quadroAltura = q.img.height;
+          this.tamanhosDoQuadro = "";
+          this.anunciarTamanho();
+        }
+        if (this.canvas.width !== q.img.width ||
+            this.canvas.height !== q.img.height) {
+          this.canvas.width = q.img.width;
+          this.canvas.height = q.img.height;
+        }
+        try { this.ctx.drawImage(q.img, 0, 0); } catch (e) {}
+        this.ultimoMs = q.ms;
+        this.exibidoMs = q.ms;
+        this.aoPosicao(q.ms);
+      }
+      q.img.close();
+      this.podarNativo(q.ms);
+    }
+    if (!this.quadroNativo && !this.pedindoQuadro && this.pendentes.length)
+      this.pedirQuadroNativo();
+  };
+
+  // O lado nativo guarda um decodificador por nome. Duas cameras chamadas
+  // "frente" em servidores diferentes sao duas cameras -- o escopo entra na
+  // chave para nao mistura-las num decodificador so.
+  Player.prototype.chaveNativa = function () {
+    var sv = this.escopo();
+    return (sv ? sv + "/" : "") + this.camera;
   };
 
   // Cria e configura o decodificador a partir do que ja foi lido do SPS.
@@ -286,10 +548,18 @@ var Player = (function () {
         // Nunca descartar o da sessao atual: o trabalho de decodificar ja foi
         // feito, e jogar fora produziria salto na imagem. Quem segura o ritmo e
         // o alimentarDecodificador, que so entrega enquanto a fila tem espaco.
+        self.quadrosVistos = (self.quadrosVistos || 0) + 1;
         self.fila.push(quadro);
       },
       error: function (e) {
         if (ger !== self.geracao) return;
+        // Guardado: o recuperarDoErro sobrescreve a mensagem no quadro
+        // seguinte, e ate agora o texto do decodificador se perdia ai.
+        self.ultimoErro = (e && (e.name ? e.name + ": " : "") + e.message) ||
+                          "erro sem descricao";
+        self.diag("decodificador falhou: " + self.ultimoErro +
+                  "  (quadros ate aqui: " + (self.quadrosVistos || 0) +
+                  ", software=" + (self.usandoSoftware ? "sim" : "nao") + ")");
         self.aoEstado("erro", "decodificador: " + e.message);
         self.recuperarDoErro();
       }
@@ -339,16 +609,57 @@ var Player = (function () {
   // Com limite: erro que se repete depressa nao e trecho ruim, e o fluxo
   // inteiro -- e ai reabrir sem parar so gastaria bateria.
   Player.prototype.recuperarDoErro = function () {
-    // Se estava em software e deu erro, o hardware e a aposta melhor para a
-    // proxima: insistir no que acabou de falhar so queima as tentativas.
-    this.usandoSoftware = false;
     var agora = this.relogio();
     if (agora - (this.ultimaRecuperacao || 0) < 2)
       this.recuperacoes = (this.recuperacoes || 0) + 1;
     else
       this.recuperacoes = 1;
     this.ultimaRecuperacao = agora;
-    if (this.recuperacoes > MAX_RECUPERACOES) return;
+
+    this.errosNaSessao = (this.errosNaSessao || 0) + 1;
+
+    if (this.recuperacoes > MAX_RECUPERACOES) {
+      // Desistir CALADO era o pior dos dois mundos: a mensagem de "trecho
+      // ilegivel" ficava na tela para sempre, sem video e sem explicacao, e
+      // parecia gravacao ruim quando o problema era o aparelho.
+      this.aoEstado("erro", "este aparelho nao decodificou " + this.cadeia +
+        " em " + this.spsLargura + "x" + this.spsAltura +
+        (this.usandoSoftware ? ", nem em software" : "") +
+        ". Uma resolucao menor nesta camera resolve.  [" +
+        (this.ultimoErro || "sem mensagem do decodificador") + "]");
+      this.diag("desistindo. diario: " + (this.diario || []).join(" | "));
+      return;
+    }
+
+    // A primeira falha costuma ser trecho gravado com defeito, e refazer o
+    // decodificador do proximo keyframe pula o GOP ruim.
+    //
+    // Da segunda em diante o suspeito deixa de ser a gravacao e passa a ser o
+    // MOTOR. Decodificador de hardware de aparelho novo engasga acima de 720p:
+    // num Android 14, 1080p (avc3.4D0033) e 1440p (hev1.1.6.L150) erravam em
+    // sequencia e nunca exibiam nada, enquanto 720p (avc3.4DE028) ia bem na
+    // mesma sessao. Antes disto o codigo voltava para o hardware a cada erro --
+    // exatamente o motor que estava falhando -- e depois de tres tentativas
+    // desistia sem dizer nada.
+    //
+    // A conta e a da SESSAO, e nao a da rajada. Com a rajada, um decodificador
+    // que errava a cada tres segundos -- mais que os dois da janela -- zerava a
+    // contagem a cada erro, nunca chegava a dois e ficava para sempre em
+    // "trecho ilegivel; seguindo do proximo keyframe", sem nunca tentar o
+    // software que funcionava. Foi o que aconteceu com a isis.
+    if ((this.errosNaSessao >= 2) && (!this.usandoSoftware)) {
+      var self = this;
+      this.aoEstado("aviso", "o decodificador de hardware recusou; " +
+                             "tentando em software");
+      this.trocarParaSoftware(function () {
+        // Sem software para esta cadeia: segue no hardware e deixa a contagem
+        // levar ao recado final, que e melhor que uma tela muda.
+        self.aoEstado("aviso", "trecho ilegivel; seguindo do proximo keyframe");
+        self.abrirDecodificador(false);
+      });
+      return;
+    }
+
     this.aoEstado("aviso", "trecho ilegivel; seguindo do proximo keyframe");
     this.abrirDecodificador(this.usandoSoftware);
   };
@@ -382,21 +693,36 @@ var Player = (function () {
     if (this.tentouSoftware) return;
     // Avaliar uma vez so; a resposta nao muda no meio da sessao.
     this.tentouSoftware = true;
+    this.aoEstado("aviso", "quadro menor que o anunciado; tentando decodificar" +
+                           " em software");
+    this.trocarParaSoftware(null);
+  };
+
+  // Troca o motor de decodificacao para software, quando este navegador tiver
+  // um para esta cadeia.
+  //
+  // `senao` roda quando NAO tiver -- e o que impede a reproducao de ficar sem
+  // decodificador nenhum enquanto se espera a resposta assincrona. No Android
+  // nao ha software para HEVC, e ali o caminho de saida e obrigatorio.
+  Player.prototype.trocarParaSoftware = function (senao) {
     var self = this, ger = this.geracao;
     var cfg = { codec: this.cadeia, hardwareAcceleration: "prefer-software" };
     VideoDecoder.isConfigSupported(cfg).then(function (r) {
-      // Nao ha software para esta cadeia (o Android nao tem para HEVC): fica
-      // no hardware e NADA muda -- em especial, nao se marca que se esta
-      // usando software.
-      if (ger !== self.geracao || !r || !r.supported) return;
+      if (ger !== self.geracao) return;
+      self.diag("software para " + self.cadeia + ": " +
+                (r && r.supported ? "existe" : "NAO existe"));
+      if (!r || !r.supported) { if (senao) senao(); return; }
       self.usandoSoftware = true;
-      self.aoEstado("aviso", "quadro menor que o anunciado; tentando decodificar" +
-                             " em software");
+      // Anotado para as proximas aberturas desta camera nao passarem de novo
+      // pela sequencia de erros ate chegar aqui.
+      Player.softwareNecessario[self.chaveFormato()] = true;
+      self.aoEstado("aviso", "decodificando em software");
       self.abrirDecodificador(true);
-    }).catch(function () {});
+    }).catch(function () { if (ger === self.geracao && senao) senao(); });
   };
 
   Player.prototype.alimentarDecodificador = function () {
+    if (this.nativo) return;     // quem decodifica e o aparelho
     if (!this.dec || this.dec.state !== "configured") return;
     while (this.pendentes.length &&
            this.fila.length + this.dec.decodeQueueSize < MAX_FILA) {
@@ -437,8 +763,17 @@ var Player = (function () {
         }
       }
       var dados = s.data;
-      if (this.prefixar && s.keyframe)
-        dados = VMS.concatenar(this.header.video.extradata, dados);
+      // Keyframe sem parameter set nao decodifica: o extradata do header entra
+      // na frente DELE. Conferido a cada keyframe, e nao uma vez por sessao.
+      if (s.keyframe && this.extradata && this.extradata.length &&
+          !VMS.temParameterSet(s.data, this.codecNome)) {
+        dados = VMS.concatenar(this.extradata, dados);
+        if (!this.avisouPrefixo) {
+          this.avisouPrefixo = true;
+          this.diag("keyframe sem parameter set; prefixando " +
+                    this.extradata.length + "B de extradata");
+        }
+      }
       try {
         this.dec.decode(new EncodedVideoChunk({
           type: s.keyframe ? "key" : "delta",
@@ -526,6 +861,12 @@ var Player = (function () {
     // mais novo mantem a reproducao junto do relogio depois de um engasgo, em
     // vez de acumular atraso.
     var agora = this.relogio();
+    if (this.nativo) {
+      this.bombearNativo(agora);
+      this.pedirMaisSePreciso();
+      requestAnimationFrame(function () { self.laco(); });
+      return;
+    }
     var mostrar = null;
     while (this.fila.length) {
       var q = this.fila[0];
@@ -604,7 +945,13 @@ var Player = (function () {
       this.aoPosicao(this.ultimoMs);
     }
 
-    // Buscar mais quando o que resta a frente encolhe.
+    this.pedirMaisSePreciso();
+
+    requestAnimationFrame(function () { self.laco(); });
+  };
+
+  // Buscar mais quando o que resta a frente encolhe.
+  Player.prototype.pedirMaisSePreciso = function () {
     var restaMs = this.pendentes.length
       ? this.pendentes[this.pendentes.length - 1].wallMs - this.ultimoMs : 0;
     if (this.aoVivo) {
@@ -616,8 +963,6 @@ var Player = (function () {
     }
     else if (!this.fim && restaMs < ALVO_BUFFER_MS)
       this.pedirFragmento(this.ultimoMs || this.baseMs);
-
-    requestAnimationFrame(function () { self.laco(); });
   };
 
   // ------------------------------------------------------------- controle

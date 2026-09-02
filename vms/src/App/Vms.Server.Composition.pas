@@ -105,6 +105,7 @@ uses
   Vms.Analytics.Motion,
   Vms.Analytics.Analyzer,
   Vms.Analytics.Probe,
+  Vms.Analytics.Frames,   // TVmsFrameWalkSource: o percurso no ritmo pedido
   Vms.Analytics.StoreDb,
 {$IFDEF MSWINDOWS}
   Vms.Thumb.FFmpeg,
@@ -187,6 +188,7 @@ function BuildAnalytics(const Cfg: TAnalyticsConfig; const Db: IDbQueue;
 var
   Grabber: IFrameGrabber;
   Keyframes: IKeyframeSource;
+  Percurso: IFrameWalkSource;
   Objetos: IObjectDetector;
   Store: TSqliteEventStore;
   Analyzer: IFrameAnalyzer;
@@ -234,6 +236,10 @@ begin
   // objeto, e ele morre junto com o rig.
   Result.Events := Store;
   Keyframes := TVmsKeyframeSource.Create(Cache, Logger);
+  // O MESMO grabber pelas duas interfaces: quadro solto (a reserva) e sequencia
+  // (o percurso no ritmo do StepMs).
+  Percurso := TVmsFrameWalkSource.Create(Cache, Grabber as IFrameSequenceOpener,
+                                         Logger);
 
   Logger.Info('analytics', Cfg.Describe);
   Logger.Info('analytics', Objetos.Describe);
@@ -246,10 +252,11 @@ begin
     // cada câmera apagar a referência da outra.
     Analyzer := TFrameAnalyzer.Create(Cameras[I],
       TFrameDiffMotionDetector.Create(Cfg.MotionThreshold,
-        Cfg.SceneChangeThreshold, Cfg.StepMs * 4),
+        Cfg.SceneChangeThreshold, Cfg.StepMs * 4,
+        Cfg.GridScale, Cfg.CellDelta),
       Objetos, Store, Cfg, Logger);
     Result.Workers[I] := TAnalyticsWorker.Create(Cameras[I], Keyframes, Grabber,
-      Analyzer, Store, Cache, Cfg, Clock, Logger, Stop);
+      Percurso, Analyzer, Store, Cache, Cfg, Clock, Logger, Stop);
     // (Store entra como IAnalysisProgress; a conversão é implícita.)
   end;
 end;
@@ -267,8 +274,13 @@ begin
   // requisicao HTTP, e compartilhar levaria as duas a se atrapalharem.
   Grabber := TFFmpegFrameGrabber.Create(Logger, 'probe');
   if Grabber.Available then
-    Result := TMotionProbe.Create(TVmsKeyframeSource.Create(Cache, Logger),
-                                  Grabber, Logger);
+    // O MESMO objeto pelas duas interfaces: ele decodifica quadro solto
+    // (IFrameGrabber, a reserva de keyframe) e abre sequencia
+    // (IFrameSequenceOpener, o percurso no ritmo pedido).
+    Result := TMotionProbe.Create(
+      TVmsKeyframeSource.Create(Cache, Logger), Grabber,
+      TVmsFrameWalkSource.Create(Cache, Grabber as IFrameSequenceOpener, Logger),
+      Logger);
 {$ENDIF}
 end;
 

@@ -30,7 +30,7 @@ uses
   System.Classes;
 
 const
-  LINHAS: array[0..182] of string = (
+  LINHAS: array[0..186] of string = (
     'PRAGMA foreign_keys = ON;',
     '',
     'CREATE TABLE db_meta (',
@@ -199,6 +199,10 @@ const
     '  (''analytics.stepMs'',             ''2000'',        0),',
     '  (''analytics.motionThreshold'',    ''0.006'',       0),',
     '  (''analytics.sceneChangeThreshold'',''0.85'',       0),',
+    '',
+    '  (''analytics.gridScale'',          ''1'',           0),',
+    '',
+    '  (''analytics.cellDelta'',          ''0'',           0),',
     '  (''analytics.mergeGapMs'',         ''8000'',        0),',
     '',
     '  (''analytics.maxEventMs'',         ''300000'',      0),',
@@ -241,7 +245,7 @@ end;
 
 function SettingsSeedSql: string;
 begin
-  Result := Junta(131, 180);
+  Result := Junta(131, 184);
 end;
 
 end.

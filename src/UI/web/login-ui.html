@@ -50,7 +50,7 @@
   <div class="sub" id="sub">carregando...</div>
 
   <form id="f" style="display:none">
-    <label>Usu&aacute;rio<input id="u" autocomplete="username" value="admin"></label>
+    <label>Usu&aacute;rio<input id="u" autocomplete="username"></label>
     <label id="l-senha">Senha<input id="p" type="password"
       autocomplete="current-password"></label>
     <label id="l-conf" style="display:none">Repita a senha<input id="p2"
@@ -91,6 +91,12 @@ fetch("/api/auth/status").then(function (r) { return r.json(); })
     $("f").style.display = "";
     if (definindo) {
       $("tit").textContent = "Defina uma senha";
+      // So aqui o nome e uma ESCOLHA, e deixar em branco nao e neutro: o
+      // servidor cai em "admin". O placeholder mostra isso em vez de deixar
+      // acontecer calado. Na entrada o campo fica vazio de verdade -- preenchido
+      // com "admin" ele estava errado toda vez para quem usa outro nome, e num
+      // endereco publico ainda entregava um usuario plausivel de graca.
+      $("u").placeholder = "admin";
       $("sub").textContent = j.local
         ? "Este servidor ainda n\u00e3o tem senha. Escolha uma com pelo menos " +
           "8 caracteres."
@@ -101,8 +107,11 @@ fetch("/api/auth/status").then(function (r) { return r.json(); })
       $("b").textContent = "Definir senha";
       if (!j.local) { $("b").disabled = true; }
     } else {
-      $("tit").textContent = "Entrar";
-      $("sub").textContent = "Este servidor pede usu\u00e1rio e senha.";
+      // O nome, e nao a instrucao: "Entrar" sobre um formulario de entrada e
+      // dizer duas vezes a mesma coisa, e "pede usuario e senha" e o que os
+      // dois campos logo abaixo ja mostram.
+      $("tit").textContent = "VMS";
+      $("sub").textContent = "Seu servidor pessoal de c\u00e2meras";
     }
   })
   .catch(function () {

@@ -132,16 +132,9 @@ uses
   Vms.Db.Config in 'src\Db\Vms.Db.Config.pas',
   Vms.Analytics.StoreDb in 'src\Analytics\Vms.Analytics.StoreDb.pas',
   Vms.Analytics.Probe in 'src\Analytics\Vms.Analytics.Probe.pas',
-  Vms.Server.Ui.Html in 'src\Api\Vms.Server.Ui.Html.pas',
-  Vms.Server.Player.Html in 'src\Api\Vms.Server.Player.Html.pas',
-  Vms.Server.Favicon.Svg in 'src\Api\Vms.Server.Favicon.Svg.pas',
+  Vms.Analytics.Frames in 'src\Analytics\Vms.Analytics.Frames.pas',
   Vms.Server.UiFiles in 'src\Api\Vms.Server.UiFiles.pas',
-  Vms.Server.Login.Html in 'src\Api\Vms.Server.Login.Html.pas',
   Vms.Server.Auth in 'src\Api\Vms.Server.Auth.pas',
-  Vms.Server.Player.Js in 'src\Api\Vms.Server.Player.Js.pas',
-  Vms.Server.Reader.Js in 'src\Api\Vms.Server.Reader.Js.pas',
-  Vms.Server.App.Html in 'src\Api\Vms.Server.App.Html.pas',
-  Vms.Server.Events.Html in 'src\Api\Vms.Server.Events.Html.pas',
   Vms.Server.Config in 'src\App\Vms.Server.Config.pas',
   Vms.Server.Composition in 'src\App\Vms.Server.Composition.pas';
 

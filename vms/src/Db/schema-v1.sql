@@ -296,6 +296,12 @@ INSERT OR IGNORE INTO setting (key, value, updated_at_ms) VALUES
   ('analytics.stepMs',             '2000',        0),
   ('analytics.motionThreshold',    '0.006',       0),
   ('analytics.sceneChangeThreshold','0.85',       0),
+  -- O lado da grade de decisao, como fracao de 64x36. Mais grossa = cego para
+  -- movimento de pouco contraste.
+  ('analytics.gridScale',          '1',           0),
+  -- Quanto o cinza de uma celula precisa mudar (0..255); 0 = o padrao, 14.
+  -- Subir e o que faz ignorar a oscilacao de brilho do ganho automatico.
+  ('analytics.cellDelta',          '0',           0),
   ('analytics.mergeGapMs',         '8000',        0),
   -- novo: teto de duracao de um evento. Fecha e comeca outro ao passar
   -- disto. Serve a dois donos — da piso a consulta por janela e impede

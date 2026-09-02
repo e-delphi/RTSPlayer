@@ -142,12 +142,25 @@
   #acoes { flex:0 0 auto; display:flex; gap:12px; align-items:center;
            padding:0 12px 12px; background:var(--sup2); flex-wrap:wrap; }
   #msg { color:var(--sobre-sup-var); font-size:12px; }
+
+  .periodo { display:flex; align-items:center; gap:6px;
+             color:var(--sobre-sup-var); font-size:14px; }
+  .ver { display:flex; align-items:center; gap:8px; margin-top:10px;
+         color:var(--sobre-sup-var); font-size:13px; }
+  .ver input { width:auto; margin:0; }
 </style>
 
 <header>
   <h1>Movimento</h1>
   <select id="cam"></select>
-  <button class="b tonal" id="ult">&Uacute;ltimos 30 min</button>
+  <label class="periodo">&Uacute;ltimos
+    <select id="periodo">
+      <option value="3" selected>3 min</option>
+      <option value="5">5 min</option>
+      <option value="10">10 min</option>
+      <option value="30">30 min</option>
+    </select>
+  </label>
   <button class="b tonal" id="varrer">Procurar nas 6 h</button>
 </header>
 
@@ -167,6 +180,8 @@
     <option value="1">1x</option>
     <option value="2">2x</option>
     <option value="4">4x</option>
+    <option value="8" selected>8x</option>
+    <option value="16">16x</option>
   </select>
   <span id="relogio">--:--:--</span>
 </div>
@@ -192,6 +207,52 @@
       &eacute; movimento. Acima deste valor o quadro &eacute; descartado em vez de
       virar evento.</div>
 
+    <div class="linha" style="margin-top:14px">
+      <span class="rot">Grade da an&aacute;lise</span>
+      <select id="grade" style="margin-left:auto">
+        <option value="1" selected>64&times;36 (fina)</option>
+        <option value="0.5">32&times;18 &mdash; 4 c&eacute;lulas viram 1</option>
+        <option value="0.25">16&times;9 &mdash; 16 c&eacute;lulas viram 1</option>
+      </select>
+    </div>
+    <div class="dica">O detector n&atilde;o compara pixels: ele reduz cada
+      quadro a uma grade e compara o cinza m&eacute;dio de cada c&eacute;lula.
+      Grade mais grossa cega o detector para o que tem <b>pouco
+      contraste</b>: um vulto pequeno precisa levantar a m&eacute;dia de uma
+      c&eacute;lula quatro vezes maior, e se ele for discreto n&atilde;o
+      chega. Um vulto pequeno e bem claro continua passando &mdash; e chega a
+      pesar mais, porque a conta &eacute; a fra&ccedil;&atilde;o de
+      c&eacute;lulas acesas.</div>
+
+    <div class="linha" style="margin-top:14px">
+      <span class="rot">Mudan&ccedil;a de cinza por c&eacute;lula</span>
+      <span class="val" id="vdelta">&mdash;</span>
+    </div>
+    <input type="range" id="delta" min="4" max="60" step="1" value="14">
+    <label class="ver"><input type="checkbox" id="vergrade" checked>
+      Mostrar a grade sobre o v&iacute;deo</label>
+    <div class="dica">Quanto o cinza m&eacute;dio de uma c&eacute;lula precisa
+      mudar (de 0 a 255) para ela contar como mexida. <b>&Eacute; este o ajuste
+      para a oscila&ccedil;&atilde;o do infravermelho</b>: quando o ganho
+      autom&aacute;tico clareia a cena inteira, todas as c&eacute;lulas andam
+      juntas alguns n&iacute;veis &mdash; reduzir a grade n&atilde;o ajuda
+      nisso, porque a m&eacute;dia desloca junto. Subir o valor faz o detector
+      ignorar esse deslocamento; o pre&ccedil;o &eacute; n&atilde;o ver
+      movimento de pouco contraste.</div>
+
+    <div class="linha" style="margin-top:14px">
+      <span class="rot">Uma an&aacute;lise a cada</span>
+      <select id="passo" style="margin-left:auto">
+        <option value="500">0,5 s</option>
+        <option value="1000">1 s</option>
+        <option value="2000" selected>2 s</option>
+        <option value="5000">5 s</option>
+      </select>
+    </div>
+    <div class="dica">Quanto menor, mais fino o detector enxerga &mdash; e mais
+      v&iacute;deo o servidor precisa decodificar. Movimento mais curto que este
+      intervalo pode passar sem ser visto.</div>
+
     <div class="trecho">
       <label>de <input type="datetime-local" id="de" step="1"></label>
       <label>at&eacute; <input type="datetime-local" id="ate" step="1"></label>
@@ -207,10 +268,126 @@
 
 <script src="/ui/vmsreader.js"></script>
 <script src="/ui/player.js"></script>
+<script id="detector">
+// O detector de movimento, do lado da pagina.
+//
+// O MESMO de Vms.Analytics.Motion, sobre as grades que a pagina extrai dos
+// quadros que ja esta desenhando. Nao toca em nada da pagina de proposito: o
+// tools/testmotion.js avalia este bloco em node e confere numero por numero
+// contra o modelo em Python (tools/eventlib.py), que e o mesmo que confere o
+// detector em Pascal. Sem isso, os dois lados poderiam divergir em silencio --
+// e sintonizar aqui passaria a ajustar numeros que nao valem la.
+var Deteccao = (function () {
+  "use strict";
+
+  var GRADE_W = 64, GRADE_H = 36;
+  // Quanto o fundo anda na direcao do quadro atual a cada analise, em 1/256.
+  var BG_ALPHA = 26;
+
+  // Quantas celulas finas cabem numa celula da grade escolhida.
+  function agrupamento(escala) {
+    if (escala <= 0.3) return 4;
+    if (escala <= 0.6) return 2;
+    return 1;
+  }
+
+  // A grade fina reduzida ao agrupamento pedido.
+  //
+  // Como as celulas finas sao todas do mesmo tamanho, a media de k*k delas e
+  // exatamente a media de caixa que sairia de reduzir a imagem direto para a
+  // grade grossa -- conferido no tools/testmotion.js contra o modelo, que
+  // reduz direto.
+  function agrupar(cel, k, gw, gh) {
+    if (k === 1) return cel;
+    var out = new Uint8Array(gw * gh);
+    for (var gy = 0; gy < gh; gy++)
+      for (var gx = 0; gx < gw; gx++) {
+        var soma = 0;
+        for (var y = 0; y < k; y++)
+          for (var x = 0; x < k; x++)
+            soma += cel[(gy * k + y) * GRADE_W + gx * k + x];
+        out[gy * gw + gx] = soma / (k * k);
+      }
+    return out;
+  }
+
+  // Roda o detector sobre TODAS as amostras, escrevendo score/moved/scene/box
+  // em cada uma.
+  //
+  // De ponta a ponta, e nao incremental: o fundo e uma media que depende de
+  // tudo que veio antes, entao mudar um ajuste muda a historia inteira. Sao
+  // 2.304 bytes por amostra e algumas dezenas de amostras -- poucos
+  // milissegundos, e vale a simplicidade de ter um caminho so.
+  function rodar(amostras, p) {
+    var k = agrupamento(p.escala);
+    var gw = GRADE_W / k, gh = GRADE_H / k, cells = gw * gh;
+    var bg = null, ultimo = 0;
+
+    amostras.sort(function (a, b) { return a.ms - b.ms; });
+
+    for (var i = 0; i < amostras.length; i++) {
+      var a = amostras[i];
+      a.moved = false; a.scene = false; a.box = null;
+      if (!a.cel) {
+        // Veio da varredura no servidor: so ha o score, e o que da para fazer
+        // e reclassifica-lo com os limiares de agora.
+        a.scene = a.score >= p.cena;
+        a.moved = !a.scene && a.score >= p.limiar;
+        continue;
+      }
+
+      var cur = agrupar(a.cel, k, gw, gh);
+      var saltou = ultimo > 0 && Math.abs(a.ms - ultimo) > p.maxGapMs;
+      ultimo = a.ms;
+      if (!bg || saltou) {
+        bg = new Int32Array(cells);
+        for (var j = 0; j < cells; j++) bg[j] = cur[j] << 8;
+        a.score = 0;
+        a.grade = { w: gw, h: gh };
+        continue;
+      }
+
+      var movidas = 0, minX = gw, minY = gh, maxX = -1, maxY = -1;
+      a.acesas = new Uint8Array(cells);
+      for (var m = 0; m < cells; m++) {
+        if (Math.abs(cur[m] - (bg[m] >> 8)) < p.delta) continue;
+        movidas++;
+        a.acesas[m] = 1;
+        var cx = m % gw, cy = (m / gw) | 0;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+      }
+      a.score = movidas / cells;
+      a.grade = { w: gw, h: gh };
+
+      if (a.score >= p.cena) {
+        // Cena nova: o fundo antigo nao descreve mais nada.
+        a.scene = true;
+        for (var n = 0; n < cells; n++) bg[n] = cur[n] << 8;
+        continue;
+      }
+      for (var o = 0; o < cells; o++)
+        bg[o] = bg[o] + (((cur[o] << 8) - bg[o]) * BG_ALPHA >> 8);
+      if (a.score < p.limiar) continue;
+      a.moved = true;
+      a.box = { l: minX / gw, t: minY / gh,
+                r: (maxX + 1) / gw, b: (maxY + 1) / gh };
+    }
+    return amostras;
+  }
+
+  return { GRADE_W: GRADE_W, GRADE_H: GRADE_H, BG_ALPHA: BG_ALPHA,
+           agrupamento: agrupamento, agrupar: agrupar, rodar: rodar };
+})();
+</script>
+
 <script>
 "use strict";
 
 function $(id) { return document.getElementById(id); }
+var GRADE_W = Deteccao.GRADE_W, GRADE_H = Deteccao.GRADE_H;
 function pad(n) { return (n < 10 ? "0" : "") + n; }
 function hhmmss(ms) {
   var d = new Date(ms);
@@ -239,7 +416,19 @@ function api(caminho) {
 }
 
 var cam = "";
-var amostras = [];        // {ms, score, sceneChanged, box}
+// {ms, cel, score, moved, scene, box} -- `cel` e a grade fina daquele quadro,
+// e e o que permite reclassificar tudo aqui mesmo quando um ajuste muda.
+var amostras = [];
+// Colher ou nao os quadros que passam. Ligado por analisar(), desligado pela
+// varredura -- que traz amostras do servidor e nao deve misturar com as daqui.
+var coletando = false;
+var proximaMs = 0;        // proximo instante de gravacao a virar amostra
+// Teto do que fica guardado. Sao 2,3 KB por amostra; deixar tocando a tarde
+// inteira nao pode encher a memoria. Ao estourar, as mais velhas saem.
+var MAX_AMOSTRAS = 3000;
+// O fim do trecho pedido. Chegar nele PAUSA, e nada mais: nao encerra nada, nao
+// mexe na barra. Quem quiser continuar aperta Tocar, e a medicao segue.
+var alvoFim = 0;
 var janela = null;        // {t0, t1} do trecho analisado
 var FIM_GRAVADO = {};
 var tocador = null, posAtual = 0;
@@ -258,7 +447,13 @@ function msg(t, cls) {
 //
 // E ela e de SENSIBILIDADE, nao de limiar: para a direita pega mais coisa. O
 // limiar por baixo anda ao contrario, e por isso o (1000 - v).
-var LIM_MIN = 0.0002, LIM_MAX = 0.30;
+//
+// O teto e 100%, e nao 30%: com 30 a barra parava ANTES do que o selo em cima do
+// video mostrava. Um vulto passando perto da camera marca 45%, e nao havia como
+// dizer "isso ainda nao e movimento" -- a barra ja estava no fim. Contradizer o
+// numero que a propria tela exibe e pior que gastar um pedaco da faixa: em
+// escala logaritmica, ir de 30% a 100% custa 16% do curso.
+var LIM_MIN = 0.0002, LIM_MAX = 1.0;
 
 function limiarDoSlider(v) {
   var a = Math.log(LIM_MIN), b = Math.log(LIM_MAX);
@@ -271,13 +466,20 @@ function sliderDoLimiar(x) {
 }
 function limiar() { return limiarDoSlider(+$("lim").value); }
 function cenaLimiar() { return (+$("cena").value) / 100; }
+function grade() { return parseFloat($("grade").value) || 1; }
+function celDelta() { return (+$("delta").value) | 0; }
 
 // A MESMA regra do detector, em Vms.Analytics.Motion: cena nova primeiro, e o
 // que sobra e movimento se passar do limiar. Ter a regra dos dois lados e o que
 // permite a barra reclassificar sem voltar ao servidor.
+// O veredito de uma amostra. Quem decide e o recalcular(), que roda o detector
+// inteiro: a decisao depende do FUNDO, que depende de tudo que veio antes, e nao
+// so do score deste quadro. Comparar score com limiar aqui -- como era antes,
+// quando o score vinha pronto do servidor -- errava exatamente nos quadros
+// depois de uma cena nova.
 function classificar(a) {
-  if (a.score >= cenaLimiar()) return "cena";
-  return a.score >= limiar() ? "mexeu" : "parado";
+  if (a.scene) return "cena";
+  return a.moved ? "mexeu" : "parado";
 }
 
 // ------------------------------------------------------------- a camera
@@ -309,46 +511,117 @@ function carregarLimiares() {
       (j.settings || []).forEach(function (s) { mapa[s.key] = s.value; });
       var lim = parseFloat(mapa["analytics.motionThreshold"]);
       var cn = parseFloat(mapa["analytics.sceneChangeThreshold"]);
+      var esc = parseFloat(mapa["analytics.gridScale"]);
+      var dl = parseInt(mapa["analytics.cellDelta"], 10);
       if (lim > 0) $("lim").value = sliderDoLimiar(lim);
       if (cn > 0) $("cena").value = Math.round(cn * 100);
+      if (esc > 0 && esc <= 1) {
+        var sel = $("grade");
+        for (var i = 0; i < sel.options.length; i++)
+          if (Math.abs(parseFloat(sel.options[i].value) - esc) < 0.001)
+            { sel.selectedIndex = i; break; }
+      }
+      if (dl > 0) $("delta").value = dl;
     }).catch(function () { /* sem settings: ficam os padroes da pagina */ });
 }
 
 // ------------------------------------------------------------- o ensaio
 function pedir(de, ate) {
   var u = "/api/motion/probe?camera=" + encodeURIComponent(cam) +
-          "&fromMs=" + de + "&toMs=" + ate + "&stepMs=2000" +
+          "&fromMs=" + de + "&toMs=" + ate +
+          "&stepMs=" + ($("passo").value | 0) +
           "&threshold=" + limiar().toFixed(6) +
-          "&sceneThreshold=" + cenaLimiar().toFixed(3);
+          "&sceneThreshold=" + cenaLimiar().toFixed(3) +
+          "&gridScale=" + grade().toFixed(3) +
+          "&cellDelta=" + celDelta();
   return fetch(api(u)).then(function (r) { return r.json(); });
 }
 
+// Analisar e TOCAR: o detector come os quadros que o player desenha, na
+// velocidade escolhida. A 16x, tres minutos de gravacao passam em onze
+// segundos, e a curva se desenha junto -- que e a mesma coisa que se ve.
+// Analisar e TOCAR: o detector come os quadros que o player desenha, na
+// velocidade escolhida. A 16x, dez minutos de gravacao passam em quarenta
+// segundos, e a curva se desenha junto -- que e a mesma coisa que se ve.
+//
+// Nao ha "fim da analise", e isso e proposital. Antes havia, e era uma fonte de
+// bugs: um cronometro decidia que o video tinha acabado quando parava de chegar
+// quadro, encerrava a analise e encolhia a barra para o que ja tinha sido
+// medido. So que PAUSAR tambem para de mandar quadro -- entao pausar por seis
+// segundos para mexer num controle encerrava a analise, a barra encolhia, e
+// dali em diante o video tocava alem do que a barra mostrava. Sem estado de
+// "terminou" nao ha o que encerrar por engano: enquanto toca, mede.
 function analisar(de, ate) {
   cam = $("cam").value;
   if (!cam || !de || ate <= de) { msg("intervalo inv\u00e1lido", "warn"); return; }
   varrendo = false;
-  $("ir").disabled = true;
-  msg("analisando o trecho...");
-  janela = { t0: de, t1: ate };
   amostras = [];
+  alvoFim = ate;
+  janela = { t0: de, t1: ate };
   desenharCurva();
-  pedir(de, ate).then(function (j) {
-    $("ir").disabled = false;
-    if (j.error) { msg(j.error, "err"); return; }
-    amostras = j.samples || [];
-    if (!amostras.length) {
-      msg("sem grava\u00e7\u00e3o nesse trecho", "warn");
-      $("aviso").textContent = "sem grava\u00e7\u00e3o nesse trecho";
-      return;
-    }
-    msg(amostras.length + " quadros analisados");
-    atualizarResumo();
-    desenharCurva();
-    abrirVideo(de);
-  }).catch(function (e) {
-    $("ir").disabled = false;
-    msg("falhou: " + e, "err");
-  });
+  atualizarResumo();
+  msg("analisando enquanto toca...");
+  abrirVideo(de);
+}
+
+// O quadro que acabou de ser desenhado vira amostra, se ja e a hora dele.
+function talvezAmostrar(ms) {
+  if (!coletando) return;
+  if (alvoFim && ms > alvoFim && tocador && tocador.tocando) {
+    tocador.pausar();
+    $("tocar").textContent = "Tocar";
+  }
+  if (ms < proximaMs) return;
+  var cel = celulasDo($("tela2d"));
+  if (!cel) return;                 // ainda nao ha imagem
+  var passo = ($("passo").value | 0) || 2000;
+  // Max, e nao soma simples: com quadros esparsos a soma acumularia atraso e o
+  // passo iria escorregando. E a mesma regra do percurso no servidor.
+  proximaMs = Math.max(proximaMs + passo, ms + 1);
+  amostras.push({ ms: ms, cel: cel, score: 0, moved: false, scene: false,
+                  box: null });
+  if (amostras.length > MAX_AMOSTRAS)
+    amostras.splice(0, amostras.length - MAX_AMOSTRAS);
+  recalcular();
+  ajustarJanela();
+  atualizarResumo();
+  desenharCurva();
+  var e = espacamento();
+  msg(amostras.length + " quadros" +
+      (e ? "  \u00b7  um a cada " + (e / 1000).toFixed(1) + " s" : "") +
+      "  \u00b7  ajuste \u00e0 vontade: recalcula aqui mesmo");
+}
+
+// A barra mostra o que foi MEDIDO, e sempre contem onde a reproducao esta.
+//
+// Sao as duas unicas regras, e juntas eliminam os dois defeitos que a barra ja
+// teve: trecho vazio a frente (parecia que a pagina buscava dados do futuro) e
+// video correndo alem do fim da barra.
+function ajustarJanela() {
+  if (!amostras.length) return;
+  var passo = espacamento() || (($("passo").value | 0) || 2000);
+  var t0 = amostras[0].ms - passo;
+  var t1 = amostras[amostras.length - 1].ms + passo;
+  if (posAtual > 0) {
+    if (posAtual < t0) t0 = posAtual - passo;
+    if (posAtual > t1) t1 = posAtual + passo;
+  }
+  janela = { t0: t0, t1: t1 };
+}
+
+function periodoMin() { return ($("periodo").value | 0) || 3; }
+
+// Deixa o seletor mostrando esta duracao. Fora das opcoes, entra uma.
+function mostrarPeriodo(ms) {
+  var min = Math.max(1, Math.round(ms / 60000));
+  var sel = $("periodo"), i;
+  for (i = 0; i < sel.options.length; i++)
+    if ((sel.options[i].value | 0) === min) { sel.selectedIndex = i; return; }
+  var o = document.createElement("option");
+  o.value = String(min);
+  o.textContent = min + " min";
+  sel.appendChild(o);
+  sel.selectedIndex = sel.options.length - 1;
 }
 
 function ultimos(min) {
@@ -366,8 +639,13 @@ function ultimos(min) {
 // Procurar ONDE houve movimento, em pedacos de uma hora, desenhando conforme
 // chega. Sintonizar exige um trecho em que algo aconteceu, e adivinhar horario
 // nao converge.
+// A varredura continua sendo do servidor, e tem de ser: sao seis horas de
+// gravacao, e aqui so se mede o que passa na tela. Ela nao sintoniza nada --
+// serve para ACHAR o trecho em que algo aconteceu, e a sintonia acontece
+// depois, tocando aquele trecho.
 function varrer(horas) {
   if (varrendo) { varrendo = false; return; }
+  coletando = false;
   cam = $("cam").value;
   if (!cam) { msg("escolha uma c\u00e2mera", "warn"); return; }
   var ate = Date.now() - 60000;
@@ -390,6 +668,9 @@ function varrer(horas) {
     pedir(at, fimPedaco).then(function (j) {
       if (!varrendo) { terminar(); return; }
       amostras = amostras.concat(j.samples || []);
+      // Sem grade guardada, o recalcular so reclassifica pelo score -- que e
+      // tudo que a varredura tem. Sem isto nada sairia colorido na barra.
+      recalcular();
       atualizarResumo();
       desenharCurva();
       at = fimPedaco;
@@ -405,10 +686,84 @@ function varrer(horas) {
     amostras.forEach(function (a) { if (a.score > pico.score) pico = a; });
     msg("toque num pico da barra para assistir");
     // Ja abre no maior: e quase sempre o que se quer olhar primeiro.
-    abrirVideo(Math.max(janela.t0, pico.ms - 5000));
+    abrirVideo(Math.max(janela.t0, pico.ms - 5000), true);
   }
 
   proximo();
+}
+
+// ================================================================ o detector
+//
+// O MESMO detector do servidor (Vms.Analytics.Motion), reescrito aqui, sobre os
+// quadros que o player ja esta desenhando. E daqui que sai a curva.
+//
+// Antes a analise era um pedido ao servidor, e por isso mexer na grade ou no
+// delta custava um trecho inteiro decodificado de novo -- dezenas de segundos
+// para ver o efeito de arrastar um controle. O quadro ja esta na tela; o que
+// faltava era medi-lo aqui.
+//
+// O que fica guardado por amostra e a GRADE FINA (64x36 bytes de luma), e nao a
+// imagem: 2,3 KB por amostra, e com ela qualquer combinacao de grade, delta,
+// limiar e cena se recalcula em milissegundos, sem rede.
+
+
+// A reducao intermediaria. 320x180 da exatamente 5x5 pixels por celula da grade
+// fina, entao a media de caixa fecha sem sobra. O servidor usa 640x360 (10x10
+// por celula); a media da mesma regiao com mais amostras muda o valor em menos
+// de um nivel de cinza.
+var RED_W = 320, RED_H = 180;
+var reduz = null, reduzCtx = null;
+
+// A luma de cada celula da grade fina, do que estiver no canvas do video.
+// null = ainda nao ha quadro desenhado.
+function celulasDo(canvasVideo) {
+  if (!canvasVideo || !canvasVideo.width || !canvasVideo.height) return null;
+  if (!reduz) {
+    reduz = document.createElement("canvas");
+    reduz.width = RED_W; reduz.height = RED_H;
+    reduzCtx = reduz.getContext("2d", { willReadFrequently: true });
+    reduzCtx.imageSmoothingEnabled = true;
+    reduzCtx.imageSmoothingQuality = "high";
+  }
+  try { reduzCtx.drawImage(canvasVideo, 0, 0, RED_W, RED_H); }
+  catch (e) { return null; }
+  var d;
+  try { d = reduzCtx.getImageData(0, 0, RED_W, RED_H).data; }
+  catch (e) { return null; }
+
+  var cel = new Uint8Array(GRADE_W * GRADE_H);
+  var px = RED_W / GRADE_W, py = RED_H / GRADE_H;   // 5 e 5
+  for (var gy = 0; gy < GRADE_H; gy++) {
+    for (var gx = 0; gx < GRADE_W; gx++) {
+      var soma = 0;
+      for (var y = gy * py; y < (gy + 1) * py; y++) {
+        var base = (y * RED_W + gx * px) * 4;
+        for (var x = 0; x < px; x++) {
+          // A MESMA luma inteira da BT.601 do detector em Pascal: pesos
+          // 77/150/29 sobre 256. Trocar por outra formula faria o mesmo quadro
+          // dar scores diferentes dos dois lados.
+          soma += (77 * d[base] + 150 * d[base + 1] + 29 * d[base + 2]) >> 8;
+          base += 4;
+        }
+      }
+      cel[gy * GRADE_W + gx] = soma / (px * py);
+    }
+  }
+  return cel;
+}
+
+// Quantas celulas finas cabem numa celula da grade escolhida.
+function agrupamento() { return Deteccao.agrupamento(grade()); }
+
+// Roda o detector sobre TODAS as amostras com os ajustes de agora.
+function recalcular() {
+  Deteccao.rodar(amostras, {
+    escala: grade(),
+    limiar: limiar(),
+    cena: cenaLimiar(),
+    delta: celDelta(),
+    maxGapMs: (($("passo").value | 0) || 2000) * 4
+  });
 }
 
 // ------------------------------------------------------------- o video
@@ -425,16 +780,27 @@ function garantirTocador() {
       posAtual = ms;
       $("aviso").textContent = "";
       $("relogio").textContent = hhmmss(ms);
+      talvezAmostrar(ms);
+      // Mesmo sem colher -- na varredura, por exemplo -- a barra tem de conter
+      // o indicador: e ele que diz onde o video esta.
+      if (coletando) ajustarJanela();
       atualizarSelo();
       desenharCurva();
     }
   });
 }
 
-function abrirVideo(ms) {
+// `semColeta` = so assistir, sem medir. E o caso da varredura: as amostras dela
+// vieram do servidor e cobrem seis horas; misturar as daqui apagaria a curva
+// que serve justamente para escolher ONDE sintonizar.
+function abrirVideo(ms, semColeta) {
   var motivo = Player.motivoIndisponivel ? Player.motivoIndisponivel() : "";
   if (motivo) { $("aviso").textContent = motivo; return; }
   garantirTocador();
+  coletando = !semColeta;
+  // O proximo a colher e daqui: sem isto, voltar no tempo nao colheria nada ate
+  // a reproducao passar de novo pelo ponto em que estava.
+  proximaMs = ms;
   $("aviso").textContent = "abrindo...";
   tocador.abrir(cam, Math.round(ms));
   tocador.setVelocidade(+$("vel").value);
@@ -468,9 +834,9 @@ function atualizarSelo() {
   var selo = $("selo");
   if (!a) {
     selo.className = "";
-    $("veredito").textContent = "sem amostra aqui";
+    $("veredito").textContent = coletando ? "analisando..." : "sem amostra aqui";
     $("scoreAgora").textContent = "";
-    desenharCaixa(null);
+    desenharSobreposicao(null);
     return;
   }
   var q = classificar(a);
@@ -478,13 +844,21 @@ function atualizarSelo() {
   $("veredito").textContent = q === "mexeu" ? "MOVIMENTO"
                             : (q === "cena" ? "cena nova" : "parado");
   $("scoreAgora").textContent = (a.score * 100).toFixed(2) + "%";
-  desenharCaixa(q === "mexeu" ? a.box : null);
+  desenharSobreposicao(a);
 }
 
-// A caixa do que mudou, por cima do video. Vem normalizada 0..1 sobre o QUADRO,
-// entao tem de ser mapeada para onde a imagem esta desenhada dentro do canvas --
-// que com object-fit:contain nao e o canvas inteiro.
-function desenharCaixa(box) {
+// O que o detector enxerga, desenhado por cima do video.
+//
+// A grade e as celulas ACESAS, e nao so a caixa: a caixa dizia "mudou algo aqui
+// dentro" sem dizer o que, e era impossivel entender por que um ajuste mudava o
+// resultado. Vendo as celulas, a grade grossa e o delta deixam de ser numeros
+// abstratos -- da para ver a sombra acender meia tela, ou o vulto acender
+// quatro celulas.
+//
+// Tudo em coordenadas 0..1 sobre o QUADRO, mapeadas para onde a imagem esta
+// desenhada dentro do canvas: com object-fit:contain ela nao ocupa o canvas
+// inteiro.
+function desenharSobreposicao(a) {
   var c = $("caixa"), v = $("tela2d");
   var L = c.clientWidth, A = c.clientHeight;
   if (!L || !A) return;
@@ -493,14 +867,44 @@ function desenharCaixa(box) {
   var g = c.getContext("2d");
   g.setTransform(r, 0, 0, r, 0, 0);
   g.clearRect(0, 0, L, A);
-  if (!box) return;
+
   var w = v.width || L, h = v.height || A;
   var k = Math.min(L / w, A / h) || 1;
   var lw = w * k, lh = h * k, mx = (L - lw) / 2, my = (A - lh) / 2;
-  g.strokeStyle = "#7ee2a8";
-  g.lineWidth = 2;
-  g.strokeRect(mx + box.l * lw, my + box.t * lh,
-               (box.r - box.l) * lw, (box.b - box.t) * lh);
+
+  var gw = (a && a.grade) ? a.grade.w : GRADE_W / agrupamento();
+  var gh = (a && a.grade) ? a.grade.h : GRADE_H / agrupamento();
+  var cw = lw / gw, ch = lh / gh;
+
+  if ($("vergrade").checked) {
+    g.strokeStyle = "rgba(255,255,255,.10)";
+    g.lineWidth = 1;
+    g.beginPath();
+    for (var i = 1; i < gw; i++)
+      { g.moveTo(mx + i * cw, my); g.lineTo(mx + i * cw, my + lh); }
+    for (var j = 1; j < gh; j++)
+      { g.moveTo(mx, my + j * ch); g.lineTo(mx + lw, my + j * ch); }
+    g.stroke();
+  }
+
+  if (!a) return;
+  if (a.acesas && $("vergrade").checked) {
+    // Ambar quando o quadro virou cena nova, verde quando e movimento, cinza
+    // quando as celulas acenderam mas nao chegaram ao limiar.
+    g.fillStyle = a.scene ? "rgba(242,193,78,.30)"
+                : (a.moved ? "rgba(126,226,168,.30)"
+                           : "rgba(255,255,255,.14)");
+    for (var m = 0; m < a.acesas.length; m++) {
+      if (!a.acesas[m]) continue;
+      g.fillRect(mx + (m % gw) * cw, my + ((m / gw) | 0) * ch, cw, ch);
+    }
+  }
+  if (a.moved && a.box) {
+    g.strokeStyle = "#7ee2a8";
+    g.lineWidth = 2;
+    g.strokeRect(mx + a.box.l * lw, my + a.box.t * lh,
+                 (a.box.r - a.box.l) * lw, (a.box.b - a.box.t) * lh);
+  }
 }
 
 // ------------------------------------------------------------- a curva
@@ -530,6 +934,11 @@ function desenharCurva() {
   var PISO = 0.0001;
   var topo = 0.02;
   amostras.forEach(function (a) { if (a.score > topo) topo = a.score; });
+  // A linha da cena tambem tem de caber: ela e a outra fronteira que se ajusta
+  // aqui, e desenhar so uma das duas deixava a de cima invisivel justamente
+  // quando ela e que estava comendo o movimento forte. Em escala logaritmica o
+  // espaco que isso custa e pequeno.
+  if (cenaLimiar() > topo) topo = cenaLimiar();
   topo *= 1.3;
   var l0 = Math.log(PISO), l1 = Math.log(topo);
   function py(v) {
@@ -548,12 +957,17 @@ function desenharCurva() {
     g.fillRect(x - larg / 2, y, larg, y1 - y);
   });
 
-  // A fronteira que a barra de sensibilidade move.
-  var yl = py(limiar());
-  g.strokeStyle = "#8ed0f0";
+  // As duas fronteiras, cada uma na cor das barras que ela produz: azul o
+  // limiar de movimento, ambar o de cena nova. Acima da ambar o quadro e
+  // descartado; entre as duas e movimento; abaixo da azul e quadro parado.
   g.lineWidth = 1;
   g.setLineDash([4, 3]);
+  g.strokeStyle = "#8ed0f0";
+  var yl = py(limiar());
   g.beginPath(); g.moveTo(0, yl + 0.5); g.lineTo(L, yl + 0.5); g.stroke();
+  g.strokeStyle = "#f2c14e";
+  var yc = py(cenaLimiar());
+  g.beginPath(); g.moveTo(0, yc + 0.5); g.lineTo(L, yc + 0.5); g.stroke();
   g.setLineDash([]);
 
   g.fillStyle = "#c2c7c9";
@@ -607,6 +1021,7 @@ function atualizarResumo() {
 function mostrarLimiar() {
   $("vlim").textContent = (limiar() * 100).toFixed(2) + "%";
   $("vcena").textContent = (cenaLimiar() * 100).toFixed(0) + "%";
+  $("vdelta").textContent = celDelta() + " de 255";
 }
 
 // ------------------------------------------------------------- gravar
@@ -621,7 +1036,12 @@ function aplicar() {
   msg("gravando...");
   Promise.all([
     grava("analytics.motionThreshold", limiar().toFixed(6)),
-    grava("analytics.sceneChangeThreshold", cenaLimiar().toFixed(3))
+    grava("analytics.sceneChangeThreshold", cenaLimiar().toFixed(3)),
+    grava("analytics.gridScale", grade().toFixed(3)),
+    grava("analytics.cellDelta", String(celDelta())),
+    // O passo tambem e ajuste, e nao preferencia de tela: com ele diferente, o
+    // servidor veria outra coisa que nao o que foi sintonizado aqui.
+    grava("analytics.stepMs", String(($("passo").value | 0) || 2000))
   ]).then(function () {
     msg("gravado. Vale na pr\u00f3xima subida do servidor.");
   }).catch(function (e) {
@@ -632,6 +1052,7 @@ function aplicar() {
 // ------------------------------------------------------------- ligacoes
 function aoMexerNaBarra() {
   mostrarLimiar();
+  recalcular();
   atualizarResumo();
   atualizarSelo();
   desenharCurva();
@@ -651,10 +1072,22 @@ $("vel").onchange = function () {
 $("ir").onclick = function () {
   analisar(doInput($("de").value), doInput($("ate").value));
 };
-$("ult").onclick = function () { ultimos(30); };
+$("periodo").onchange = function () { ultimos(periodoMin()); };
 $("varrer").onclick = function () { varrer(6); };
 $("aplicar").onclick = aplicar;
-$("cam").onchange = function () { cam = $("cam").value; ultimos(30); };
+$("cam").onchange = function () { cam = $("cam").value; ultimos(periodoMin()); };
+// A grade e o delta mudam a CONTA, e nao so a classificacao -- mas a conta e
+// feita aqui, sobre as grades guardadas, entao os dois respondem na hora, como
+// a barra de sensibilidade. Nada volta ao servidor.
+$("grade").onchange = aoMexerNaBarra;
+$("delta").oninput = aoMexerNaBarra;
+$("vergrade").onchange = function () { desenharSobreposicao(amostraDe(posAtual)); };
+
+// O passo e a excecao: ele decide QUAIS quadros viram amostra, e os quadros de
+// um passo mais fino nunca foram olhados. So ele obriga a tocar de novo.
+$("passo").onchange = function () {
+  analisar(doInput($("de").value), doInput($("ate").value));
+};
 
 // Tocar a partir do ponto tocado na curva: e assim que se vai ver o que foi
 // aquele pico.
@@ -665,7 +1098,7 @@ $("cam").onchange = function () { cam = $("cam").value; ultimos(30); };
     var r = c.getBoundingClientRect();
     var f = (ev.clientX - r.left) / Math.max(1, r.width);
     abrirVideo(janela.t0 + (janela.t1 - janela.t0) *
-               Math.min(1, Math.max(0, f)));
+               Math.min(1, Math.max(0, f)), !coletando);
   });
 })();
 
@@ -693,9 +1126,12 @@ carregarCameras()
     if (DE_INICIAL && ATE_INICIAL > DE_INICIAL) {
       $("de").value = paraInput(DE_INICIAL);
       $("ate").value = paraInput(ATE_INICIAL);
+      // Quem abriu a tela mandou a janela; o seletor tem de dizer QUAL, senao
+      // ele fica anunciando um periodo que ninguem analisou.
+      mostrarPeriodo(ATE_INICIAL - DE_INICIAL);
       analisar(DE_INICIAL, ATE_INICIAL);
     }
-    else ultimos(30);
+    else ultimos(periodoMin());
   })
   .catch(function (e) {
     $("aviso").textContent = String(e.message || e);

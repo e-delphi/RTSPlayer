@@ -49,6 +49,32 @@ type
                   out Codec: TVideoCodec; out ActualMs: Int64): Boolean;
   end;
 
+  // Um decodificador que MANTEM estado entre quadros.
+  //
+  // O IFrameGrabber abaixo decodifica um AU isolado, e por isso so serve para
+  // keyframe: quadro P sozinho nao e nada -- ele descreve a diferenca para os
+  // anteriores, e sem eles nao ha o que reconstruir. Para olhar a gravacao num
+  // ritmo mais fino que o GOP e preciso decodificar a SEQUENCIA, e isso exige
+  // um contexto que sobreviva de uma chamada para a outra.
+  //
+  // Quem usa alimenta TODOS os AUs em ordem, e aproveita so os quadros que
+  // interessam: pular a entrega quebraria a cadeia de referencias.
+  IFrameSequence = interface
+    ['{1B9E4C07-6A55-4E31-8C2D-5F0A7B3E9D14}']
+    // Entrega o proximo AU. True = um quadro saiu e esta em Img. False sem erro
+    // e normal: o decodificador ainda esta juntando referencias.
+    function Feed(const AU: TBytes; out Img: TRgbImage): Boolean;
+  end;
+
+  // Quem sabe abrir uma dessas.
+  IFrameSequenceOpener = interface
+    ['{7D3A1F62-9C08-4B5A-A6E7-2C41D8B0F35E}']
+    // Extra sao os parameter sets do header da gravacao, para a camera que so
+    // os manda fora do stream. nil = nao da para decodificar nesta maquina.
+    function OpenSequence(Codec: TVideoCodec; const Extra: TBytes;
+                          MaxW, MaxH: Integer): IFrameSequence;
+  end;
+
   // Quem sabe transformar um quadro comprimido em pixels.
   IFrameGrabber = interface
     ['{9F2D6A44-1F0B-4D6E-B0A1-7A9C3E5D8B02}']
