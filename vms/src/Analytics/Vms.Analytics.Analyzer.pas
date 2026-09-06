@@ -94,6 +94,7 @@ type
     destructor Destroy; override;
     { IFrameAnalyzer }
     procedure Feed(Ms: Int64; const Img: TRgbImage);
+    procedure Ajustar(const Cfg: TAnalyticsConfig);
     procedure Flush;
     procedure Rewind;
     // Quantos eventos ja foram fechados. So para o log de progresso.
@@ -264,6 +265,17 @@ begin
   CloseAll(False);
   FLastObjectMs := 0;
   if FMotion <> nil then FMotion.Reset;
+end;
+
+// Os parametros novos descem para o detector. O que esta ABERTO nao se toca:
+// um evento em construcao foi aberto com o limiar de antes, e fecha-lo aqui
+// partiria ao meio um movimento que ainda esta acontecendo.
+procedure TFrameAnalyzer.Ajustar(const Cfg: TAnalyticsConfig);
+begin
+  FCfg := Cfg;
+  if FMotion <> nil then
+    FMotion.Ajustar(Cfg.MotionThreshold, Cfg.SceneChangeThreshold,
+                    Cfg.GridScale, Cfg.CellDelta);
 end;
 
 procedure TFrameAnalyzer.Feed(Ms: Int64; const Img: TRgbImage);

@@ -54,6 +54,8 @@ type
     FMaxW, FMaxH: Integer;
     FLogger: ILogger;
     FTag: string;
+    // Ja passou por aqui um AU que traz os proprios parameter sets? Ver o Feed.
+    FViuParameterSets: Boolean;
     function Converter(out Img: TRgbImage): Boolean;
   public
     constructor Create(Codec: TVideoCodec; const AExtra: TBytes;
@@ -431,9 +433,16 @@ begin
   Img := Default(TRgbImage);
   if (not Aberto) or (Length(AU) = 0) then Exit;
   try
-    // Os parameter sets vao na frente quando o AU nao os traz -- mesma regra do
-    // Decode. Em avc3/hev1 eles vem no proprio fluxo e isto nao acontece.
-    if (Length(FExtra) > 0) and (not HasParameterSets(AU, FCodec)) then
+    // Os parameter sets do header vao na frente so enquanto o fluxo nao mostrou
+    // os seus. Numa SEQUENCIA a decisao nao pode ser AU a AU como no Decode: o
+    // keyframe traz SPS/PPS e escapa da prefixacao, mas os quadros P seguintes
+    // nao trazem nada, e prefixa-los reativaria o SPS/PPS do header em cima dos
+    // bons -- ha camera cujo header anuncia Baseline/CAVLC enquanto transmite
+    // Main/CABAC com o mesmo sps_id. O resultado e um GOP inteiro decodificando
+    // errado, consertado so pelo keyframe seguinte, que o detector de movimento
+    // le como movimento. Por isso: viu parameter sets uma vez, nao prefixa mais.
+    if HasParameterSets(AU, FCodec) then FViuParameterSets := True;
+    if (Length(FExtra) > 0) and (not FViuParameterSets) then
     begin
       InLen := Length(FExtra) + Length(AU);
       SetLength(Buf, InLen + AV_INPUT_BUFFER_PADDING_SIZE);

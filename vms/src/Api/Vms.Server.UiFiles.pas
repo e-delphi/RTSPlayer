@@ -156,7 +156,7 @@ function UiArquivos: TArray<string>;
 begin
   Result := TArray<string>.Create(
     'app-ui.html', 'player-ui.html', 'events-ui.html', 'motion-ui.html',
-    'login-ui.html', 'player.js', 'vmsreader.js', 'favicon.svg');
+    'login-ui.html', 'ui.css', 'player.js', 'vmsreader.js', 'favicon.svg');
 end;
 
 function UiFaltando: string;

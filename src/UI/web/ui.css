@@ -1,0 +1,162 @@
+/* ============================================================ Material Design 3
+
+   O que TODA pagina da interface compartilha: os tokens de cor, a base do
+   documento e os poucos componentes que aparecem em mais de uma tela.
+
+   Existe porque a paleta estava copiada em tres arquivos e ja tinha divergido:
+   o mesmo #8ed0f0 se chamava --p na casca e --az no login, o mesmo #e6e6e6 era
+   --sobre-sup aqui e --txt la, e as telas de eventos e do player nem token
+   tinham -- escreviam o hex na mao. Trocar uma cor pedia cinco buscas e
+   acertava quatro.
+
+   O que NAO entra aqui: layout de tela e componente de uma pagina so. A linha
+   do tempo da sintonia, o cartao de evento, o formulario do login -- cada um
+   fica onde e usado. Isto e a base comum, e nao um deposito.
+
+   Cuidado ao acrescentar: `.pin` de proposito NAO esta aqui. A casca chama
+   assim o ponto de estado de 10px de um servidor, e a tela de eventos chama
+   assim o pontinho de 6px que diz o tipo do evento. Mesmo nome, coisas
+   diferentes; subir um dos dois quebraria o outro em silencio.
+
+   Servido em /ui/ui.css pelos DOIS servidores, da mesma pasta que o
+   vmsreader.js e o player.js.
+
+   ---------------------------------------------------------------- os tokens
+
+   Tokens, e nao cores soltas. Cada valor abaixo tem um PAPEL -- superficie,
+   contorno, primaria -- e a regra e sempre usar o papel. Foi assim que deu para
+   trocar a aparencia inteira sem procurar #2f2f2f espalhado pelos arquivos.
+
+   Escala tonal no escuro: a elevacao do M3 nao e sombra, e TOM. Um cartao
+   "acima" da superficie e um cinza mais claro, e nao um cinza igual com uma
+   sombra embaixo. Por isso a fileira sup .. sup4.
+
+   A primaria vive na familia do azul que o app sempre teve (#2d9cdb), nos tons
+   que o esquema escuro pede: clara para o traco (tom 80) e escura para o que
+   fica ATRAS dele (tom 30). Azul escuro com texto branco, que era o botao de
+   antes, e o padrao claro usado no escuro -- fica pesado e some no fundo. */
+:root {
+  color-scheme: dark;
+
+  --p:#8ed0f0;                 /* primaria */
+  --sobre-p:#00344a;           /* o que se escreve EM CIMA da primaria */
+  --p-cont:#00506b;            /* container primario */
+  --sobre-p-cont:#c2e9ff;
+  --sec-cont:#334b53;          /* container secundario: acao de apoio */
+  --sobre-sec-cont:#cfe7ef;
+
+  --sup:#121212;               /* a superficie do app */
+  --sup1:#1a1a1a;
+  --sup2:#1f1f1f;
+  --sup3:#282828;
+  --sup4:#333333;
+  --sobre-sup:#e6e6e6;
+  --sobre-sup-var:#c2c7c9;     /* texto secundario */
+  --contorno:#8b9194;
+  --contorno-var:#3f4447;      /* divisorias e bordas */
+
+  --erro:#ffb4ab;
+  --ok:#7ee2a8;
+  --alerta:#f2c14e;
+
+  /* Cantos. O M3 arredonda por tamanho de componente, e nao por gosto. */
+  --r-xs:4px; --r-s:8px; --r-m:12px; --r-l:16px; --r-xl:28px;
+
+  /* Nomes antigos, para o que ainda os cita. */
+  --bg:var(--sup); --bor:var(--contorno-var); --txt:var(--sobre-sup);
+  --dim:var(--sobre-sup-var); --az:var(--p); --sobre-az:var(--sobre-p);
+}
+
+/* ------------------------------------------------------------------- a base
+
+   So o que vale para qualquer pagina. Rolagem, direcao do flex e fundo proprio
+   ficam com cada uma: a casca esconde a rolagem, o login centraliza, o player
+   pinta o proprio preto. */
+* { -webkit-tap-highlight-color: transparent; }
+
+html, body { height:100%; }
+
+body { margin:0; background:var(--sup); color:var(--sobre-sup);
+       /* Roboto e a fonte do Material, e ela ja esta no Android. No Windows cai
+          no Segoe UI, que e a fonte do sistema de la -- pedir Roboto de fora
+          quebraria o app sem rede, que e onde ele mais roda. */
+       font:400 14px/20px Roboto, system-ui, "Segoe UI", sans-serif; }
+
+/* ------------------------------------------------------------------ botoes
+
+   Tres pesos, como o M3 pede: cheio para a acao principal da tela, tonal para
+   as de apoio, contornado para o resto. Todos em pilula e com 40px de altura,
+   que e a medida do Material. */
+button.b, select.b {
+  background:none; color:var(--p); border:1px solid var(--contorno-var);
+  border-radius:20px; padding:9px 16px; min-height:40px; box-sizing:border-box;
+  font:500 14px/20px Roboto, system-ui, sans-serif; cursor:pointer;
+  white-space:nowrap; position:relative; overflow:hidden; }
+/* O toque no Material nao muda a cor do componente: poe um veu da cor do
+   CONTEUDO por cima dele, com opacidade fixa. Uma regra so serve a todos, e
+   cada um continua com a cor de fundo que tem. */
+button.b::after, select.b::after {
+  content:""; position:absolute; inset:0; background:currentColor; opacity:0;
+  pointer-events:none; transition:opacity .1s linear; }
+button.b:hover::after, select.b:hover::after { opacity:.08; }
+button.b:active::after, select.b:active::after { opacity:.12; }
+/* .on = a acao principal. Fundo claro e texto escuro: e assim que o botao cheio
+   se comporta num tema escuro. */
+button.b.on { background:var(--p); border-color:transparent;
+              color:var(--sobre-p); }
+button.b.tonal { background:var(--sec-cont); border-color:transparent;
+                 color:var(--sobre-sec-cont); }
+button.b.risco { color:var(--erro); }
+button.b[disabled] { opacity:.38; cursor:default; }
+
+/* O seletor nativo nao acompanha a altura nem a cor dos botoes ao lado -- vinha
+   mais baixo e com a seta do sistema. Sem a aparencia nativa ele vira mais um
+   botao da fileira, com a seta desenhada aqui. */
+select.b {
+  appearance:none; -webkit-appearance:none; padding-right:32px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 19px) 55%, calc(100% - 14px) 55%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat; }
+select.b:focus { outline:none; border-color:var(--p); }
+select.b option { background:var(--sup3); color:var(--sobre-sup); }
+
+/* ------------------------------------------------------------ botao de icone
+
+   40px de alvo, 24px de desenho, veu redondo. */
+.icone { position:relative; overflow:hidden;
+         flex:0 0 auto; width:40px; height:40px; padding:8px;
+         box-sizing:border-box; border:0; border-radius:50%;
+         background:none; color:var(--sobre-sup); cursor:pointer;
+         display:inline-flex; align-items:center; justify-content:center; }
+.icone svg { width:24px; height:24px; display:block; }
+.icone[disabled] { opacity:.38; cursor:default; }
+.icone::after { content:""; position:absolute; inset:0; border-radius:50%;
+                background:currentColor; opacity:0; pointer-events:none;
+                transition:opacity .1s linear; }
+.icone:hover::after { opacity:.08; }
+.icone:active::after { opacity:.12; }
+
+/* Icone de tracado, que e o estilo corrente do Material. A regra e uma so para
+   todos: fill e stroke sao herdados, entao vale tambem dentro do <use> --
+   seletor de fora nao alcanca o conteudo clonado, mas heranca alcanca. */
+svg.ico { width:24px; height:24px; display:block; flex:0 0 auto;
+          fill:none; stroke:currentColor; stroke-width:1.8;
+          stroke-linecap:round; stroke-linejoin:round; }
+
+/* A onda. E o gesto que faz uma interface parecer Material antes mesmo de se ler
+   qualquer coisa nela: o toque tem origem, e ela se ve. */
+.onda { position:absolute; border-radius:50%; background:currentColor;
+        opacity:.20; transform:scale(0); pointer-events:none;
+        animation:ondear .45s ease-out forwards; }
+@keyframes ondear { to { transform:scale(1); opacity:0; } }
+
+/* ------------------------------------------------------------------- estado
+
+   Texto de recado. As tres telas que dizem "deu certo" ou "deu errado" diziam
+   com vermelhos diferentes; aqui e o token. */
+.err  { color:var(--erro); }
+.ok   { color:var(--ok); }
+.warn { color:var(--alerta); }

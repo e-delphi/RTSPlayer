@@ -69,6 +69,13 @@ type
     FClock: IClock;
     FLogger: ILogger;
     FCfg: TAnalyticsConfig;
+    // Configuracao nova esperando a vez. Nao se troca a FCfg de fora: ela e
+    // lida no meio do laco desta thread, e um registro nao se copia de forma
+    // atomica -- a analise leria metade de uma e metade da outra. Quem chega de
+    // fora deixa aqui; a troca acontece no comeco da rodada, nesta thread.
+    FCfgLock: TCriticalSection;
+    FCfgNova: TAnalyticsConfig;
+    FTemCfgNova: Boolean;
     FStop: TEvent;
     FAtMs: Int64;          // proximo instante a pedir
     FLastFrameMs: Int64;   // instante do ultimo quadro que de fato foi analisado
@@ -84,6 +91,8 @@ type
     function StepPercurso(out Avancou: Boolean): Boolean;
     procedure SaveProgress;
     procedure Log(const Msg: string);
+    // Aplica a configuracao que estiver esperando. So esta thread chama.
+    procedure TrocarCfgSePreciso;
   protected
     procedure Execute; override;
   public
@@ -94,6 +103,10 @@ type
                        const AProgress: IAnalysisProgress; ACache: TVmsIndexCache;
                        const ACfg: TAnalyticsConfig; const AClock: IClock;
                        const ALogger: ILogger; AStop: TEvent);
+    destructor Destroy; override;
+    // Vale na proxima rodada do laco, e nao daqui a uma subida do servidor.
+    // Pode ser chamado de qualquer thread.
+    procedure Ajustar(const ACfg: TAnalyticsConfig);
   end;
 
 implementation
@@ -149,6 +162,7 @@ begin
   FClock := AClock;
   FLogger := ALogger;
   FStop := AStop;
+  FCfgLock := TCriticalSection.Create;
   FreeOnTerminate := False;
   inherited Create(False);
 end;
@@ -171,6 +185,45 @@ begin
   for I := 0 to High(Files) do
     if (Files[I].StartMs > 0) and ((Result = 0) or (Files[I].StartMs < Result)) then
       Result := Files[I].StartMs;
+end;
+
+destructor TAnalyticsWorker.Destroy;
+begin
+  FCfgLock.Free;
+  inherited;
+end;
+
+procedure TAnalyticsWorker.Ajustar(const ACfg: TAnalyticsConfig);
+begin
+  FCfgLock.Enter;
+  try
+    FCfgNova := ACfg;
+    FTemCfgNova := True;
+  finally
+    FCfgLock.Leave;
+  end;
+end;
+
+procedure TAnalyticsWorker.TrocarCfgSePreciso;
+var
+  Nova: TAnalyticsConfig;
+begin
+  FCfgLock.Enter;
+  try
+    if not FTemCfgNova then Exit;
+    Nova := FCfgNova;
+    FTemCfgNova := False;
+  finally
+    FCfgLock.Leave;
+  end;
+
+  // O Enabled NAO se troca aqui: ligar ou desligar a analise cria ou destroi
+  // threads, e isso e montagem, nao ajuste. O resto vale na hora.
+  Nova.Enabled := FCfg.Enabled;
+  FCfg := Nova;
+  if FAnalyzer <> nil then
+    FAnalyzer.Ajustar(FCfg);
+  Log('parametros novos em uso: ' + FCfg.Describe);
 end;
 
 function TAnalyticsWorker.StartPoint: Int64;
@@ -346,6 +399,10 @@ begin
 
     while (not Terminated) and (FStop.WaitFor(0) <> wrSignaled) do
     begin
+      // No comeco da rodada, e nao no meio dela: trocar limiar entre dois
+      // quadros do MESMO trecho daria um resultado que nao corresponde a
+      // nenhuma configuracao inteira.
+      TrocarCfgSePreciso;
       Alvo := TargetMs;
       NoLote := 0;
 

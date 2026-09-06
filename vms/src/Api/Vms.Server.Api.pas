@@ -10,7 +10,7 @@
 //   GET /api/segments?camera=X&day=Y      as faixas contínuas daquele dia
 //   GET /api/media?camera=X&fromMs=…      a mídia: header .vms + N blocos
 //   GET /api/media?camera=X&cursor=…      a continuação, sem busca
-//   GET /api/live?camera=X&cursor=…       o ao vivo: a cauda do que se grava
+//   GET /api/live?camera=X&cursor=…       o ao vivo, direto do anel
 //   GET /api/recordings?camera=X&...      a lista crua, arquivo por arquivo
 //   GET /api/index?file=…                 o índice de blocos, cru
 //                                         (as duas últimas são diagnóstico)
@@ -35,6 +35,7 @@
 // proprio computador entra -- e so para definir uma.
 //   GET /ui/app                           a casca do app (cameras/dias/play)
 //   GET /ui/player                        o player de gravacao em HTML
+//   GET /ui/ui.css                        a folha comum a todas as paginas
 //   GET /ui/vmsreader.js /ui/player.js    o que a pagina do player carrega
 //
 // Regra de ouro destas rotas: **o cliente não sabe que existem arquivos**. Ele
@@ -64,6 +65,7 @@ uses
   VMS.Domain.Types,
   VMS.Domain.Logging,
   VMS.Rec.Format,
+  VMS.Rec.Writer,
   Vms.Server.LiveHub,
   Vms.Server.IndexCache,
   Vms.Thumb.Intf,
@@ -83,6 +85,17 @@ const
   // segundo de atraso em relação ao que a câmera está vendo; o bastante para a
   // tela não abrir vazia esperando o próximo bloco fechar.
   LIVE_PREROLL_MS = 4000;
+  // Quanto o pedido do ao vivo espera por sample novo antes de responder "nada
+  // ainda". Segurar a resposta é o que troca uma pergunta a cada meio segundo
+  // por uma entrega no instante em que o quadro chega da câmera. Curto o
+  // bastante para não prender uma thread do servidor por muito tempo.
+  LIVE_ESPERA_MS = 1500;
+  // Teto de samples por resposta. Só pega quando o cliente volta depois de uma
+  // pausa longa; no ritmo normal vêm um ou dois.
+  LIVE_MAX_SAMPLES = 600;
+  // A marca que separa o cursor do anel do cursor de arquivo. O cliente devolve
+  // o que recebeu sem olhar, e as duas rotas compartilham o mesmo cabeçalho.
+  LIVE_CURSOR_TAG = 'L';
   // De quanto em quanto auth.* e relido do banco.
   AUTH_RELEITURA_MS = 5000;
   API_DEFAULT_MAX_BLOCKS = 32;
@@ -158,6 +171,10 @@ type
     FDb: IDbQueue;
     // O ensaio do detector de movimento. Nil = a rota responde 503.
     FProbe: IMotionProbe;
+    // Chamado depois de gravar um parametro de analise. Quem liga isto e o
+    // .dpr, que e onde a API e a analise se encontram -- a API sozinha nao
+    // conhece os workers, e nem deve.
+    FOnAnalyticsMudou: TProc;
     FLogger: ILogger;
     function KnownCamera(const Name: string; out Canonical: string): Boolean;
     function IsLive(const Camera: string): Boolean;
@@ -194,6 +211,8 @@ type
     function HandleUiArquivo(const NomeArquivo,
                              TipoConteudo: string): TApiResponse;
     function HandleJs(const NomeArquivo: string): TApiResponse;
+    function HandleCss(const NomeArquivo: string): TApiResponse;
+    function HandleLive(const Query: string): TApiResponse;
   public
     // O cache e a fonte de miniaturas vêm de fora, e o roteador não é dono de
     // nenhum dos dois: quem os cria é a composição, que é o único lugar que
@@ -211,6 +230,9 @@ type
                     const Body: TBytes = nil): TApiResponse; overload;
     function Handle(const Req: TApiRequest): TApiResponse; overload;
     class function IsApiPath(const Uri: string): Boolean; static;
+    // Ligado pelo .dpr: e la que a API e a analise se encontram.
+    property OnAnalyticsMudou: TProc read FOnAnalyticsMudou
+                                     write FOnAnalyticsMudou;
     property Cache: TVmsIndexCache read FCache;
     property Config: TApiConfig read FConfig;
   end;
@@ -504,7 +526,12 @@ begin
   // Curta de propósito: cada item aqui é uma porta a menos. A tela de entrada,
   // as rotas que a fazem funcionar e o ícone -- que o navegador pede sozinho,
   // antes de qualquer login, e cujo 401 sujaria o console.
+  //
+  // A folha comum entra pelo mesmo motivo do ícone: a tela de entrada a carrega
+  // ANTES de haver sessão, e um 401 aqui a deixaria sem estilo nenhum. Não
+  // revela nada -- são cores e medidas, os mesmos bytes para todo mundo.
   Result := SameText(Path, UI_PREFIX + 'login') or
+            SameText(Path, UI_PREFIX + 'ui.css') or
             SameText(Path, API_PREFIX + 'auth/status') or
             SameText(Path, API_PREFIX + 'auth/login') or
             SameText(Path, '/favicon.svg') or
@@ -657,6 +684,12 @@ begin
       Exit(HandleAppUi);
     if SameText(Path, UI_PREFIX + 'player') then
       Exit(HandlePlayerUi);
+    // A folha comum a TODAS as páginas: a paleta, a base do documento e os
+    // poucos componentes que aparecem em mais de uma tela. Solta pelo mesmo
+    // motivo dos scripts -- a cor passa a existir num lugar só, e o navegador
+    // guarda uma cópia que serve a todas.
+    if SameText(Path, UI_PREFIX + 'ui.css') then
+      Exit(HandleCss('ui.css'));
     // Os dois scripts que a página do player carrega. Servidos soltos, e não
     // embutidos nela, porque também servirão às próximas páginas -- e assim o
     // navegador os guarda em cache uma vez só.
@@ -695,11 +728,10 @@ begin
       Result := HandleSegments(Query)
     else if SameText(Path, API_PREFIX + 'media') then
       Result := HandleMedia(Query, False)
-    // Ao vivo é a mesma mídia, seguida pela cauda: o servidor grava sem parar,
-    // e "agora" é o fim do arquivo aberto. Rota separada só para o cliente não
-    // precisar saber onde é o fim — ele manda cursor vazio e recebe o resto.
+    // Ao vivo sai do anel em memória enquanto a câmera publica, e da cauda do
+    // arquivo quando ela não está publicando. Ver HandleLive.
     else if SameText(Path, API_PREFIX + 'live') then
-      Result := HandleMedia(Query, True)
+      Result := HandleLive(Query)
     else if SameText(Path, API_PREFIX + 'recordings') then
       Result := HandleRecordings(Query)
     else if SameText(Path, API_PREFIX + 'index') then
@@ -1138,6 +1170,11 @@ begin
                             'application/javascript; charset=utf-8');
 end;
 
+function TApiRouter.HandleCss(const NomeArquivo: string): TApiResponse;
+begin
+  Result := HandleUiArquivo(NomeArquivo, 'text/css; charset=utf-8');
+end;
+
 // A faixa de eventos que o app mostra embaixo do vídeo.
 //
 // Servida pelo servidor, e não carregada de dentro do app, por um motivo
@@ -1201,7 +1238,7 @@ var
   I, Gravadas: Integer;
   Agora: Int64;
   Recusadas: TJSONArray;
-  Existe: Boolean;
+  Existe, MexeuNaAnalise: Boolean;
 begin
   if (FDb = nil) or (not FDb.IsOpen) then
     Exit(TApiResponse.Error(503, 'banco indisponivel'));
@@ -1221,6 +1258,7 @@ begin
   Root := TJSONObject.Create;
   Recusadas := TJSONArray.Create;
   Gravadas := 0;
+  MexeuNaAnalise := False;
   Agora := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Now), True) * 1000;
   try
     try
@@ -1250,6 +1288,8 @@ begin
         FDb.Exec('UPDATE setting SET value = ?, updated_at_ms = ? WHERE key = ?',
           [Par.JsonValue.Value, Agora, Par.JsonString.Value]);
         Inc(Gravadas);
+        if Par.JsonString.Value.StartsWith('analytics.', True) then
+          MexeuNaAnalise := True;
       end;
     except
       on E: Exception do
@@ -1265,9 +1305,24 @@ begin
 
   Root.AddPair('saved', TJSONNumber.Create(Gravadas));
   Root.AddPair('unknown', Recusadas);
-  // A análise lê a configuração na subida: dizer isso evita o usuário achar
-  // que mexeu no limiar e nada mudou.
-  Root.AddPair('note', 'vale na proxima subida do servidor');
+
+  // Parametro de analise vale AGORA. Sintonizar e uma conversa -- mexe, olha,
+  // mexe de novo --, e se cada tentativa custasse reiniciar o servidor ninguem
+  // sintonizaria nada. As threads da analise recebem a configuracao nova e a
+  // aplicam no comeco da proxima rodada.
+  if (Gravadas > 0) and MexeuNaAnalise and Assigned(FOnAnalyticsMudou) then
+  begin
+    try
+      FOnAnalyticsMudou();
+      Root.AddPair('note', 'ja esta valendo');
+    except
+      on E: Exception do
+        Root.AddPair('note', 'gravado, mas nao consegui aplicar agora (' +
+                             E.Message + '); vale na proxima subida');
+    end;
+  end
+  else
+    Root.AddPair('note', 'gravado');
   Result := TApiResponse.FromJson(Root);
 end;
 
@@ -1296,6 +1351,12 @@ var
   FromMs, ToMs, StepMs: Int64;
   Limiar, Cena, Grade: Double;
   Delta: Integer;
+  GradeMs: Int64;
+  GradeCel: TArray<Byte>;
+  GradeW, GradeH: Integer;
+  GradeCapturadaEmMs: Int64;
+  Cels: TJSONArray;
+  ObjGrade: TJSONObject;
   Amostras: TMotionSamples;
   Root, Item, Caixa: TJSONObject;
   Arr: TJSONArray;
@@ -1328,6 +1389,14 @@ begin
   if (Delta < 0) or (Delta > 255) then Delta := 0;
 
   Comeco := Now;
+  // Diagnostico: guarda a grade crua do quadro mais proximo deste instante.
+  //
+  // Serve para comparar, celula a celula, o que o servidor mede com o que outro
+  // lado mede sobre o MESMO video. Sem isso, uma divergencia entre os dois so
+  // se discute pelos scores, que sao o resultado da conta e nao a entrada dela.
+  GradeMs := QueryInt(Query, 'gradeMs', 0);
+  FProbe.GuardarGradeEm(GradeMs);
+
   Amostras := FProbe.Run(Camera, FromMs, ToMs, StepMs, Limiar, Cena, Grade,
                          Delta, Integer(QueryInt(Query, 'max', 0)));
 
@@ -1341,6 +1410,22 @@ begin
   Root.AddPair('sceneThreshold', TJSONNumber.Create(Cena));
   Root.AddPair('gridScale', TJSONNumber.Create(Grade));
   Root.AddPair('cellDelta', TJSONNumber.Create(Delta));
+
+  // A grade pedida, se houve. `cells` vem na ordem da esquerda para a direita,
+  // de cima para baixo -- o mesmo laco do detector.
+  if (GradeMs > 0) and FProbe.GradeGuardada(GradeCel, GradeW, GradeH,
+                                            GradeCapturadaEmMs) then
+  begin
+    ObjGrade := TJSONObject.Create;
+    ObjGrade.AddPair('ms', TJSONNumber.Create(GradeCapturadaEmMs));
+    ObjGrade.AddPair('w', TJSONNumber.Create(GradeW));
+    ObjGrade.AddPair('h', TJSONNumber.Create(GradeH));
+    Cels := TJSONArray.Create;
+    for I := 0 to High(GradeCel) do
+      Cels.Add(GradeCel[I]);
+    ObjGrade.AddPair('cells', Cels);
+    Root.AddPair('grid', ObjGrade);
+  end;
   Root.AddPair('count', TJSONNumber.Create(Length(Amostras)));
   // Por que o percurso terminou. A pagina so mostra isto quando o trecho
   // analisado saiu menor que o pedido -- e ai e a diferenca entre "a gravacao
@@ -1399,6 +1484,160 @@ begin
     // Miniatura de minuto passado não muda nunca mais: deixa o cliente e
     // qualquer proxy no caminho guardarem à vontade.
     'Cache-Control: max-age=86400');
+end;
+
+// O ao vivo pelo anel de memória, sem passar pelo disco.
+//
+// Por que existe: /api/live era HandleMedia(Query, True), a mesma leitura da
+// gravação seguindo a cauda do arquivo aberto. Só que o arquivo só cresce
+// quando um bloco FECHA -- block.maxDurationMs, 2 s -- e a isso somava-se o
+// recuo de LIVE_PREROLL_MS na abertura, que fica para sempre porque o player
+// ancora o relógio no primeiro quadro exibido. O anel do Vms.Server.LiveHub já
+// recebia o sample no mesmo instante que o gravador, mas só a saída RTSP o
+// consumia; aqui ele passa a servir também quem assiste pelo HTTP.
+//
+// O formato do fio não muda: a resposta continua sendo .vms (cabeçalho mais um
+// bloco) com X-Vms-Cursor, e o player não sabe de onde os bytes vieram. O que
+// muda é a idade deles.
+//
+// Sem câmera publicando, cai no caminho de arquivo -- que é o que atende câmera
+// que não conectou nesta execução, e é o mesmo plano B que o hub já previa.
+//
+// Sobre o ritmo dos pedidos: cada resposta leva o que houver desde o cursor, e o
+// pedido fica segurado até aparecer alguma coisa. Em rede rápida isso dá um
+// pedido por quadro; em rede lenta o tempo de ida e volta acumula samples e a
+// resposta vem maior. O custo se regula sozinho, e por isso NÃO há janela fixa
+// de espera juntando quadros antes de responder: qualquer valor ali atrasaria a
+// rede boa para poupar a ruim. O preço é uma thread do Indy segurada por até
+// LIVE_ESPERA_MS por espectador parado -- a mesma que ele ocuparia reconectando.
+function TApiRouter.HandleLive(const Query: string): TApiResponse;
+var
+  Camera, CursorTexto: string;
+  Stream: TLiveStream;
+  Cursor: TLiveCursor;
+  Res: TLiveFetch;
+  Itens: TArray<TLiveSampleRec>;
+  Header: TVmsHeader;
+  Bloco: TVmsBlock;
+  Cabecalho, Corpo: TBytes;
+  Flags: TSampleFlags;
+  I, N, Off, Total: Integer;
+  Descontinuo: Boolean;
+  Partes: TArray<string>;
+
+  function CursorSai: string;
+  begin
+    Result := LIVE_CURSOR_TAG + IntToStr(Cursor.NextSeq) + '-' +
+              IntToStr(Cursor.Epoch) + '-' + IntToStr(Ord(Cursor.WaitKeyframe));
+  end;
+
+  function NadaNovo: TApiResponse;
+  begin
+    Result := Default(TApiResponse);
+    Result.Status := 204;
+    Result.ContentType := 'application/x-vms';
+    Result.Body := nil;
+    Result.Extra := TArray<string>.Create(
+      'X-Vms-Cursor: ' + CursorSai,
+      'X-Vms-Growing: 1');
+  end;
+
+begin
+  Result := Default(TApiResponse);
+  if not KnownCamera(QueryValue(Query, 'camera'), Camera) then
+    Exit(TApiResponse.Error(404, 'camera desconhecida'));
+
+  Stream := nil;
+  if FHub <> nil then Stream := FHub.Find(Camera);
+  // Nada publicando agora: o histórico responde por isto, exatamente como antes.
+  if (Stream = nil) or (not Stream.IsPublishing) then
+    Exit(HandleMedia(Query, True));
+
+  CursorTexto := Trim(QueryValue(Query, 'cursor'));
+  Descontinuo := False;
+  Cursor := Default(TLiveCursor);
+  // Cursor de arquivo chegando aqui é cliente que estava no plano B e a câmera
+  // voltou. Assinar de novo é o certo: ao vivo quer o agora, e não emendar o
+  // passado -- a marca de descontinuidade avisa o player para reancorar.
+  if StartsText(LIVE_CURSOR_TAG, CursorTexto) then
+  begin
+    Partes := SplitString(Copy(CursorTexto, 2, MaxInt), '-');
+    if Length(Partes) = 3 then
+    begin
+      Cursor.NextSeq := StrToInt64Def(Partes[0], 0);
+      Cursor.Epoch := StrToIntDef(Partes[1], 0);
+      Cursor.WaitKeyframe := Partes[2] <> '0';
+      Cursor.Valid := True;
+    end;
+  end;
+  if not Cursor.Valid then
+  begin
+    Descontinuo := True;
+    // Publicando, mas ainda sem vídeo anunciado nesta execução: não é erro e
+    // não é fim, e o cliente pergunta de novo.
+    if not Stream.Subscribe(Cursor) then Exit(NadaNovo);
+  end;
+
+  Res := Stream.Fetch(Cursor, LIVE_ESPERA_MS, Itens);
+  if Res in [lfResync, lfFormatChanged] then Descontinuo := True;
+
+  N := Length(Itens);
+  if N > LIVE_MAX_SAMPLES then N := LIVE_MAX_SAMPLES;
+  if (Res = lfNone) or (N = 0) then Exit(NadaNovo);
+
+  if not Stream.TryGetHeader(Header) then Exit(NadaNovo);
+
+  // Um bloco só, com o que veio. As âncoras saem do primeiro sample de cada
+  // trilha: é delas que o leitor data o resto, pelo PTS.
+  Bloco := Default(TVmsBlock);
+  Total := 0;
+  for I := 0 to N - 1 do Inc(Total, Length(Itens[I].Data));
+  SetLength(Bloco.Payload, Total);
+  SetLength(Bloco.Samples, N);
+  Off := 0;
+  for I := 0 to N - 1 do
+  begin
+    if Length(Itens[I].Data) > 0 then
+      Move(Itens[I].Data[0], Bloco.Payload[Off], Length(Itens[I].Data));
+    // Do anel só volta o bit de keyframe; começo e fim de quadro não são
+    // guardados lá. É o bit que o leitor e o percurso usam, e o único que
+    // mudaria alguma coisa deste lado.
+    Flags := [];
+    if Itens[I].Keyframe then Include(Flags, sfKeyframe);
+    Bloco.Samples[I].TrackId := Itens[I].TrackId;
+    Bloco.Samples[I].FlagsByte := FlagsToByte(Flags);
+    Bloco.Samples[I].Pts := Itens[I].Pts;
+    Bloco.Samples[I].PayloadOffset := Cardinal(Off);
+    Bloco.Samples[I].PayloadSize := Cardinal(Length(Itens[I].Data));
+    Inc(Off, Length(Itens[I].Data));
+    if (Itens[I].TrackId = 0) and (Bloco.VideoAnchorMs = 0) then
+      Bloco.VideoAnchorMs := Stream.ParedeDe(Itens[I].WallMs);
+    if (Itens[I].TrackId = 1) and (Bloco.AudioAnchorMs = 0) then
+      Bloco.AudioAnchorMs := Stream.ParedeDe(Itens[I].WallMs);
+  end;
+  Bloco.BlockSeq := Cardinal(Cursor.NextSeq - N);
+  Bloco.StartUnixMs := Bloco.VideoAnchorMs;
+  if Bloco.StartUnixMs = 0 then Bloco.StartUnixMs := Bloco.AudioAnchorMs;
+
+  Cabecalho := BuildHeaderBytes(Header);
+  Corpo := BuildBlockBytes(Bloco);
+  SetLength(Result.Body, Length(Cabecalho) + Length(Corpo));
+  Move(Cabecalho[0], Result.Body[0], Length(Cabecalho));
+  Move(Corpo[0], Result.Body[Length(Cabecalho)], Length(Corpo));
+
+  Result.Status := 200;
+  Result.ContentType := 'application/x-vms';
+  Result.Extra := TArray<string>.Create(
+    'X-Vms-Cursor: ' + CursorSai,
+    'X-Vms-Block-Count: 1',
+    Format('X-Vms-Start-Ms: %d', [Bloco.StartUnixMs]),
+    Format('X-Vms-End-Ms: %d', [Bloco.StartUnixMs]),
+    'X-Vms-Next-Ms: -1',
+    'X-Vms-Gap-Ms: 0',
+    Format('X-Vms-Discontinuity: %d', [Ord(Descontinuo)]),
+    Format('X-Vms-Keyframe: %d', [Ord(Itens[0].Keyframe)]),
+    'X-Vms-Growing: 1',
+    'X-Vms-Thinned: 0');
 end;
 
 function TApiRouter.HandleCameras: TApiResponse;

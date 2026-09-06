@@ -964,6 +964,267 @@ def teste_ancora_do_gravador(_pasta):
     check('sem sobrepor nada na volta', not d3['sobrepostos'])
 
 
+def teste_parameter_sets_da_sequencia(_pasta):
+    """Numa sequencia, o extradata do header so vale ate o fluxo mostrar o seu.
+
+    A camera ayla grava um header cujo SPS diz Baseline/CAVLC, enquanto o fluxo
+    e Main/CABAC -- com o mesmo sps_id. O AU de keyframe traz SPS/PPS proprios e
+    escapava da prefixacao; os quadros P seguintes nao trazem nada, levavam o
+    SPS/PPS velho colado na frente, e reativavam o errado por cima do bom. O
+    FFmpeg entao le o cabecalho de fatia torto ("deblocking_filter_idc out of
+    range"), esconde o erro com concealment, e o GOP inteiro decodifica sujo ate
+    o keyframe seguinte -- que o detector de movimento le como movimento.
+
+    Medido nas DLLs do proprio servidor, num GOP real de 40 AUs: pela regra
+    velha sairam 22 quadros, 164 celulas da grade fora do lugar; pela nova
+    sairam os 40, nenhuma celula fora.
+    """
+    print('parameter sets ao longo de uma sequencia')
+
+    def tem_ps(au):
+        """Porte do HasParameterSets: SPS(7) ou PPS(8) em Annex-B."""
+        i = 0
+        while i + 4 < len(au):
+            if au[i] == 0 and au[i + 1] == 0:
+                if au[i + 2] == 1:
+                    t = i + 3
+                elif au[i + 2] == 0 and au[i + 3] == 1:
+                    t = i + 4
+                else:
+                    i += 1
+                    continue
+                if t >= len(au):
+                    return False
+                if au[t] & 31 in (7, 8):
+                    return True
+                i = t
+            else:
+                i += 1
+        return False
+
+    def por_au(aus):
+        """A regra antiga: decide AU a AU."""
+        return [not tem_ps(a) for a in aus]
+
+    def por_sequencia(aus):
+        """A regra nova: viu parameter sets uma vez, nao prefixa mais."""
+        saida, viu = [], False
+        for a in aus:
+            if tem_ps(a):
+                viu = True
+            saida.append(not viu)
+        return saida
+
+    def nal(tipo, tam=40):
+        return bytes([0, 0, 0, 1, tipo]) + bytes(tam)
+
+    idr = nal(7, 20) + nal(8, 4) + nal(5, 400)   # SPS + PPS + fatia IDR
+    p = nal(1, 200)                              # so a fatia
+    gop = [idr] + [p] * 9 + [idr] + [p] * 9
+
+    velha, nova = por_au(gop), por_sequencia(gop)
+    check('o keyframe nunca recebe o extradata do header',
+          not velha[0] and not nova[0])
+    check('pela regra antiga, todo quadro P recebia o extradata velho',
+          sum(1 for i, x in enumerate(velha) if x) == 18,
+          '%d de %d AUs prefixados' % (sum(velha), len(gop)))
+    check('pela regra da sequencia, nenhum AU recebe depois do keyframe',
+          not any(nova), '%d AUs prefixados' % sum(nova))
+
+    # O extradata do header continua fazendo falta quando o fluxo nao traz nada:
+    # camera que so manda fatias, ou percurso que comeca fora de um keyframe.
+    sem_ps = [p] * 5
+    check('fluxo sem parameter sets nenhum ainda recebe o do header',
+          all(por_sequencia(sem_ps)), 'prefixados: %s' % por_sequencia(sem_ps))
+
+    # E quando os parameter sets aparecem no meio, a prefixacao para dali.
+    tarde = [p, p, idr, p, p]
+    r = por_sequencia(tarde)
+    check('parameter sets no meio param a prefixacao dali em diante',
+          r == [True, True, False, False, False], 'prefixados: %s' % r)
+
+
+def teste_entrada_no_keyframe(_pasta):
+    """Um percurso novo nao entrega quadro antes do primeiro keyframe.
+
+    O bloco de entrada e escolhido por HasKeyframe, que diz que ele CONTEM um
+    keyframe -- nao que comece com um: o TBlockBuilder fecha bloco por tempo e
+    tamanho. Alimentar o decodificador a partir do primeiro sample do bloco
+    entrega, quase sempre, um quadro P sem referencia; o FFmpeg inventa a
+    referencia que falta e devolve um quadro CINZA CHAPADO.
+
+    Medido no servidor: a grade desse primeiro quadro ia de 121 a 132, num
+    instante cuja faixa real e 58..254. Ele virava a referencia do detector, e
+    os ~4 s seguintes de cena parada pontuavam ~30% de movimento, decaindo junto
+    com a media movel do fundo (0.296, 0.275, 0.245, 0.203, 0.165, ...). Como o
+    worker refaz o percurso a cada 30 s (PERCURSO_MS), a linha do tempo ganhava
+    um evento falso a cada 30 s, sempre na mesma fase -- foi assim que o padrao
+    apareceu: 27 eventos em :31.71 e 11 em :01.71.
+    """
+    print('entrada do percurso pelo keyframe')
+
+    K, P_ = 1, 0     # 1 = sample com sfKeyframe
+
+    def bloco(flags):
+        return [{'chave': bool(f), 'i': i} for i, f in enumerate(flags)]
+
+    def contem_chave(b):
+        """O criterio do indice: HasKeyframe/SamplesHaveKeyframe."""
+        return any(x['chave'] for x in b)
+
+    def alimentados(b, esperar_chave):
+        """Os samples que chegam ao decodificador, na ordem."""
+        saida, esperando = [], esperar_chave
+        for x in b:
+            if esperando:
+                if not x['chave']:
+                    continue
+                esperando = False
+            saida.append(x['i'])
+        return saida
+
+    # O caso real: o bloco traz um keyframe, mas no meio.
+    b = bloco([P_, P_, K, P_, P_, P_])
+    check('o bloco serve de entrada porque CONTEM keyframe', contem_chave(b))
+    check('mas ele nao comeca por um', not b[0]['chave'])
+
+    velha = alimentados(b, False)
+    nova = alimentados(b, True)
+    check('pela regra antiga, dois quadros P entravam antes do keyframe',
+          velha[:2] == [0, 1], 'entraram: %s' % velha[:3])
+    check('pela regra nova, o keyframe e o primeiro a entrar',
+          nova[0] == 2, 'entraram: %s' % nova[:3])
+    check('e dali em diante nada mais e pulado',
+          nova == [2, 3, 4, 5], 'entraram: %s' % nova)
+
+    # Bloco que ja comeca no keyframe: a regra nova nao pode custar nada.
+    b2 = bloco([K, P_, P_])
+    check('bloco que comeca no keyframe passa inteiro pelas duas regras',
+          alimentados(b2, True) == alimentados(b2, False) == [0, 1, 2])
+
+    # Um keyframe adiante desliga a espera de uma vez so, e nao a cada bloco.
+    b3 = bloco([P_, K, P_]) + bloco([P_, P_])
+    seguidos, esperando = [], True
+    for x in b3:
+        if esperando:
+            if not x['chave']:
+                continue
+            esperando = False
+        seguidos.append(x['i'])
+    check('depois do primeiro keyframe, os blocos seguintes entram inteiros',
+          len(seguidos) == 4, 'entraram %d samples' % len(seguidos))
+
+
+def teste_bloco_do_anel_ao_vivo(_pasta):
+    """O bloco que o /api/live monta do anel data igual ao que o gravador grava.
+
+    O ao vivo passou a sair do anel em memoria (Vms.Server.LiveHub) em vez da
+    cauda do arquivo, porque o arquivo so cresce quando um bloco FECHA -- 2 s de
+    block.maxDurationMs -- e a isso se somava o recuo de abertura, que fica para
+    sempre porque o player ancora o relogio no primeiro quadro exibido.
+
+    A parte arriscada da troca e a DATA. Por dentro o anel carimba por relogio
+    monotonico; o .vms carrega hora de parede, e o leitor a reconstroi com
+    `wall = ancora + (pts - primeiro pts) * 1000 / timescale`, uma ancora por
+    trilha. Errar isso nao quebra a imagem -- ela aparece com a hora errada, o
+    que e pior, porque a regua deixa de fechar com o video e ninguem desconfia
+    do relogio.
+    """
+    print('bloco do anel do ao vivo')
+    TS = 90000                      # a base de PTS do video, como no hub
+
+    def montar(itens, agora_parede, agora_mono):
+        """O que o HandleLive faz: um bloco, uma ancora por trilha.
+
+        itens: lista de (track, pts, keyframe, mono_ms).
+        """
+        parede = lambda mono: agora_parede - (agora_mono - mono)
+        amostras, va, aa = [], 0, 0
+        for track, pts, chave, mono in itens:
+            amostras.append((track, 1 if chave else 0, pts,
+                             bytes([track]) * 16))
+            if track == 0 and not va:
+                va = parede(mono)
+            if track == 1 and not aa:
+                aa = parede(mono)
+        inicio = va or aa
+        return (genvms.build_header(inicio)
+                + genvms.build_block(1, inicio, amostras, anchors=(va, aa)))
+
+    # Uma rajada como a que sai do anel: video a 10 fps e audio junto.
+    AGORA, MONO = 1788400000000, 5000000
+    itens = []
+    for i in range(10):
+        itens.append((0, i * (TS // 10), i == 0, MONO - 900 + i * 100))
+        itens.append((1, i * 800, False, MONO - 900 + i * 100))
+
+    dados = montar(itens, AGORA, MONO)
+    cab = vmslib.read_header(dados)
+    blocos = list(vmslib.iter_blocks(dados, cab))
+    check('o bloco montado do anel e legivel', len(blocos) == 1,
+          '%d blocos' % len(blocos))
+    b = blocos[0]
+    check('e o crc fecha', b.crc_ok)
+    check('as duas ancoras entraram', b.video_anchor_ms > 0 and b.audio_anchor_ms > 0,
+          'video=%s audio=%s' % (b.video_anchor_ms, b.audio_anchor_ms))
+
+    # A regra do leitor, aplicada aqui: cada trilha data pela ancora DELA.
+    def datar(bloco, track, timescale):
+        prim = None
+        fora = []
+        for sm in bloco.samples:
+            if sm.track_id != track:
+                continue
+            if prim is None:
+                prim = sm.pts
+            anc = bloco.video_anchor_ms if track == 0 else bloco.audio_anchor_ms
+            fora.append(anc + (sm.pts - prim) * 1000 // timescale)
+        return fora
+
+    esperado_v = [AGORA - 900 + i * 100 for i in range(10)]
+    check('o video sai com a hora de parede de quando chegou',
+          datar(b, 0, TS) == esperado_v,
+          'primeiro=%d esperado=%d' % (datar(b, 0, TS)[0], esperado_v[0]))
+    check('o primeiro quadro e o keyframe', (b.samples[0].flags & 1) == 1)
+    check('e a hora do primeiro e a ancora',
+          datar(b, 0, TS)[0] == b.video_anchor_ms)
+
+    # Audio numa base de PTS propria: e por isso que ha duas ancoras.
+    esperado_a = [AGORA - 900 + i * 100 for i in range(10)]
+    check('o audio data pela ancora dele, e nao pela do video',
+          datar(b, 1, 8000) == esperado_a,
+          'primeiro=%d esperado=%d' % (datar(b, 1, 8000)[0], esperado_a[0]))
+
+    # Rajada so de video: sem trilha de audio, a ancora dela fica em zero e o
+    # bloco continua valido -- e o caso da camera sem som.
+    so_video = [(0, i * (TS // 10), i == 0, MONO + i * 100) for i in range(4)]
+    d2 = montar(so_video, AGORA, MONO)
+    b2 = list(vmslib.iter_blocks(d2, vmslib.read_header(d2)))[0]
+    check('rajada sem audio ainda monta bloco valido', b2.crc_ok)
+    check('e sem ancora de audio', b2.audio_anchor_ms == 0,
+          'audio=%s' % b2.audio_anchor_ms)
+
+    # O cursor do anel tem de ser distinguivel do cursor de arquivo, senao um
+    # cliente voltando do plano B seria lido como se estivesse no anel.
+    def cursor_do_anel(seq, epoca, espera_chave):
+        return 'L%d-%d-%d' % (seq, epoca, 1 if espera_chave else 0)
+
+    def le_cursor(texto):
+        if not texto.startswith('L'):
+            return None
+        p = texto[1:].split('-')
+        if len(p) != 3:
+            return None
+        return int(p[0]), int(p[1]), p[2] != '0'
+
+    check('cursor do anel volta igual ao que saiu',
+          le_cursor(cursor_do_anel(4321, 2, True)) == (4321, 2, True))
+    check('cursor de arquivo nao passa por cursor de anel',
+          le_cursor('1788400000000-17-2-frente_2026-09-03_18-29-39.vms') is None)
+    check('cursor vazio nao passa', le_cursor('') is None)
+    check('o zero que o cliente manda ao abrir nao passa', le_cursor('0') is None)
+
+
 def main():
     pasta = tempfile.mkdtemp(prefix='vms_selftest_')
     try:
@@ -983,6 +1244,9 @@ def main():
         teste_eventos_consulta(pasta)
         teste_movimento(pasta)
         teste_grade_e_delta(pasta)
+        teste_parameter_sets_da_sequencia(pasta)
+        teste_entrada_no_keyframe(pasta)
+        teste_bloco_do_anel_ao_vivo(pasta)
         teste_agregacao_eventos(pasta)
     finally:
         shutil.rmtree(pasta, ignore_errors=True)

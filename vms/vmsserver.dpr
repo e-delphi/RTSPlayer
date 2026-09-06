@@ -332,6 +332,30 @@ begin
       Api := TApiRouter.Create(ApiCfg, CameraNames, Cache, Hub, Thumbs,
                                Analytics.Events, Db,
                                BuildMotionProbe(Cache, Logger), Logger);
+      // A sintonia grava no banco e vale NA HORA: a rota avisa aqui, este
+      // trecho rele a configuracao e as threads da analise a adotam na proxima
+      // rodada. Sem isto, cada tentativa de ajustar um limiar custava reiniciar
+      // o servidor -- e ninguem sintoniza nada assim.
+      //
+      // A releitura e do BANCO, e nao do corpo do pedido: assim o que passa a
+      // valer e exatamente o que ficou gravado, com os mesmos limites e
+      // padroes que valeriam numa subida.
+      Api.OnAnalyticsMudou :=
+        procedure
+        var
+          Recarga: TDbConfig;
+          Nova: TAnalyticsConfig;
+        begin
+          Recarga := TDbConfig.Create(Db, Boot);
+          try
+            Recarga.Load;
+            Nova := Recarga.Analytics;
+          finally
+            Recarga.Free;
+          end;
+          Analytics.Ajustar(Nova);
+          Logger.Info('main', 'analise reconfigurada: ' + Nova.Describe);
+        end;
       // Nao e o mesmo aviso da API: aquele fala de baixar gravacao, este fala
       // de SQL livre. Quem alcanca esta porta le camera_endpoint.password, que
       // guarda as senhas das cameras em texto, e pode apagar qualquer tabela.

@@ -6,6 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
 <title>VMS</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/ui/ui.css">
 <!--
   A casca do app em HTML: cameras, dias e reproducao numa pagina so.
 
@@ -29,64 +30,11 @@
   marcacao, e por escape unicode nas strings de JavaScript.
 -->
 <style>
-  /* ===================================================== Material Design 3
+  /* A paleta e a base vem do /ui/ui.css; aqui fica so o que e da casca. */
 
-     Tokens, e nao cores soltas. Cada valor abaixo tem um PAPEL -- superficie,
-     contorno, primaria -- e a regra e sempre usar o papel. Foi assim que deu
-     para trocar a aparencia inteira sem procurar #2f2f2f espalhado pelo arquivo.
-
-     Escala tonal no escuro: a elevacao do M3 nao e sombra, e TOM. Um cartao
-     "acima" da superficie e um cinza mais claro, e nao um cinza igual com uma
-     sombra embaixo. Por isso a fileira surface-c-low .. surface-c-highest.
-
-     A primaria vive na familia do azul que o app sempre teve (#2d9cdb), nos
-     tons que o esquema escuro pede: clara para o traco (tom 80) e escura para o
-     que fica ATRAS dele (tom 30). Azul escuro com texto branco, que era o botao
-     de antes, e o padrao claro usado no escuro -- fica pesado e some no fundo.
-  */
-  :root {
-    color-scheme: dark;
-
-    --p:#8ed0f0;                 /* primaria */
-    --sobre-p:#00344a;           /* o que se escreve EM CIMA da primaria */
-    --p-cont:#00506b;            /* container primario */
-    --sobre-p-cont:#c2e9ff;
-    --sec-cont:#334b53;          /* container secundario: acao de apoio */
-    --sobre-sec-cont:#cfe7ef;
-
-    --sup:#121212;               /* a superficie do app */
-    --sup1:#1a1a1a;
-    --sup2:#1f1f1f;
-    --sup3:#282828;
-    --sup4:#333333;
-    --sobre-sup:#e6e6e6;
-    --sobre-sup-var:#c2c7c9;     /* texto secundario */
-    --contorno:#8b9194;
-    --contorno-var:#3f4447;      /* divisorias e bordas */
-
-    --erro:#ffb4ab;
-    --ok:#7ee2a8;
-    --alerta:#f2c14e;
-
-    /* Cantos. O M3 arredonda por tamanho de componente, e nao por gosto. */
-    --r-xs:4px; --r-s:8px; --r-m:12px; --r-l:16px; --r-xl:28px;
-
-    /* Nomes antigos, para o que ainda os cita. */
-    --bg:var(--sup); --bor:var(--contorno-var); --txt:var(--sobre-sup);
-    --dim:var(--sobre-sup-var); --az:var(--p);
-  }
-
-  html, body { height:100%; }
-  body { margin:0; background:var(--sup); color:var(--sobre-sup);
-         overflow:hidden;
-         /* Roboto e a fonte do Material, e ela ja esta no Android. No Windows
-            cai no Segoe UI, que e a fonte do sistema de la -- pedir Roboto de
-            fora quebraria o app sem rede, que e onde ele mais roda. */
-         font:400 14px/20px Roboto, system-ui, "Segoe UI", sans-serif;
-         -webkit-tap-highlight-color: transparent;
-         /* manipulation tira o duplo-toque-para-zoom e o atraso de 300ms que
-            vem junto com ele */
-         touch-action: manipulation; }
+  /* A casca nao rola: quem rola sao as telas, por dentro. E manipulation
+     tira o duplo-toque-para-zoom e o atraso de 300ms que vem junto com ele. */
+  body { overflow:hidden; touch-action: manipulation; }
 
   /* height/top, e nao so o inset:0: quando o teclado virtual esta aberto a
      area util e menor que a tela, e quem sabe disso e o visualViewport (ver o
@@ -96,18 +44,6 @@
           height:var(--alturaUtil, 100%);
           display:none; flex-direction:column; }
   .tela.on { display:flex; }
-
-  /* ------------------------------------------------- camada de estado
-
-     O toque no Material nao muda a cor do componente: poe um veu da cor do
-     CONTEUDO por cima dele, com opacidade fixa. Uma regra so serve para cartao,
-     botao e item de menu, e cada um continua com a cor de fundo que tem. */
-  /* A onda. E o gesto que faz uma interface parecer Material antes mesmo de se
-     ler qualquer coisa nela: o toque tem origem, e ela se ve. */
-  .onda { position:absolute; border-radius:50%; background:currentColor;
-          opacity:.20; transform:scale(0); pointer-events:none;
-          animation:ondear .45s ease-out forwards; }
-  @keyframes ondear { to { transform:scale(1); opacity:0; } }
 
   /* ------------------------------------------------------ barra de topo */
   header { flex:0 0 auto; display:flex; align-items:center; gap:4px;
@@ -121,25 +57,6 @@
   .rot { color:var(--sobre-sup-var);
          font:500 12px/16px Roboto, system-ui, sans-serif; margin-left:auto; }
 
-  /* Botao de icone: 40px de alvo, 24px de desenho, veu redondo. */
-  .icone { flex:0 0 auto; width:40px; height:40px; padding:8px;
-           box-sizing:border-box; border:0; border-radius:50%;
-           background:none; color:var(--sobre-sup); cursor:pointer;
-           display:inline-flex; align-items:center; justify-content:center; }
-  /* Icone de tracado, que e o estilo corrente do Material. A regra e uma so
-     para todos: fill e stroke sao herdados, entao vale tambem dentro do <use>
-     -- seletor de fora nao alcanca o conteudo clonado, mas heranca alcanca. */
-  svg.ico { width:24px; height:24px; display:block; flex:0 0 auto;
-            fill:none; stroke:currentColor; stroke-width:1.8;
-            stroke-linecap:round; stroke-linejoin:round; }
-  .icone svg { width:24px; height:24px; display:block; }
-  .icone[disabled] { opacity:.38; cursor:default; }
-  .icone::after { content:""; position:absolute; inset:0; border-radius:50%;
-                  background:currentColor; opacity:0; pointer-events:none;
-                  transition:opacity .1s linear; }
-  .icone { position:relative; overflow:hidden; }
-  .icone:hover::after { opacity:.08; }
-  .icone:active::after { opacity:.12; }
   /* Sem botao de voltar, o titulo comeca na margem do Material. */
   header h1:first-child { margin-left:12px; }
 
@@ -202,43 +119,6 @@
          overflow:hidden; }
   .cob i { display:block; height:100%; background:var(--p); }
 
-  /* ------------------------------------------------------------- botoes
-
-     Tres pesos, como o M3 pede: cheio para a acao principal da tela, tonal
-     para as de apoio, contornado para o resto. Todos em pilula e com 40px de
-     altura, que e a medida do Material. */
-  button.b, select.b {
-    background:none; color:var(--p); border:1px solid var(--contorno-var);
-    border-radius:20px; padding:9px 16px; min-height:40px; box-sizing:border-box;
-    font:500 14px/20px Roboto, system-ui, sans-serif; cursor:pointer;
-    position:relative; overflow:hidden; }
-  button.b:hover::after, select.b:hover::after { opacity:.08; }
-  button.b::after, select.b::after {
-    content:""; position:absolute; inset:0; background:currentColor; opacity:0;
-    pointer-events:none; transition:opacity .1s linear; }
-  button.b:active::after, select.b:active::after { opacity:.12; }
-  /* .on = a acao principal. Fundo claro e texto escuro: e assim que o botao
-     cheio se comporta num tema escuro. */
-  button.b.on { background:var(--p); border-color:transparent;
-                color:var(--sobre-p); }
-  button.b.tonal { background:var(--sec-cont); border-color:transparent;
-                   color:var(--sobre-sec-cont); }
-  button.b.risco { color:var(--erro); }
-  button.b[disabled] { opacity:.38; cursor:default; }
-  /* O seletor nativo nao acompanha a altura nem a cor dos botoes ao lado --
-     vinha mais baixo e com a seta do sistema. Sem a aparencia nativa ele vira
-     mais um botao da fileira, com a seta desenhada aqui. */
-  select.b {
-    appearance:none; -webkit-appearance:none; padding-right:32px;
-    background-image:
-      linear-gradient(45deg, transparent 50%, currentColor 50%),
-      linear-gradient(135deg, currentColor 50%, transparent 50%);
-    background-position: calc(100% - 19px) 55%, calc(100% - 14px) 55%;
-    background-size: 5px 5px, 5px 5px;
-    background-repeat: no-repeat; }
-  select.b:focus { outline:none; border-color:var(--p); }
-  select.b option { background:var(--sup3); color:var(--sobre-sup); }
-
   /* Botao flutuante: a acao de CRIAR da tela, sempre no mesmo canto. */
   .fab { position:absolute; right:16px; bottom:16px; z-index:5;
          display:inline-flex; align-items:center; gap:8px; height:56px;
@@ -288,6 +168,14 @@
      canvas, que e elemento substituido como img. */
   #tela2d { width:100%; height:100%; object-fit:contain; display:block;
             transform-origin: 0 0; }
+  /* A previa: a miniatura do instante que se esta escolhendo, por cima do
+     video. Cobre o palco inteiro com fundo proprio, senao o quadro velho
+     apareceria nas faixas pretas quando as proporcoes nao coincidissem.
+     pointer-events:none para nao roubar o toque que esconde as barras. */
+  #previa { position:absolute; inset:0; width:100%; height:100%;
+            object-fit:contain; background:#000; display:none;
+            pointer-events:none; }
+  #previa.on { display:block; }
   #aviso { position:absolute; color:var(--sobre-sup-var); font-size:13px;
            padding:10px 16px; text-align:center; background:rgba(0,0,0,.55);
            border-radius:var(--r-l); max-width:80%; }
@@ -653,6 +541,7 @@
   </header>
   <div id="palco">
     <canvas id="tela2d"></canvas>
+    <img id="previa" alt="">
     <div id="aviso"></div>
   </div>
   <div id="rodape">
@@ -749,6 +638,9 @@ function mostrar(qual) {
     tocavaAoSair = tocador.tocando;
     tocador.pausar();
     pararDeOcultar();
+    // Sair com previa no ar a deixaria por cima do quadro na volta, esperando
+    // um onPosicao que so vem quando a reproducao andar.
+    esconderPrevia();
     return;
   }
   if (tocavaAoSair) {
@@ -1174,6 +1066,9 @@ function aoVivo(camera) {
   $("h-play").textContent = camera + "  (ao vivo)";
   $("aviso").textContent = "conectando...";
   $("linha").style.display = "none";
+  // Ao vivo nao tem regua nem instante escolhido: se sobrou previa de uma
+  // gravacao anterior, ela sai agora.
+  esconderPrevia();
   mostrar("t-play");
   garantirTocador();
   tocador.abrirAoVivo(camera);
@@ -1208,6 +1103,10 @@ function garantirTocador() {
       posAtual = ms;
       $("hora").textContent = hhmmss(ms);
       $("aviso").textContent = "";
+      // Chegou quadro: a previa cumpriu o papel dela e sai. Este e o unico
+      // lugar que a tira depois de um salto, e de proposito -- e o instante em
+      // que ha o que mostrar no lugar dela.
+      esconderPrevia();
       if (dia) { seguirNaRegua(); desenharRegua(); }
     }
   });
@@ -1249,8 +1148,11 @@ function abrirPlayer(camera, d, msInicial) {
 
   // No instante pedido, quando houve um; senao no fim do dia gravado, que e
   // onde quase sempre se quer olhar.
-  tocador.abrir(camera, msInicial ||
-                (Math.min(d.endMs, Date.now()) - 30000));
+  var alvo = msInicial || (Math.min(d.endMs, Date.now()) - 30000);
+  // Abrir um dia e um salto como qualquer outro: a previa cobre a espera pelo
+  // fragmento e pela decodificacao, e sai no primeiro quadro.
+  mostrarPrevia(alvo);
+  tocador.abrir(camera, alvo);
   $("tocar").textContent = "Pausar";
   pararDeOcultar();
 }
@@ -1400,6 +1302,49 @@ function seguirNaRegua() {
   limitarVista();
 }
 
+// ------------------------------------------------------------- a previa
+//
+// A miniatura do instante que se esta escolhendo, por cima do video.
+//
+// Serve a dois momentos. Com o dedo na regua, ela mostra o que ha NAQUELE
+// horario -- e o que transforma procurar um trecho em escolher um trecho, em
+// vez de saltar e ver no que deu. E depois do salto ela FICA, ate o primeiro
+// quadro decodificado aparecer: abrir um trecho pede fragmento, keyframe e
+// decodificacao, e sem ela o palco ficava preto ou congelado na cena anterior,
+// que e pior -- parece que o salto nao foi obedecido.
+//
+// O servidor guarda UMA miniatura por minuto (ver Vms.Thumb.Cache), entao pedir
+// alinhado ao minuto e o mais fino que existe, e repetir o mesmo minuto nao
+// custa rede: a resposta vem com Cache-Control de um dia.
+var MINUTO_MS = 60000;
+var previaMin = -1;
+
+function mostrarPrevia(ms) {
+  if (!comServidor() || !camAtual || !(ms > 0)) return;
+  // Preso ao dia: arrastar contra a borda da regua leva o dedo para antes do
+  // comeco ou depois do fim, e ali nao ha miniatura -- pedir daria 404 e a
+  // previa piscaria fora justamente enquanto o dedo ainda esta na tela.
+  if (dia) ms = Math.min(Math.max(ms, dia.startMs), dia.endMs);
+  var min = Math.floor(ms / MINUTO_MS) * MINUTO_MS;
+  var img = $("previa");
+  if (min !== previaMin) {
+    previaMin = min;
+    img.src = api("/api/thumb?camera=" + encodeURIComponent(camAtual) +
+                  "&ms=" + min);
+  }
+  img.classList.add("on");
+}
+
+function esconderPrevia() {
+  if (previaMin < 0) return;
+  previaMin = -1;
+  $("previa").classList.remove("on");
+}
+
+// Minuto sem imagem responde 404, e uma imagem quebrada seria pior do que o
+// video velho: some, e o palco volta a ser o que era.
+$("previa").addEventListener("error", esconderPrevia);
+
 // ---------------------------------------------------- gestos sobre a regua
 
 (function () {
@@ -1423,7 +1368,20 @@ function seguirNaRegua() {
     desenharRegua();
   });
 
-  var toques = {}, pinca = 0, arrastando = false, x0 = 0, t0Ini = 0, andou = 0;
+  // Onde na tela cai um instante -- o inverso do msNoX. Serve para saber se o
+  // dedo pegou o indicador.
+  function xDe(ms) {
+    var r = reg.getBoundingClientRect();
+    return r.left + r.width * (ms - vista.t0) / Math.max(1, vista.t1 - vista.t0);
+  }
+
+  // Quanto perto do indicador o dedo precisa cair para arrastar ELE em vez de
+  // deslocar a janela. Generoso de proposito: o traco tem 2px e nenhum dedo
+  // acerta 2px.
+  var PEGA_PX = 16;
+
+  var toques = {}, pinca = 0, arrastando = false, puxando = false,
+      x0 = 0, t0Ini = 0, andou = 0;
 
   reg.addEventListener("pointerdown", function (ev) {
     if (!dia || !vista) return;
@@ -1431,11 +1389,19 @@ function seguirNaRegua() {
     reg.setPointerCapture(ev.pointerId);
     var n = Object.keys(toques);
     if (n.length === 1) {
-      arrastando = true; andou = 0;
+      andou = 0;
       x0 = ev.clientX; t0Ini = vista.t0;
+      // Em cima do indicador, o gesto e arrastar ELE. Em qualquer outro ponto e
+      // deslocar a janela, que e como sempre foi -- a regua tem zoom e precisa
+      // continuar navegavel.
+      puxando = posAtual > 0 && Math.abs(ev.clientX - xDe(posAtual)) <= PEGA_PX;
+      arrastando = !puxando;
+      mostrarPrevia(msNoX(ev.clientX));
     }
     else if (n.length === 2) {
       arrastando = false;
+      puxando = false;
+      esconderPrevia();
       pinca = Math.abs(toques[n[0]] - toques[n[1]]);
     }
   });
@@ -1453,6 +1419,16 @@ function seguirNaRegua() {
       }
       return;
     }
+    // Arrastando o indicador: ele segue o dedo e a previa vai junto. Nada e
+    // decodificado aqui -- so quando soltar.
+    if (puxando) {
+      andou = Math.max(andou, Math.abs(ev.clientX - x0));
+      seguindo = false;
+      posAtual = Math.round(msNoX(ev.clientX));
+      mostrarPrevia(posAtual);
+      desenharRegua();
+      return;
+    }
     if (!arrastando) return;
     var dx = ev.clientX - x0;
     andou = Math.max(andou, Math.abs(dx));
@@ -1462,19 +1438,38 @@ function seguirNaRegua() {
     vista.t1 = vista.t0 + span;
     limitarVista();
     desenharRegua();
+    // A janela andou debaixo do dedo, entao o instante sob ele mudou.
+    mostrarPrevia(msNoX(ev.clientX));
   });
+
+  // Salta e deixa a previa no ar. Quem a tira e o onPosicao, no primeiro quadro
+  // desenhado -- ate la o palco mostra o instante escolhido em vez de preto ou
+  // da cena anterior.
+  function irComPrevia(ms) {
+    if (!tocador) { esconderPrevia(); return; }
+    mostrarPrevia(ms);
+    tocador.irPara(Math.round(ms));
+    $("tocar").textContent = "Pausar";
+  }
 
   function soltar(ev) {
     if (!(ev.pointerId in toques)) return;
     var eraUnico = Object.keys(toques).length === 1;
     delete toques[ev.pointerId];
     pinca = 0;
-    if (!arrastando || !eraUnico) { arrastando = false; return; }
+    if (puxando && eraUnico) {
+      puxando = false;
+      irComPrevia(msNoX(ev.clientX));
+      return;
+    }
+    puxando = false;
+    // Deslocamento da janela, ou gesto de dois dedos: nada foi escolhido, entao
+    // a previa sai e o video segue de onde estava.
+    if (!arrastando || !eraUnico) { arrastando = false; esconderPrevia(); return; }
     arrastando = false;
     // Arrastou: era deslocamento, e nao um toque para posicionar.
-    if (andou > 4 || !tocador) return;
-    tocador.irPara(Math.round(msNoX(ev.clientX)));
-    $("tocar").textContent = "Pausar";
+    if (andou > 4) { esconderPrevia(); return; }
+    irComPrevia(msNoX(ev.clientX));
   }
   reg.addEventListener("pointerup", soltar);
   reg.addEventListener("pointercancel", soltar);
@@ -2118,10 +2113,19 @@ function abrirSintonia() {
   if (servAtual)
     u += (u.indexOf("?") >= 0 ? "&" : "?") +
          "server=" + encodeURIComponent(servAtual);
-  // So agora, e nao na carga da casca: o iframe carrega a pagina inteira, e
-  // fazer isso na abertura do app custaria memoria por nada.
-  if ($("quadro-mov").getAttribute("src") !== u)
-    $("quadro-mov").setAttribute("src", u);
+  // SEMPRE recarrega, mesmo com a mesma URL.
+  //
+  // O iframe guarda a pagina viva quando se sai da tela. Voltando a ela, o que
+  // aparecia era o estado deixado para tras -- inclusive a cortina de
+  // "baixando..." de uma abertura anterior, o que parecia a tela comecar a
+  // baixar sozinha. Recarregar tambem devolve a memoria do trecho anterior, que
+  // ali sao dezenas de MB de video.
+  //
+  // O about:blank no meio e o que garante documento novo: reatribuir a MESMA
+  // src nem sempre recarrega.
+  var quadro = $("quadro-mov");
+  quadro.setAttribute("src", "about:blank");
+  setTimeout(function () { quadro.setAttribute("src", u); }, 0);
   mostrar("t-mov");
 }
 
@@ -2262,8 +2266,11 @@ $("v-mov").onclick = function () { mostrar("t-cams"); };
 // alguns segundos, ninguem esta olhando para elas. Somem sozinhas, e um toque
 // no video traz de volta.
 //
-// So no AO VIVO. Na gravacao a regua e os controles sao o que se usa o tempo
-// todo -- esconde-los ali seria atrapalhar, nao ajudar.
+// Na GRAVACAO o toque esconde igual, mas o relogio nao corre: ali a regua e os
+// controles sao o que se usa o tempo todo, e faze-los fugir sozinhos no meio de
+// quem esta procurando um trecho seria atrapalhar. Entao quem quer ver so a
+// imagem pede, com um toque, e quem esta trabalhando na regua nao e
+// interrompido. Um segundo toque traz tudo de volta.
 
 var ESPERA_OCULTAR_MS = 4000;
 var relogioOcultar = null;
@@ -2278,7 +2285,9 @@ function mostrarBarras(sim) {
 function adiarOcultar() {
   if (relogioOcultar) { clearTimeout(relogioOcultar); relogioOcultar = null; }
   mostrarBarras(true);
-  if (dia) return;                 // gravacao: ficam
+  // Gravacao: as barras ficam ate alguem pedir que sumam, com um toque no
+  // video. Ver o cabecalho desta secao.
+  if (dia) return;
   relogioOcultar = setTimeout(function () {
     relogioOcultar = null;
     // So esconde se ainda estivermos no ao vivo desta tela: em quatro segundos
@@ -2309,9 +2318,9 @@ function pararDeOcultar() {
     if (ativos === 0) varios = false;
     if (!limpo) return;
     if ($("t-play").classList.contains("imerso")) { adiarOcultar(); return; }
-    // Segundo toque esconde na hora -- e a contagem em curso perde a razao de
-    // existir, senao ela dispararia depois para esconder o que ja esta oculto.
-    if (dia) return;
+    // Barras a vista: o toque esconde na hora, ao vivo ou na gravacao. E a
+    // contagem em curso perde a razao de existir, senao ela dispararia depois
+    // para esconder o que ja esta oculto.
     if (relogioOcultar) { clearTimeout(relogioOcultar); relogioOcultar = null; }
     mostrarBarras(false);
   }

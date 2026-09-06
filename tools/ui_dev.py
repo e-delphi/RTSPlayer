@@ -46,6 +46,7 @@ PADROES = [
     re.compile(r"UiTexto\('([^']+)'"),
     re.compile(r"ServirPagina\(AResponseInfo, '([^']+)'"),
     re.compile(r"ServirJs\(AResponseInfo, '([^']+)'"),
+    re.compile(r"ServirCss\(AResponseInfo, '([^']+)'"),
 ]
 
 

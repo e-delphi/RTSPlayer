@@ -70,6 +70,16 @@ type
 
 implementation
 
+const
+  // Teto de samples mandados ao decodificador sem nenhum quadro sair.
+  //
+  // E o cinto de seguranca contra laco que nao termina. Um passeio pede 30 s de
+  // gravacao; se milhares de samples entrarem sem um quadro sair, algo esta
+  // girando em falso -- e girar em falso aqui custa 100% de processador com a
+  // analise parada e calada, que foi o que aconteceu por tres dias. Melhor
+  // terminar o passeio dizendo o motivo.
+  MAX_SEM_SAIDA = 10000;
+
 type
   TVmsFrameWalk = class(TInterfacedObject, IFrameWalk)
   strict private
@@ -84,13 +94,23 @@ type
     FSeq: IFrameSequence;
     FArquivo: string;          // o que esta aberto
     FMotivo: string;           // por que o passeio terminou
+    // Samples mandados ao decodificador desde o ultimo quadro entregue.
+    //
+    // E o cinto de seguranca contra laco que nao termina. Um passeio pede 30 s
+    // de gravacao; se milhares de samples entrarem sem nenhum quadro sair, algo
+    // esta girando em falso -- e girar em falso aqui custa 100% de CPU e uma
+    // analise parada, calada, por dias. Melhor terminar dizendo o motivo.
+    FSemSaida: Integer;
     FBloco: TVmsBlock;
     FIdxSample: Integer;       // proximo sample do bloco corrente
     FTemBloco: Boolean;
+    // Ainda nao passou um keyframe por este decodificador. Ver o laco do Next.
+    FEsperandoChave: Boolean;
     FAncora, FPrimeiroPts, FTimescale: Int64;
     FAcabou: Boolean;
 
     function AbrirArquivoEm(Ms: Int64): Boolean;
+    function AbrirArquivo(const Info: TVmsFileInfo; Ms: Int64): Boolean;
     function ProximoArquivo: Boolean;
     function ProximoBloco: Boolean;
     procedure Fechar;
@@ -174,8 +194,7 @@ function TVmsFrameWalk.AbrirArquivoEm(Ms: Int64): Boolean;
 var
   Arquivos: TVmsFileInfoArray;
   Info: TVmsFileInfo;
-  Index: TVmsIndex;
-  I, BlocoIdx, ChaveIdx: Integer;
+  I: Integer;
   Achou: Boolean;
 begin
   Result := False;
@@ -202,7 +221,31 @@ begin
         Break;
       end;
   if not Achou then Exit;
+  Result := AbrirArquivo(Info, Ms);
+end;
+
+// Abre ESTE arquivo, e nao "o que contem Ms".
+//
+// A separacao existe por causa de um travamento real: os arquivos de uma camera
+// se sobrepoem -- o novo comeca no mesmo instante em que o anterior termina, e
+// as vezes alguns segundos antes. Pedindo "o arquivo que contem o inicio do
+// proximo", a busca casava com o arquivo ANTERIOR, que ainda cobria aquele
+// instante, e o passeio reabria o que tinha acabado de ler. Como todo quadro
+// dali era mais velho que o alvo, nada saia; o fim do arquivo chegava de novo,
+// e recomecava. O processador ficava em 100% e a analise nao andava um
+// milissegundo -- foi o que travou as tres cameras por tres dias.
+function TVmsFrameWalk.AbrirArquivo(const Info: TVmsFileInfo;
+  Ms: Int64): Boolean;
+var
+  Index: TVmsIndex;
+  BlocoIdx, ChaveIdx: Integer;
+begin
+  Result := False;
+  Fechar;
   if Info.StartMs > FToMs then Exit;
+  // Instante antes do comeco do arquivo (a troca pede o inicio dele): comeca do
+  // primeiro bloco em vez de procurar um bloco que nao existe.
+  if Ms < Info.StartMs then Ms := Info.StartMs;
 
   if not FCache.GetIndex(Info.Path, Index) then Exit;
   if Length(Index) = 0 then Exit;
@@ -237,6 +280,9 @@ begin
 
   FArquivo := Info.Path;
   FTemBloco := False;
+  // Decodificador novo comeca sem referencia nenhuma: ate o primeiro keyframe,
+  // nada do que sair dele e imagem. Ver o laco do Next.
+  FEsperandoChave := True;
   Result := True;
 end;
 
@@ -245,6 +291,7 @@ end;
 function TVmsFrameWalk.ProximoArquivo: Boolean;
 var
   Arquivos: TVmsFileInfoArray;
+  Proximo: TVmsFileInfo;
   I: Integer;
   Alvo: Int64;
   Seguinte: string;
@@ -263,6 +310,7 @@ begin
       end;
       Alvo := Arquivos[I + 1].StartMs;
       Seguinte := Arquivos[I + 1].Path;
+      Proximo := Arquivos[I + 1];
       Break;
     end;
   if Alvo <= 0 then
@@ -277,7 +325,15 @@ begin
     FMotivo := 'fim do trecho pedido';
     Exit;
   end;
-  Result := AbrirArquivoEm(Alvo);
+  // Nem que o indice minta: reabrir o arquivo que acabou de ser lido e o
+  // caminho conhecido para o laco infinito, e uma linha aqui o fecha de vez.
+  if SameText(Proximo.Path, FArquivo) then
+  begin
+    FMotivo := 'o arquivo seguinte e o mesmo que acabou de ser lido';
+    Exit;
+  end;
+  // Pelo ARQUIVO, e nao pelo instante: ver AbrirArquivo.
+  Result := AbrirArquivo(Proximo, Alvo);
   if not Result then
     FMotivo := 'nao consegui abrir ' + ExtractFileName(Seguinte);
 end;
@@ -359,6 +415,29 @@ begin
       Exit;
     end;
 
+    // Nada entra no decodificador antes do primeiro keyframe.
+    //
+    // O bloco de entrada foi escolhido por HasKeyframe, que diz que ele CONTEM
+    // um keyframe -- nao que comece com um: o TBlockBuilder fecha bloco por
+    // tempo e tamanho (ver SamplesHaveKeyframe em VMS.Rec.Format). Entao o
+    // primeiro sample costuma ser um quadro P, e o FFmpeg, sem a referencia que
+    // falta, inventa uma cinza e devolve um quadro CINZA CHAPADO -- medido, a
+    // grade inteira entre 121 e 132 num quadro cuja faixa real e 58..254.
+    //
+    // Esse quadro virava a referencia do detector de movimento, e os ~4 s
+    // seguintes de cena parada apareciam como 30% de movimento, decaindo junto
+    // com a media movel do fundo. Como o worker refaz o percurso a cada 30 s,
+    // isso enchia a linha do tempo de um evento falso a cada 30 s.
+    if FEsperandoChave then
+    begin
+      if not (sfKeyframe in ByteToFlags(FBloco.Samples[FIdxSample].FlagsByte)) then
+      begin
+        Inc(FIdxSample);
+        Continue;
+      end;
+      FEsperandoChave := False;
+    end;
+
     SetLength(AU, FBloco.Samples[FIdxSample].PayloadSize);
     Move(FBloco.Payload[FBloco.Samples[FIdxSample].PayloadOffset], AU[0],
          FBloco.Samples[FIdxSample].PayloadSize);
@@ -368,8 +447,34 @@ begin
     // de referencias dos que vem depois. O ritmo escolhe o que SAI daqui, e nao
     // o que entra la.
     Saiu := FSeq.Feed(AU, Img);
-    if not Saiu then Continue;
-    if Parede < FAlvoMs then Continue;
+    if not Saiu then
+    begin
+      Inc(FSemSaida);
+      if FSemSaida > MAX_SEM_SAIDA then
+      begin
+        FAcabou := True;
+        FMotivo := Format('%d samples sem nenhum quadro sair -- parei aqui',
+                          [FSemSaida]);
+        Exit;
+      end;
+      Continue;
+    end;
+    FSemSaida := 0;
+    if Parede < FAlvoMs then
+    begin
+      // Quadro decodificado, mas anterior ao alvo: conta igual. E exatamente
+      // assim que o laco antigo girava -- decodificando sem parar material que
+      // ja tinha passado.
+      Inc(FSemSaida);
+      if FSemSaida > MAX_SEM_SAIDA then
+      begin
+        FAcabou := True;
+        FMotivo := Format('%d quadros anteriores ao alvo -- parei aqui',
+                          [FSemSaida]);
+        Exit;
+      end;
+      Continue;
+    end;
 
     // Max, e nao soma simples: com quadros esparsos a soma acumularia atraso e
     // o passo iria escorregando.

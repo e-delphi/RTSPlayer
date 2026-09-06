@@ -57,6 +57,13 @@ type
     FLogger: ILogger;
     // Por que o ultimo percurso parou. Ver o cabecalho do IFrameWalk.
     FMotivoFim: string;
+    // O diagnostico da grade: o instante pedido, e o que foi capturado.
+    FGradeAlvoMs: Int64;
+    FGradeCel: TArray<Byte>;
+    FGradeW, FGradeH: Integer;
+    FGradeMs: Int64;
+    // Guarda a grade se este quadro for o mais proximo do alvo ate agora.
+    procedure TalvezGuardarGrade(const Motion: IMotionDetector; Ms: Int64);
     function RodarPercurso(const Camera: string; FromMs, ToMs, StepMs: Int64;
                            const Motion: IMotionDetector;
                            MaxSamples: Integer): TMotionSamples;
@@ -72,6 +79,9 @@ type
                  Threshold, SceneThreshold, GridScale: Single;
                  CellDelta, MaxSamples: Integer): TMotionSamples;
     function MotivoDoFim: string;
+    procedure GuardarGradeEm(Ms: Int64);
+    function GradeGuardada(out Cel: TArray<Byte>;
+                           out W, H: Integer; out Ms: Int64): Boolean;
     function Available: Boolean;
   end;
 
@@ -117,6 +127,8 @@ var
 begin
   Result := nil;
   FMotivoFim := '';
+  FGradeCel := nil;
+  FGradeMs := 0;
   if not Available then Exit;
   if (Camera = '') or (ToMs <= FromMs) then Exit;
 
@@ -145,6 +157,44 @@ begin
   Result := FMotivoFim;
 end;
 
+procedure TMotionProbe.GuardarGradeEm(Ms: Int64);
+begin
+  FGradeAlvoMs := Ms;
+  FGradeCel := nil;
+  FGradeMs := 0;
+  FGradeW := 0;
+  FGradeH := 0;
+end;
+
+function TMotionProbe.GradeGuardada(out Cel: TArray<Byte>;
+  out W, H: Integer; out Ms: Int64): Boolean;
+begin
+  Cel := FGradeCel;
+  W := FGradeW;
+  H := FGradeH;
+  Ms := FGradeMs;
+  Result := Length(Cel) > 0;
+end;
+
+// O mais proximo do alvo vence. Comparar por distancia, e nao pegar o primeiro
+// depois do alvo, evita devolver um quadro de um segundo adiante so porque o
+// ritmo nao caiu exatamente no instante pedido.
+procedure TMotionProbe.TalvezGuardarGrade(const Motion: IMotionDetector;
+  Ms: Int64);
+var
+  Cel: TArray<Byte>;
+  W, H: Integer;
+begin
+  if FGradeAlvoMs <= 0 then Exit;
+  if (Length(FGradeCel) > 0) and
+     (Abs(Ms - FGradeAlvoMs) >= Abs(FGradeMs - FGradeAlvoMs)) then Exit;
+  if not Motion.UltimaGrade(Cel, W, H) then Exit;
+  FGradeCel := Cel;
+  FGradeW := W;
+  FGradeH := H;
+  FGradeMs := Ms;
+end;
+
 function TMotionProbe.RodarPercurso(const Camera: string;
   FromMs, ToMs, StepMs: Int64; const Motion: IMotionDetector;
   MaxSamples: Integer): TMotionSamples;
@@ -169,6 +219,7 @@ begin
   begin
     if not Img.IsValid then Continue;
     Res := Motion.Feed(Ms, Img);
+    TalvezGuardarGrade(Motion, Ms);
     Result[N].Ms := Ms;
     Result[N].Score := Res.Score;
     Result[N].Moved := Res.Moved;
@@ -224,6 +275,7 @@ begin
        Img.IsValid then
     begin
       Res := Motion.Feed(ActualMs, Img);
+      TalvezGuardarGrade(Motion, ActualMs);
       Result[N].Ms := ActualMs;
       Result[N].Score := Res.Score;
       Result[N].Moved := Res.Moved;

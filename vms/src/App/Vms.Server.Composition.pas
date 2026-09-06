@@ -69,6 +69,9 @@ type
   TAnalyticsRig = record
     Events: IEventSource;
     Workers: TArray<TAnalyticsWorker>;
+    // Passa parametros novos a todas as cameras, sem parar nada. E o que faz
+    // a tela de sintonia valer na hora em vez de na proxima subida.
+    procedure Ajustar(const Cfg: TAnalyticsConfig);
     procedure Stop;
     // Não se chama Free: quem chama isto é um registro, não um objeto, e a
     // ordem importa — os workers antes das interfaces que eles seguram.
@@ -151,6 +154,15 @@ end;
 // Sinaliza todos antes de esperar por qualquer um: parar em série custaria o
 // tempo de cada thread somado, e uma delas pode estar no meio de uma
 // inferência de centenas de milissegundos.
+procedure TAnalyticsRig.Ajustar(const Cfg: TAnalyticsConfig);
+var
+  I: Integer;
+begin
+  for I := 0 to High(Workers) do
+    if Workers[I] <> nil then
+      Workers[I].Ajustar(Cfg);
+end;
+
 procedure TAnalyticsRig.Stop;
 var
   I: Integer;

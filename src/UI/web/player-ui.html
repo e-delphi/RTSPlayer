@@ -13,13 +13,14 @@
   ASCII puro (exigencia do tools/gen_ui_pas.py): acento por entidade na
   marcacao, e por escape unicode nas strings de JavaScript.
 -->
+<link rel="stylesheet" href="/ui/ui.css">
 <style>
-  :root { color-scheme: dark; }
-  html, body { height:100%; }
-  body { margin:0; background:#0d0d0d; color:#e8e8e8; overflow:hidden;
+  /* A paleta e a base vem do /ui/ui.css. Esta e a pagina de teste do player:
+     fundo mais escuro que o do app de proposito, para julgar o video sem a
+     superficie clareando o entorno. */
+  body { background:#0d0d0d; overflow:hidden;
          font:13px/1.4 system-ui, "Segoe UI", Roboto, sans-serif;
-         display:flex; flex-direction:column;
-         -webkit-tap-highlight-color: transparent; }
+         display:flex; flex-direction:column; }
 
   #palco { flex:1 1 auto; min-height:0; background:#000; position:relative;
            display:flex; align-items:center; justify-content:center; }
@@ -31,8 +32,8 @@
            text-align:center; color:#8a8a8a; font-size:13px; padding:0 16px; }
 
   #barra { flex:0 0 auto; display:flex; align-items:center; gap:6px;
-           padding:8px; background:#1a1a1a; border-top:1px solid #2f2f2f;
-           flex-wrap:wrap; }
+           padding:8px; background:var(--sup1);
+           border-top:1px solid #2f2f2f; flex-wrap:wrap; }
   button { background:#2a2a2a; color:#e8e8e8; border:1px solid #3a3a3a;
            border-radius:6px; padding:7px 12px; font:inherit; cursor:pointer; }
   button.on { background:#2d9cdb; border-color:#2d9cdb; color:#fff; }
@@ -40,7 +41,6 @@
   #estado { width:100%; color:#8a8a8a; font-size:11px;
             font-family:ui-monospace, Consolas, monospace;
             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .err { color:#f87171; }
 </style>
 
 <div id="palco">

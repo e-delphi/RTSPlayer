@@ -136,6 +136,8 @@ type
     procedure ServirIcone(AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirJs(AResponseInfo: TIdHTTPResponseInfo;
                        const NomeArquivo: string);
+    procedure ServirCss(AResponseInfo: TIdHTTPResponseInfo;
+                        const NomeArquivo: string);
     procedure ServirCameras(AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirConfig(AResponseInfo: TIdHTTPResponseInfo);
     procedure GravarConfig(ARequestInfo: TIdHTTPRequestInfo;
@@ -742,6 +744,12 @@ begin
                 'application/javascript; charset=utf-8');
 end;
 
+procedure TLocalServer.ServirCss(AResponseInfo: TIdHTTPResponseInfo;
+  const NomeArquivo: string);
+begin
+  ServirDaPasta(AResponseInfo, NomeArquivo, 'text/css; charset=utf-8');
+end;
+
 procedure TLocalServer.ServirIcone(AResponseInfo: TIdHTTPResponseInfo);
 begin
   ServirDaPasta(AResponseInfo, 'favicon.svg', 'image/svg+xml');
@@ -942,6 +950,12 @@ begin
       ServirPagina(AResponseInfo, 'motion-ui.html')
     else if Caminho = '/ui/player' then
       ServirPagina(AResponseInfo, 'player-ui.html')
+    // A folha comum a todas as paginas: paleta, base do documento e os poucos
+    // componentes que aparecem em mais de uma tela. Solta, e nao embutida em
+    // cada uma, para a cor existir num lugar so -- e o navegador guarda uma
+    // copia para todas.
+    else if Caminho = '/ui/ui.css' then
+      ServirCss(AResponseInfo, 'ui.css')
     else if Caminho = '/ui/vmsreader.js' then
       ServirJs(AResponseInfo, 'vmsreader.js')
     else if Caminho = '/ui/player.js' then

@@ -67,6 +67,12 @@ type
     { IMotionDetector }
     function Feed(Ms: Int64; const Img: TRgbImage): TMotionResult;
     procedure Reset;
+    // Os mesmos parametros do construtor, trocados em uso. Mudar a grade muda
+    // o significado do fundo guardado -- por isso ele e descartado, e o proximo
+    // quadro vira a referencia nova.
+    procedure Ajustar(AThreshold, ASceneThreshold, AGridScale: Single;
+                      ACellDelta: Integer);
+    function UltimaGrade(out Cel: TArray<Byte>; out W, H: Integer): Boolean;
   end;
 
 implementation
@@ -121,6 +127,53 @@ begin
   // tamanho fixo, sem alocar nada por quadro analisado.
   SetLength(FBg, GRID_CELLS);
   SetLength(FCur, GRID_CELLS);
+end;
+
+procedure TFrameDiffMotionDetector.Ajustar(AThreshold, ASceneThreshold,
+  AGridScale: Single; ACellDelta: Integer);
+var
+  AntesW, AntesH: Integer;
+begin
+  AntesW := FGridW;
+  AntesH := FGridH;
+
+  FThreshold := AThreshold;
+  if FThreshold <= 0 then FThreshold := 0.012;
+  FSceneThreshold := ASceneThreshold;
+  if FSceneThreshold <= FThreshold then FSceneThreshold := 0.55;
+  FCellDelta := ACellDelta;
+  if (FCellDelta <= 0) or (FCellDelta > 255) then FCellDelta := CELL_DELTA;
+
+  FGridW := GRID_W;
+  FGridH := GRID_H;
+  if (AGridScale > 0) and (AGridScale < 1) then
+  begin
+    FGridW := Round(GRID_W * AGridScale);
+    FGridH := Round(GRID_H * AGridScale);
+  end;
+  if FGridW < GRID_MIN_W then FGridW := GRID_MIN_W;
+  if FGridH < GRID_MIN_H then FGridH := GRID_MIN_H;
+  FGridCells := FGridW * FGridH;
+
+  // Limiar novo vale sobre o fundo que ja existe -- ele descreve a cena, e a
+  // cena nao mudou. Grade nova, nao: as celulas passam a cobrir outra area, e
+  // comparar com o fundo antigo acusaria movimento em toda a tela.
+  if (FGridW <> AntesW) or (FGridH <> AntesH) then
+    FHasBg := False;
+end;
+
+function TFrameDiffMotionDetector.UltimaGrade(out Cel: TArray<Byte>;
+  out W, H: Integer): Boolean;
+begin
+  Cel := nil;
+  W := FGridW;
+  H := FGridH;
+  Result := FHasBg and (Length(FCur) >= FGridCells);
+  if not Result then Exit;
+  // Copia: o FCur e reescrito no proximo quadro, e quem recebe isto vai olhar
+  // com calma do outro lado de uma resposta HTTP.
+  SetLength(Cel, FGridCells);
+  Move(FCur[0], Cel[0], FGridCells);
 end;
 
 procedure TFrameDiffMotionDetector.Reset;

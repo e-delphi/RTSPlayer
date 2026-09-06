@@ -124,6 +124,14 @@ type
     function Subscribe(out Cursor: TLiveCursor): Boolean;
     function Fetch(var Cursor: TLiveCursor; TimeoutMs: Integer;
                    out Items: TArray<TLiveSampleRec>): TLiveFetch;
+    // O instante de PAREDE do WallMs de um sample do anel.
+    //
+    // Por dentro o anel data por relógio monotônico, que não anda para trás nem
+    // pula com acerto de hora -- é o certo para ordenar e para medir idade. Mas
+    // quem lê o .vms do outro lado quer hora de parede, e na MESMA base que o
+    // gravador escreve (NowUtcMs): senão a mesma cena teria dois horários, um
+    // ao vivo e outro na gravação, e a régua não fecharia com o vídeo.
+    function ParedeDe(MonotonicMs: Int64): Int64;
     // A câmera entregou mídia há pouco? Diferente de "já anunciou formato": os
     // formatos ficam guardados depois que a câmera cai, e o que interessa a quem
     // pergunta (a API, para dizer se está ao vivo) é o agora.
@@ -393,6 +401,14 @@ begin
     TMonitor.Exit(Self);
   end;
   Header := H;
+end;
+
+function TLiveStream.ParedeDe(MonotonicMs: Int64): Int64;
+begin
+  // A idade do instante, medida no monotônico, descontada do agora de parede.
+  // Quem monta um bloco chama isto só para as âncoras -- uma por trilha -- e os
+  // demais samples saem do PTS, que é o mesmo caminho do arquivo gravado.
+  Result := FClock.NowUtcMs - (FClock.MonotonicMs - MonotonicMs);
 end;
 
 function TLiveStream.IsPublishing(WithinMs: Int64): Boolean;

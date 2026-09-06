@@ -51,6 +51,11 @@ var Player = (function () {
 
   var MAX_DESVIO_MS = 60000;
 
+  // Atraso tolerado no AO VIVO antes de puxar a ancora para a frente. Ver
+  // alcancarAoVivo. Acima de um segundo e meio ja se percebe olhando a rua e a
+  // tela ao mesmo tempo, e abaixo disso o pulo seria mais incomodo que o atraso.
+  var ATRASO_MAX_AO_VIVO_MS = 1500;
+
   // ------------------------------------------------------------- G.711
 
   // A-law -> PCM16. Tabela montada uma vez: sao 256 entradas, e fazer a conta
@@ -850,10 +855,35 @@ var Player = (function () {
     return this.baseRelogio + (ms - this.baseMs) / 1000 / this.velocidade;
   };
 
+  // Ao vivo nao se assiste atrasado.
+  //
+  // O cronograma e ancorado no primeiro quadro que aparece e anda a 1x dali em
+  // diante, entao TODO atraso da entrada fica para sempre. E na entrada sempre
+  // ha algum: so da para comecar a decodificar num keyframe, e o mais recente
+  // que o servidor tem guardado pode ter quase um GOP de idade -- na ayla, com
+  // GOP de 4 s, ate quatro segundos.
+  //
+  // Quando o que JA CHEGOU esta bem a frente do que se esta exibindo, o atraso e
+  // nosso e nao da camera: puxa a ancora para o mais novo. Os quadros do meio
+  // continuam sendo decodificados, porque os seguintes dependem deles; quem os
+  // descarta e o laco de exibicao, por terem vencido -- o mesmo caminho que ja
+  // trata engasgo de rede.
+  //
+  // So no ao vivo: na gravacao o buffer a frente e proposital, e pular seria
+  // comer trecho que a pessoa quer ver.
+  Player.prototype.alcancarAoVivo = function () {
+    if (!this.aoVivo || !this.baseMs || !this.pendentes.length) return;
+    var novo = this.pendentes[this.pendentes.length - 1].wallMs;
+    if (novo - (this.ultimoMs || this.baseMs) < ATRASO_MAX_AO_VIVO_MS) return;
+    this.baseMs = novo;
+    this.baseRelogio = this.relogio();
+  };
+
   Player.prototype.laco = function () {
     if (!this.tocando) return;
     var self = this;
 
+    this.alcancarAoVivo();
     this.alimentarDecodificador();
     this.agendarAudio();
 

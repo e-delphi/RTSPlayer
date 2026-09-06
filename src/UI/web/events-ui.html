@@ -29,12 +29,12 @@
   ASCII puro (exigencia do tools/gen_ui_pas.py): acento por entidade na
   marcacao, e por escape unicode nas strings de JavaScript.
 -->
+<link rel="stylesheet" href="/ui/ui.css">
 <style>
-  :root { color-scheme: dark; }
-  html, body { height:100%; }
-  body { margin:0; background:#121212; color:#e6e6e6; overflow:hidden;
-         font:400 13px/18px Roboto, system-ui, "Segoe UI", sans-serif;
-         -webkit-tap-highlight-color: transparent; }
+  /* A paleta e a base vem do /ui/ui.css; aqui a lista nao rola por fora, e o
+     texto e um degrau menor que o do app -- sao cartoes pequenos. */
+  body { overflow:hidden;
+         font:400 13px/18px Roboto, system-ui, "Segoe UI", sans-serif; }
 
   /* Dois formatos, e a altura decide qual.
      Numa FAIXA (banda baixa embaixo do video) a lista rola na horizontal, como
@@ -42,20 +42,22 @@
      Em TELA CHEIA isso fica pessimo -- cartoes altos e estreitos, e o dedo
      rolando para o lado. Ai vira grade, que e o que se espera de uma lista. */
   #barra { display:flex; align-items:center; gap:8px; padding:8px 10px;
-           background:#1a1a1a; }
-  #titulo { font-size:12px; color:#c2c7c9; white-space:nowrap; }
-  #titulo b { color:#e6e6e6; }
-  select { background:none; color:#8ed0f0; border:1px solid #3f4447;
+           background:var(--sup1); }
+  #titulo { font-size:12px; color:var(--sobre-sup-var); white-space:nowrap; }
+  #titulo b { color:var(--sobre-sup); }
+  select { background:none; color:var(--p);
+           border:1px solid var(--contorno-var);
            border-radius:16px; padding:5px 10px; font:inherit; }
-  #msg { font-size:11px; color:#c2c7c9; margin-left:auto; white-space:nowrap; }
+  #msg { font-size:11px; color:var(--sobre-sup-var); margin-left:auto; white-space:nowrap; }
 
   #tira { display:flex; gap:8px; overflow-x:auto; overflow-y:hidden;
           padding:8px; height:calc(100% - 36px); box-sizing:border-box;
           -webkit-overflow-scrolling:touch; scrollbar-width:thin; }
-  .ev { flex:0 0 auto; width:132px; background:#1f1f1f; border-radius:12px;
+  .ev { flex:0 0 auto; width:132px; background:var(--sup2);
+        border-radius:var(--r-m);
         border:2px solid transparent; overflow:hidden; cursor:pointer;
         display:flex; flex-direction:column; }
-  .ev.sel { border-color:#8ed0f0; }
+  .ev.sel { border-color:var(--p); }
   .ev img { width:132px; height:74px; object-fit:cover; background:#000;
             display:block; }
 
@@ -76,13 +78,14 @@
   }
   .ev .txt { padding:4px 6px 6px; }
   .ev .h { font-size:12px; font-variant-numeric:tabular-nums; }
-  .ev .n { font-size:11px; color:#c2c7c9; white-space:nowrap;
+  .ev .n { font-size:11px; color:var(--sobre-sup-var); white-space:nowrap;
            overflow:hidden; text-overflow:ellipsis; }
   .pin { display:inline-block; width:6px; height:6px; border-radius:3px;
          margin-right:5px; vertical-align:1px; }
-  .k-motion { background:#f2c14e; }
-  .k-object { background:#8ed0f0; }
-  #vazio { color:#c2c7c9; font-size:12px; padding:24px 16px; }
+  .k-motion { background:var(--alerta); }
+  .k-object { background:var(--p); }
+  #vazio { color:var(--sobre-sup-var); font-size:12px;
+           padding:24px 16px; }
 </style>
 
 <div id="barra">
@@ -122,6 +125,21 @@ function api(caminho) {
 var DENTRO_DA_CASCA = (window.parent !== window);
 
 var eventos = [], selecionado = -1;
+
+// Teto de eventos na lista, e se o ultimo pedido bateu nele.
+//
+// Existe um teto porque cada evento vira um cartao no DOM, com miniatura
+// propria; algumas dezenas de milhares deles travariam um WebView de telefone.
+// Mas o numero antigo, 2000, ficava ABAIXO de um dia real -- medido no
+// servidor, 03/09 fechou com 2247 eventos na frente e 2266 na ayla -- e a lista
+// cortava em silencio: o rodape dizia "2000 de 2000" e parecia completo.
+//
+// Duas mudancas, entao. O teto sobe para caber um dia movimentado com folga, e
+// o pedido leva UM A MAIS que ele: e assim que se sabe se sobrou. Pedir
+// exatamente o teto devolve uma lista cheia sem dizer se ela acabou ali ou se
+// foi cortada.
+var TETO = 10000;
+var cortou = false;
 
 // Quantas miniaturas carregam de imediato. O bastante para cobrir a largura de
 // uma faixa em tablet deitado; o resto entra conforme rola.
@@ -216,7 +234,11 @@ function pintar() {
                                    : "nenhum evento neste dia";
     tira.appendChild(v);
   }
-  $("msg").textContent = mostrados + " de " + eventos.length;
+  // "de 2000" sozinho parecia um total; com o corte, o "+" diz que nao e.
+  $("msg").textContent = mostrados + " de " + eventos.length + (cortou ? "+" : "");
+  $("msg").title = cortou
+    ? "o periodo tem mais eventos do que a lista mostra; escolha um intervalo menor"
+    : "";
 
   // As primeiras sem esperar observador nenhum: a faixa nunca deve aparecer
   // vazia, e as que estao na tela ao abrir nao dependem de rolagem.
@@ -256,7 +278,7 @@ function carregar() {
   }
   $("titulo").innerHTML = "<b>" + CAMERA + "</b>";
   var u = api("/api/events?camera=" + encodeURIComponent(CAMERA) +
-              "&fromMs=" + DE + "&toMs=" + ATE + "&limit=2000");
+              "&fromMs=" + DE + "&toMs=" + ATE + "&limit=" + (TETO + 1));
   fetch(u).then(function (r) { return r.json(); }).then(function (j) {
     if (j.error) {
       $("tira").innerHTML = '<div id="vazio"></div>';
@@ -264,6 +286,9 @@ function carregar() {
       return;
     }
     eventos = j.events || [];
+    // O que passou do teto nao entra na lista, mas deixa marca: ver TETO.
+    cortou = eventos.length > TETO;
+    if (cortou) eventos = eventos.slice(0, TETO);
     pintar();
   }).catch(function (err) {
     $("tira").innerHTML = '<div id="vazio"></div>';

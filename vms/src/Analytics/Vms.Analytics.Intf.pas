@@ -79,6 +79,16 @@ type
     function Feed(Ms: Int64; const Img: TRgbImage): TMotionResult;
     // Esquece a referencia. Chamado ao pular para outro ponto da gravacao.
     procedure Reset;
+    // Troca os parametros SEM parar. Ver IFrameAnalyzer.Ajustar.
+    procedure Ajustar(AThreshold, ASceneThreshold, AGridScale: Single;
+                      ACellDelta: Integer);
+    // A grade do ultimo quadro analisado -- o cinza medio de cada celula, na
+    // ordem da esquerda para a direita, de cima para baixo.
+    //
+    // E diagnostico, e nao parte da deteccao: serve para comparar o que o
+    // servidor mede com o que outro lado mede sobre o MESMO video. Sem isso,
+    // uma divergencia entre os dois so se discute -- nao se resolve.
+    function UltimaGrade(out Cel: TArray<Byte>; out W, H: Integer): Boolean;
   end;
 
   // O que e?
@@ -153,6 +163,13 @@ type
     function Run(const Camera: string; FromMs, ToMs, StepMs: Int64;
                  Threshold, SceneThreshold, GridScale: Single;
                  CellDelta, MaxSamples: Integer): TMotionSamples;
+    // Antes de um Run, pede que ele guarde a grade do quadro mais proximo deste
+    // instante. 0 desliga. Ver IMotionDetector.UltimaGrade.
+    procedure GuardarGradeEm(Ms: Int64);
+    // A grade guardada no ultimo Run. False = nao foi pedida, ou nao houve
+    // quadro por perto.
+    function GradeGuardada(out Cel: TArray<Byte>;
+                           out W, H: Integer; out Ms: Int64): Boolean;
     // Por que o ultimo Run terminou onde terminou; vale ate o proximo Run.
     // Ver o MotivoDoFim do IFrameWalk: um ensaio curto pode ser a gravacao
     // acabando ou um defeito, e de fora os dois eram identicos.
@@ -164,6 +181,10 @@ type
   IFrameAnalyzer = interface
     ['{0B4E7C29-6A13-4F85-9D2C-7E3A1B5F8C60}']
     procedure Feed(Ms: Int64; const Img: TRgbImage);
+    // Troca os parametros SEM parar a analise. Sintonizar um limiar e uma
+    // conversa: mexe, olha, mexe de novo. Se cada tentativa custasse reiniciar
+    // o servidor, ninguem sintonizaria nada.
+    procedure Ajustar(const Cfg: TAnalyticsConfig);
     // Fecha o que estiver aberto. Chamado ao pular no tempo e ao encerrar: sem
     // isto, o ultimo evento de cada rodada nunca chegaria ao disco.
     procedure Flush;
