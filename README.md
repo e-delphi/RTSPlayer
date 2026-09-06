@@ -12,11 +12,36 @@ libVLC, sem wrapper, sem componente de terceiro. Só a decodificação de vídeo
 
 ## Telas
 
-| Início | Configurar |
+### Assistir
+
+A tela inicial separa o que vem de um servidor do que está cadastrado no próprio
+aparelho. A de vídeo é a mesma para ao vivo e para gravação.
+
+| Início | Ao vivo |
 |:--:|:--:|
-| ![Tela inicial com a lista vazia e o botão de adicionar câmera](docs/app-inicio.png) | ![Cadastro da câmera: protocolo, host, porta, credenciais, transporte e o resultado do teste de conexão](docs/app-configurar.png) |
-| **Listagem** | **Vídeo ao vivo** |
-| ![Lista de câmeras cadastradas, mostrando URL e transporte de cada uma](docs/app-listagem.png) | ![Player exibindo o stream ao vivo de uma câmera](docs/app-video.png) |
+| ![Tela inicial: as câmeras do servidor, cada uma com contagem de arquivos, espaço ocupado e atalho para o histórico; abaixo, as câmeras cadastradas neste aparelho](docs/1-inicio.png) | ![Vídeo ao vivo da câmera frente, com o relógio no cabeçalho e o codec e a resolução no rodapé](docs/2-ao-vivo.png) |
+
+### Rever
+
+| Histórico | Linha do tempo | Eventos |
+|:--:|:--:|:--:|
+| ![Histórico por dia: cada dia com o total gravado, a porcentagem do dia coberta e uma barra de cobertura](docs/3-historico.png) | ![Reprodução de gravação com a régua do dia embaixo do vídeo, mostrando as faixas gravadas em azul, os buracos em preto e as marcas de evento](docs/4-time-line.png) | ![Grade de eventos com miniatura, hora e rótulo: movimento em amarelo, objeto reconhecido pela rede em azul](docs/5-eventos.png) |
+
+### Calibrar a detecção
+
+A grade que o detector enxerga fica desenhada sobre o próprio vídeo, e a curva
+mostra o trecho analisado. Mexer na sensibilidade reclassifica o trecho na hora,
+sem voltar ao servidor; só o botão de aplicar grava o parâmetro lá.
+
+| Detecção de movimento | Parâmetros do servidor |
+|:--:|:--:|
+| ![Calibração da detecção: a grade sobre o vídeo, o selo com o veredito e o score, a curva do trecho analisado com a linha do limiar e o controle de sensibilidade](docs/9-calibracao-movimento.png) | ![Parâmetros do servidor editáveis pelo app, com campo de filtro e a troca de senha no topo](docs/8-servidor-parametros.png) |
+
+### Cadastrar
+
+| Servidores | Servidor | Nova câmera |
+|:--:|:--:|:--:|
+| ![Lista de servidores cadastrados, com o endereço de cada um](docs/6-servidores.png) | ![Cadastro do servidor: nome, as rotas até ele com a marca de tailscale, e as credenciais de acesso](docs/7-servidor-cadastro.png) | ![Cadastro de câmera: nome, URL RTSP ou DVRIP, usuário, senha e o interruptor de habilitada](docs/10-camera-cadastro.png) |
 
 ## Recursos
 
