@@ -160,3 +160,79 @@ svg.ico { width:24px; height:24px; display:block; flex:0 0 auto;
 .err  { color:var(--erro); }
 .ok   { color:var(--ok); }
 .warn { color:var(--alerta); }
+
+/* ===================================================== formularios
+
+   Duas telas cadastram coisas: as cameras do aparelho e as do servidor.
+   O campo cheio do M3 (fundo proprio, canto arredondado so em cima,
+   traco que acende no foco, rotulo que sobe quando ha texto) vive aqui
+   para as duas usarem o mesmo, e nao duas copias que divergem. */
+.ajuda { color:var(--sobre-sup-var);
+         font:400 12px/16px Roboto, system-ui, sans-serif;
+         padding:4px 16px 0; margin:-8px 0 12px; }
+.divisor { height:1px; background:var(--contorno-var); margin:8px 0; }
+
+/* ------------------------------------------------------ campos de texto
+
+   Campo cheio do M3: fundo proprio, canto arredondado so em cima, e um
+   traco embaixo que acende na cor primaria com o foco. O rotulo comeca
+   dentro e SOBE quando ha texto -- e por isso que o input vem antes do
+   rotulo na marcacao, para o :placeholder-shown alcancar o irmao.
+
+   `label.campo`, e nao `.campo`: a regra generica de input logo abaixo tem a
+   MESMA especificidade e vem depois, entao ganhava dela -- o campo nascia com
+   o padding do input simples, sem o espaco de cima, e o rotulo flutuado caia
+   por cima do proprio valor. */
+.campo { display:block; position:relative; margin-bottom:20px; }
+label.campo input {
+  display:block; width:100%; box-sizing:border-box; margin:0;
+  background:var(--sup3); color:var(--sobre-sup);
+  border:0; border-bottom:1px solid var(--contorno);
+  border-radius:var(--r-xs) var(--r-xs) 0 0;
+  padding:24px 16px 8px; font:400 16px/24px Roboto, system-ui, sans-serif; }
+label.campo input:focus { outline:none; border-bottom:2px solid var(--p);
+                     padding-bottom:7px; }
+label.campo > span { position:absolute; left:16px; top:16px; pointer-events:none;
+                color:var(--sobre-sup-var);
+                font:400 16px/24px Roboto, system-ui, sans-serif;
+                transition:transform .12s ease, color .12s ease;
+                transform-origin:left top; }
+/* Vazio E sem foco: o rotulo desce e ocupa o lugar do texto. */
+label.campo input + span { transform:translateY(-10px) scale(.75); }
+label.campo input:placeholder-shown:not(:focus) + span {
+  transform:translateY(8px) scale(1); }
+label.campo input:focus + span { color:var(--p); }
+
+/* Fora dos .campo (filtro, linhas de parametro) o input continua simples. */
+input[type=text], input:not([type]), input[type=password] {
+  display:block; width:100%; box-sizing:border-box; margin-top:4px;
+  background:var(--sup3); color:var(--sobre-sup);
+  border:1px solid var(--contorno-var); border-radius:var(--r-xs);
+  padding:10px 12px; font:400 14px/20px Roboto, system-ui, sans-serif; }
+input[type=text]:focus, input:not([type]):focus, input[type=password]:focus {
+  outline:none; border-color:var(--p); }
+label { display:block; margin-bottom:12px; color:var(--sobre-sup-var);
+        font:400 12px/16px Roboto, system-ui, sans-serif; }
+
+/* ------------------------------------------------------------- chave
+
+   O quadradinho virou a chave do Material: alvo maior, estado legivel de
+   longe, e o polegar cresce quando liga. */
+label.chk { display:flex; align-items:center; gap:16px;
+            font:400 16px/24px Roboto, system-ui, sans-serif;
+            color:var(--sobre-sup); margin:8px 0 16px; cursor:pointer; }
+label.chk input[type=checkbox] {
+  appearance:none; -webkit-appearance:none; margin:0; flex:0 0 auto;
+  width:52px; height:32px; border-radius:16px; background:var(--sup4);
+  border:2px solid var(--contorno); position:relative; cursor:pointer;
+  transition:background .12s, border-color .12s; }
+label.chk input[type=checkbox]::after {
+  content:""; position:absolute; left:6px; top:50%; width:16px; height:16px;
+  border-radius:50%; background:var(--contorno); transform:translateY(-50%);
+  transition:left .12s ease, width .12s, height .12s, background .12s; }
+label.chk input[type=checkbox]:checked {
+  background:var(--p); border-color:var(--p); }
+label.chk input[type=checkbox]:checked::after {
+  left:26px; width:24px; height:24px; background:var(--sobre-p); }
+
+.acoes { display:flex; gap:8px; margin-top:24px; flex-wrap:wrap; }

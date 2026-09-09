@@ -69,6 +69,15 @@ type
   TAnalyticsRig = record
     Events: IEventSource;
     Workers: TArray<TAnalyticsWorker>;
+    // Monta o trabalhador de UMA camera com os mesmos colaboradores da subida.
+    // E um metodo anonimo, e nao dez campos: o que ele precisa (decodificador,
+    // detector, arquivo de eventos, cache, config) ja existe como variavel
+    // local do BuildAnalytics, e a captura guarda exatamente isso. Nil quando
+    // a analise nao subiu.
+    MontarWorker: TFunc<string, TAnalyticsWorker>;
+    // Poe uma camera nova sob analise, sem parar as que ja rodam. Silencioso
+    // quando a analise nao subiu -- e o mesmo caso de nao haver FFmpeg.
+    procedure AcrescentarCamera(const Nome: string);
     // Passa parametros novos a todas as cameras, sem parar nada. E o que faz
     // a tela de sintonia valer na hora em vez de na proxima subida.
     procedure Ajustar(const Cfg: TAnalyticsConfig);
@@ -98,6 +107,17 @@ function BuildAnalytics(const Cfg: TAnalyticsConfig; const Db: IDbQueue;
 function BuildServerSupervisors(const App: TAppConfig; const Logger: ILogger;
                                 const Clock: IClock;
                                 const Hub: TLiveHub = nil): TAppSupervisorList;
+
+// UM supervisor, o da camera dada. E o corpo do laco acima, em separado: e o
+// que permite acrescentar uma camera com o servidor no ar, sem reconstruir as
+// outras. Devolve nil para camera desabilitada.
+//
+// Nada aqui e global: o supervisor sai pronto da linha da camera mais o log, o
+// relogio e o hub -- e o hub cria o fluxo dela sob demanda.
+function MontarSupervisor(const App: TAppConfig;
+                          const Cam: TCameraConfigEntry;
+                          const Logger: ILogger; const Clock: IClock;
+                          const Hub: TLiveHub): TCameraSupervisor;
 
 implementation
 
@@ -154,6 +174,21 @@ end;
 // Sinaliza todos antes de esperar por qualquer um: parar em série custaria o
 // tempo de cada thread somado, e uma delas pode estar no meio de uma
 // inferência de centenas de milissegundos.
+procedure TAnalyticsRig.AcrescentarCamera(const Nome: string);
+var
+  Novo: TAnalyticsWorker;
+  I: Integer;
+begin
+  if not Assigned(MontarWorker) then Exit;
+  // Ja sob analise: nada a fazer. Dois trabalhadores na mesma camera leriam os
+  // mesmos arquivos e gravariam o mesmo evento duas vezes.
+  for I := 0 to High(Workers) do
+    if (Workers[I] <> nil) and SameText(Workers[I].Camera, Nome) then Exit;
+  Novo := MontarWorker(Nome);
+  if Novo = nil then Exit;
+  Workers := Workers + [Novo];
+end;
+
 procedure TAnalyticsRig.Ajustar(const Cfg: TAnalyticsConfig);
 var
   I: Integer;
@@ -203,7 +238,6 @@ var
   Percurso: IFrameWalkSource;
   Objetos: IObjectDetector;
   Store: TSqliteEventStore;
-  Analyzer: IFrameAnalyzer;
   I: Integer;
 begin
   Result.Events := nil;
@@ -256,21 +290,30 @@ begin
   Logger.Info('analytics', Cfg.Describe);
   Logger.Info('analytics', Objetos.Describe);
 
+  // Um montador so, usado na subida e depois a cada camera nova. Ele CAPTURA
+  // os colaboradores acima; sao todos compartilhados de proposito, menos o
+  // detector de movimento e o analisador, que tem estado por cena.
+  Result.MontarWorker :=
+    function(Nome: string): TAnalyticsWorker
+    var
+      Analisador: IFrameAnalyzer;
+    begin
+      // Um detector de movimento e um analisador POR CÂMERA: os dois comparam
+      // o quadro atual com o que veio antes NAQUELA cena. Compartilhá-los
+      // faria cada câmera apagar a referência da outra.
+      Analisador := TFrameAnalyzer.Create(Nome,
+        TFrameDiffMotionDetector.Create(Cfg.MotionThreshold,
+          Cfg.SceneChangeThreshold, Cfg.StepMs * 4,
+          Cfg.GridScale, Cfg.CellDelta),
+        Objetos, Store, Cfg, Logger);
+      // (Store entra como IAnalysisProgress; a conversão é implícita.)
+      Result := TAnalyticsWorker.Create(Nome, Keyframes, Grabber,
+        Percurso, Analisador, Store, Cache, Cfg, Clock, Logger, Stop);
+    end;
+
   SetLength(Result.Workers, Length(Cameras));
   for I := 0 to High(Cameras) do
-  begin
-    // Um detector de movimento e um analisador POR CÂMERA: os dois comparam o
-    // quadro atual com o que veio antes NAQUELA cena. Compartilhá-los faria
-    // cada câmera apagar a referência da outra.
-    Analyzer := TFrameAnalyzer.Create(Cameras[I],
-      TFrameDiffMotionDetector.Create(Cfg.MotionThreshold,
-        Cfg.SceneChangeThreshold, Cfg.StepMs * 4,
-        Cfg.GridScale, Cfg.CellDelta),
-      Objetos, Store, Cfg, Logger);
-    Result.Workers[I] := TAnalyticsWorker.Create(Cameras[I], Keyframes, Grabber,
-      Percurso, Analyzer, Store, Cache, Cfg, Clock, Logger, Stop);
-    // (Store entra como IAnalysisProgress; a conversão é implícita.)
-  end;
+    Result.Workers[I] := Result.MontarWorker(Cameras[I]);
 end;
 
 function BuildMotionProbe(Cache: TVmsIndexCache;
@@ -301,59 +344,68 @@ begin
   Result := SameText(Copy(Trim(Url), 1, 5), 'dvrip');
 end;
 
+function MontarSupervisor(const App: TAppConfig;
+  const Cam: TCameraConfigEntry; const Logger: ILogger; const Clock: IClock;
+  const Hub: TLiveHub): TCameraSupervisor;
+var
+  SessionCfg: TCameraSessionConfig;
+  Policy: IReconnectPolicy;
+  Sink: IMediaSink;
+begin
+  Result := nil;
+  if not Cam.Enabled then
+  begin
+    Logger.Info('composition', Format('Camera "%s" desabilitada, pulando', [Cam.Name]));
+    Exit;
+  end;
+
+  SessionCfg := BuildSessionConfig(App, Cam);
+  Policy := BuildReconnectPolicy(Cam);
+  Sink := nil;
+
+  if IsDvripUrl(Cam.Url) then
+  begin
+    SessionCfg.RecordEnabled := False; // TDvripSession ignora esse flag
+    Sink := TRecordingSink.Create(Cam.Name, App.StorageDir, Cam.FilenamePattern,
+                                  Cam.Url, Cam.RecordAudio,
+                                  App.MaxBlockSamples, App.MaxBlockDurationMs,
+                                  App.MaxBlockSizeBytes, Logger, Clock,
+                                  1500, App.RotateMs);
+    Logger.Info('composition', Format('Camera "%s": dvrip, gravando via sink', [Cam.Name]));
+  end
+  else
+  begin
+    SessionCfg.RecordEnabled := True;
+    Logger.Info('composition', Format('Camera "%s": rtsp, gravando na sessão', [Cam.Name]));
+  end;
+
+  // Por fora do que já existia: publica na memória e repassa para o sink de
+  // gravação (dvrip) ou para ninguém (rtsp, que grava dentro da sessão).
+  // O áudio segue a mesma regra da gravação — quem desligou recordAudio não
+  // quer a trilha, nem no arquivo nem ao vivo.
+  if Hub <> nil then
+  begin
+    Sink := TLiveSink.Create(Hub.GetOrCreate(Cam.Name), Sink, Cam.RecordAudio);
+    Logger.Info('composition', Format('Camera "%s": ao vivo pela memória', [Cam.Name]));
+  end;
+
+  Result := TCameraSupervisor.Create(SessionCfg, Logger,
+                                     Clock, DefaultDepacketizerFactory(),
+                                     Policy, Sink);
+end;
+
 function BuildServerSupervisors(const App: TAppConfig; const Logger: ILogger;
   const Clock: IClock; const Hub: TLiveHub): TAppSupervisorList;
 var
   I: Integer;
-  Cam: TCameraConfigEntry;
-  SessionCfg: TCameraSessionConfig;
-  Policy: IReconnectPolicy;
-  Factory: TDepacketizerFactoryFn;
-  Sink: IMediaSink;
+  Cam: TCameraSupervisor;
 begin
   Result := TAppSupervisorList.Create(True);
   try
-    Factory := DefaultDepacketizerFactory();
     for I := 0 to High(App.Cameras) do
     begin
-      Cam := App.Cameras[I];
-      if not Cam.Enabled then
-      begin
-        Logger.Info('composition', Format('Camera "%s" desabilitada, pulando', [Cam.Name]));
-        Continue;
-      end;
-
-      SessionCfg := BuildSessionConfig(App, Cam);
-      Policy := BuildReconnectPolicy(Cam);
-      Sink := nil;
-
-      if IsDvripUrl(Cam.Url) then
-      begin
-        SessionCfg.RecordEnabled := False; // TDvripSession ignora esse flag
-        Sink := TRecordingSink.Create(Cam.Name, App.StorageDir, Cam.FilenamePattern,
-                                      Cam.Url, Cam.RecordAudio,
-                                      App.MaxBlockSamples, App.MaxBlockDurationMs,
-                                      App.MaxBlockSizeBytes, Logger, Clock,
-                                      1500, App.RotateMs);
-        Logger.Info('composition', Format('Camera "%s": dvrip, gravando via sink', [Cam.Name]));
-      end
-      else
-      begin
-        SessionCfg.RecordEnabled := True;
-        Logger.Info('composition', Format('Camera "%s": rtsp, gravando na sessão', [Cam.Name]));
-      end;
-
-      // Por fora do que já existia: publica na memória e repassa para o sink de
-      // gravação (dvrip) ou para ninguém (rtsp, que grava dentro da sessão).
-      // O áudio segue a mesma regra da gravação — quem desligou recordAudio não
-      // quer a trilha, nem no arquivo nem ao vivo.
-      if Hub <> nil then
-      begin
-        Sink := TLiveSink.Create(Hub.GetOrCreate(Cam.Name), Sink, Cam.RecordAudio);
-        Logger.Info('composition', Format('Camera "%s": ao vivo pela memória', [Cam.Name]));
-      end;
-
-      Result.Add(TCameraSupervisor.Create(SessionCfg, Logger, Clock, Factory, Policy, Sink));
+      Cam := MontarSupervisor(App, App.Cameras[I], Logger, Clock, Hub);
+      if Cam <> nil then Result.Add(Cam);
     end;
   except
     Result.Free;

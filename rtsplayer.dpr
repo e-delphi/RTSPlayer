@@ -13,6 +13,7 @@ uses
   VMS.App.Config in 'src\App\VMS.App.Config.pas',
   VMS.App.Logger in 'src\App\VMS.App.Logger.pas',
   VMS.App.Decodificacao in 'src\App\VMS.App.Decodificacao.pas',
+  VMS.Android.UiAssets in 'src\Android\VMS.Android.UiAssets.pas',
   VMS.Android.Jpeg in 'src\Android\VMS.Android.Jpeg.pas',
   VMS.Android.JNIUtil in 'src\Android\VMS.Android.JNIUtil.pas',
   VMS.Android.VideoDecoder in 'src\Android\VMS.Android.VideoDecoder.pas',
@@ -33,6 +34,7 @@ uses
   VMS.Domain.MediaSink in 'src\Domain\VMS.Domain.MediaSink.pas',
   VMS.Domain.Reconnect in 'src\Domain\VMS.Domain.Reconnect.pas',
   VMS.Domain.Session in 'src\Domain\VMS.Domain.Session.pas',
+  VMS.Domain.Ptz in 'src\Domain\VMS.Domain.Ptz.pas',
   VMS.Domain.Supervisor in 'src\Domain\VMS.Domain.Supervisor.pas',
   VMS.Domain.Types in 'src\Domain\VMS.Domain.Types.pas',
   VMS.Net.Intf in 'src\Net\VMS.Net.Intf.pas',
@@ -64,6 +66,7 @@ uses
   VMS.App.Servers in 'src\App\VMS.App.Servers.pas',
   // A MESMA leitura de arquivo que o vmsserver usa: uma pasta, dois
   // hospedeiros.
+  Vms.Onvif.Client in 'vms\src\Onvif\Vms.Onvif.Client.pas',
   Vms.Server.UiFiles in 'vms\src\Api\Vms.Server.UiFiles.pas',
   UI.Shell in 'src\UI\UI.Shell.pas';
 

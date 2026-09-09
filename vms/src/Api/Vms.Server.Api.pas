@@ -11,6 +11,7 @@
 //   GET /api/media?camera=X&fromMs=…      a mídia: header .vms + N blocos
 //   GET /api/media?camera=X&cursor=…      a continuação, sem busca
 //   GET /api/live?camera=X&cursor=…       o ao vivo, direto do anel
+//   GET /api/ptz?camera=X&acao=…          move a camera por ONVIF
 //   GET /api/recordings?camera=X&...      a lista crua, arquivo por arquivo
 //   GET /api/index?file=…                 o índice de blocos, cru
 //                                         (as duas últimas são diagnóstico)
@@ -62,10 +63,14 @@ uses
   System.IOUtils,
   System.NetEncoding,
   System.Generics.Collections,
+  System.SyncObjs,
   VMS.Domain.Types,
   VMS.Domain.Logging,
+  VMS.Domain.Ptz,
+  VMS.Dvrip.Protocol,
   VMS.Rec.Format,
   VMS.Rec.Writer,
+  Vms.Onvif.Client,
   Vms.Server.LiveHub,
   Vms.Server.IndexCache,
   Vms.Thumb.Intf,
@@ -149,7 +154,22 @@ type
   strict private
     FConfig: TApiConfig;
     FCameras: TArray<string>;
+    // Protege a TROCA do vetor acima, nao a leitura dele: o vetor publicado
+    // nunca e alterado no lugar, entao quem pegou a referencia pode le-la a
+    // vontade depois de soltar o lock.
+    FCamerasLock: TCriticalSection;
+    // Cameras cuja configuracao mudou e ainda nao foi aplicada. Ver o
+    // cabecalho de TomarCamerasPendentes.
+    FPendentes: TStringList;
     FHub: TLiveHub;
+    // Um cliente ONVIF por camera, guardado: a preparacao custa tres chamadas
+    // de rede e o resultado nao muda enquanto a camera for a mesma. O lock e
+    // porque cada pedido HTTP vem numa thread do Indy.
+    FOnvif: TObjectDictionary<string, TOnvifClient>;
+    // O ultimo comando de PTZ por camera. A parada do DVRIP repete o comando
+    // que estava andando; sem guardar, nao haveria o que repetir.
+    FUltimoPtz: TDictionary<string, string>;
+    FOnvifLock: TCriticalSection;
     FCache: TVmsIndexCache;
     FMedia: TMediaBuilder;
     FAuth: TAutenticador;
@@ -213,6 +233,13 @@ type
     function HandleJs(const NomeArquivo: string): TApiResponse;
     function HandleCss(const NomeArquivo: string): TApiResponse;
     function HandleLive(const Query: string): TApiResponse;
+    function HandlePtz(const Query: string): TApiResponse;
+    function HandleConfigCamerasGet: TApiResponse;
+    function HandleConfigCamerasPost(const Body: TBytes): TApiResponse;
+    function HandleProcurarPtz(const Body: TBytes): TApiResponse;
+    function CamerasAgora: TArray<string>;
+    function HandleCamerasUi: TApiResponse;
+    function ClienteOnvif(const Camera: string): TOnvifClient;
   public
     // O cache e a fonte de miniaturas vêm de fora, e o roteador não é dono de
     // nenhum dos dois: quem os cria é a composição, que é o único lugar que
@@ -233,6 +260,17 @@ type
     // Ligado pelo .dpr: e la que a API e a analise se encontram.
     property OnAnalyticsMudou: TProc read FOnAnalyticsMudou
                                      write FOnAnalyticsMudou;
+    // As cameras que mudaram desde a ultima vez, e limpa a lista.
+    //
+    // Chamada pela thread principal no laco dela. Devolver E limpar numa
+    // operacao so e o que evita perder um pedido que chegue entre a leitura e
+    // a limpeza. Nomes repetidos entram uma vez so: salvar tres vezes seguidas
+    // da um trabalho, nao tres.
+    function TomarCamerasPendentes: TArray<string>;
+    // A lista de cameras que a API reconhece. Trocada quando uma camera nova
+    // passa a existir -- sem isto ela gravaria, mas o /api/cameras nao a
+    // listaria e o ao vivo dela responderia "camera desconhecida".
+    procedure DefinirCameras(const Nomes: TArray<string>);
     property Cache: TVmsIndexCache read FCache;
     property Config: TApiConfig read FConfig;
   end;
@@ -441,11 +479,18 @@ begin
   if FConfig.MaxBlocksPerRequest <= 0 then
     FConfig.MaxBlocksPerRequest := API_DEFAULT_MAX_BLOCKS;
   FCameras := Copy(ACameras);
+  FCamerasLock := TCriticalSection.Create;
+  FPendentes := TStringList.Create;
+  FPendentes.Duplicates := dupIgnore;
+  FPendentes.Sorted := True;
   FHub := AHub;
   FLogger := ALogger;
   FCache := ACache;
   FMedia := TMediaBuilder.Create(FCache, FConfig.MaxBlocksPerRequest, ALogger);
   FAuth := TAutenticador.Create;
+  FOnvif := TObjectDictionary<string, TOnvifClient>.Create([doOwnsValues]);
+  FUltimoPtz := TDictionary<string, string>.Create;
+  FOnvifLock := TCriticalSection.Create;
   RecarregarAuth;
   // A interface E a pasta: faltando ela, ou um arquivo dela, não há tela
   // nenhuma. Dizer isso na subida evita descobrir pelo navegador, com uma
@@ -459,7 +504,7 @@ begin
       FLogger.Warn('api', 'faltam na interface (' + UiExplicacao + '): ' +
                           UiFaltando)
     else
-      FLogger.Info('api', 'interface em ' + UiExplicacao);
+      FLogger.Info('api', 'interface em ' + UiExplicacao + ' -- ' + UiCarimbo);
   end;
 end;
 
@@ -468,6 +513,11 @@ begin
   // O cache não é nosso: quem criou destrói.
   FMedia.Free;
   FAuth.Free;
+  FOnvif.Free;
+  FUltimoPtz.Free;
+  FOnvifLock.Free;
+  FPendentes.Free;
+  FCamerasLock.Free;
   inherited;
 end;
 
@@ -484,16 +534,57 @@ end;
 // O nome da câmera vem do cliente e vira parte de um caminho de arquivo. Aceitar
 // só o que está configurado resolve a travessia de diretório pela raiz: nada que
 // o cliente escreva chega ao sistema de arquivos.
+// A lista publicada, numa referencia propria.
+//
+// Copia a REFERENCIA, e nao o conteudo: quem publica sempre monta um vetor
+// novo, entao o que este aqui devolveu continua valido e imutavel mesmo depois
+// de outra thread trocar o campo. E por isso que o lock so envolve a leitura
+// do campo, e nao o laco de quem usa.
+function TApiRouter.CamerasAgora: TArray<string>;
+begin
+  FCamerasLock.Enter;
+  try
+    Result := FCameras;
+  finally
+    FCamerasLock.Leave;
+  end;
+end;
+
+procedure TApiRouter.DefinirCameras(const Nomes: TArray<string>);
+begin
+  FCamerasLock.Enter;
+  try
+    FCameras := Copy(Nomes);
+  finally
+    FCamerasLock.Leave;
+  end;
+end;
+
+function TApiRouter.TomarCamerasPendentes: TArray<string>;
+begin
+  Result := nil;
+  FCamerasLock.Enter;
+  try
+    if FPendentes.Count = 0 then Exit;
+    Result := FPendentes.ToStringArray;
+    FPendentes.Clear;
+  finally
+    FCamerasLock.Leave;
+  end;
+end;
+
 function TApiRouter.KnownCamera(const Name: string; out Canonical: string): Boolean;
 var
+  Lista: TArray<string>;
   I: Integer;
 begin
   Canonical := '';
   if Trim(Name) = '' then Exit(False);
-  for I := 0 to High(FCameras) do
-    if SameText(FCameras[I], Name) then
+  Lista := CamerasAgora;
+  for I := 0 to High(Lista) do
+    if SameText(Lista[I], Name) then
     begin
-      Canonical := FCameras[I];
+      Canonical := Lista[I];
       Exit(True);
     end;
   Result := False;
@@ -684,6 +775,8 @@ begin
       Exit(HandleAppUi);
     if SameText(Path, UI_PREFIX + 'player') then
       Exit(HandlePlayerUi);
+    if SameText(Path, UI_PREFIX + 'cameras') then
+      Exit(HandleCamerasUi);
     // A folha comum a TODAS as páginas: a paleta, a base do documento e os
     // poucos componentes que aparecem em mais de uma tela. Solta pelo mesmo
     // motivo dos scripts -- a cor passa a existir num lugar só, e o navegador
@@ -717,6 +810,25 @@ begin
         Exit(TApiResponse.Error(405, 'use GET ou POST'));
       Exit(HandleSettingsGet);
     end;
+    // O cadastro das cameras. Separado do /api/cameras, que e a lista curta que
+    // as telas de assistir usam: aqui vem a configuracao inteira, e daqui ela
+    // se altera.
+    // A procura roda AQUI, e nao no navegador de quem abriu a tela: e esta
+    // maquina que vai mandar o comando de PTZ depois.
+    if SameText(Path, API_PREFIX + 'config/ptz/procurar') then
+    begin
+      if not SameText(Method, 'POST') then
+        Exit(TApiResponse.Error(405, 'use POST'));
+      Exit(HandleProcurarPtz(Body));
+    end;
+    if SameText(Path, API_PREFIX + 'config/cameras') then
+    begin
+      if SameText(Method, 'POST') then
+        Exit(HandleConfigCamerasPost(Body));
+      if not (SameText(Method, 'GET') or SameText(Method, 'HEAD')) then
+        Exit(TApiResponse.Error(405, 'use GET ou POST'));
+      Exit(HandleConfigCamerasGet);
+    end;
     if not (SameText(Method, 'GET') or SameText(Method, 'HEAD')) then
       Exit(TApiResponse.Error(405, 'so GET e HEAD'));
 
@@ -732,6 +844,8 @@ begin
     // arquivo quando ela não está publicando. Ver HandleLive.
     else if SameText(Path, API_PREFIX + 'live') then
       Result := HandleLive(Query)
+    else if SameText(Path, API_PREFIX + 'ptz') then
+      Result := HandlePtz(Query)
     else if SameText(Path, API_PREFIX + 'recordings') then
       Result := HandleRecordings(Query)
     else if SameText(Path, API_PREFIX + 'index') then
@@ -1640,8 +1754,580 @@ begin
     'X-Vms-Thinned: 0');
 end;
 
+// Mover a camera, por ONVIF.
+//
+//   GET /api/ptz?camera=X&acao=mover&pan=-1..1&tilt=-1..1&zoom=-1..1
+//   GET /api/ptz?camera=X&acao=parar
+//   GET /api/ptz?camera=X&acao=presets
+//   GET /api/ptz?camera=X&acao=ir&preset=TOKEN
+//   GET /api/ptz?camera=X&acao=testar
+//
+// O comando vem para CA, e nao do aparelho direto para a camera, pelo mesmo
+// motivo de todo o resto: quem enxerga a camera e o servidor. O telefone pode
+// estar em outra rede, e frequentemente esta.
+//
+// `mover` e movimento CONTINUO: a camera anda ate mandarem parar. E o que casa
+// com botao que se segura, e e por isso que `parar` existe como comando separado
+// -- soltar o botao tem de chegar aqui, senao a camera gira sozinha ate bater no
+// fim do curso. Quem chama e responsavel por mandar o parar.
+//
+// O endereco do servico sai da URL de midia da camera (mesma maquina, HTTP,
+// caminho da norma). Camera que atende ONVIF noutra porta ou noutro caminho
+// ganha a chave `ptz.<camera>.xaddr` nos parametros do servidor.
+function TApiRouter.ClienteOnvif(const Camera: string): TOnvifClient;
+var
+  Url, Usuario, Senha, XAddr: string;
+begin
+  Result := nil;
+  if (FDb = nil) or (not FDb.IsOpen) then Exit;
+
+  FOnvifLock.Enter;
+  try
+    if FOnvif.TryGetValue(LowerCase(Camera), Result) then Exit;
+  finally
+    FOnvifLock.Leave;
+  end;
+
+  // A primeira rota da camera: e a que o gravador usa, e a que responde.
+  Url := '';
+  FDb.Read('SELECT e.url, e.user_name, e.password FROM camera_endpoint e ' +
+           'JOIN camera c ON c.id = e.camera_id ' +
+           'WHERE c.name = ? ORDER BY e.ord LIMIT 1', [Camera],
+    procedure(const Row: IDbRow)
+    begin
+      Url := Row.AsString('url');
+      Usuario := Row.AsString('user_name');
+      Senha := Row.AsString('password');
+    end);
+  if Url = '' then Exit;
+
+  XAddr := '';
+  FDb.Read('SELECT value FROM setting WHERE key = ?',
+           ['ptz.' + LowerCase(Camera) + '.xaddr'],
+    procedure(const Row: IDbRow)
+    begin
+      XAddr := Trim(Row.AsString('value'));
+    end);
+  // SO o que a chave disser. Sem palpite de porta 80 quando ela esta vazia:
+  // medido, perguntar por uma camera sem ONVIF custava 8 segundos de espera
+  // numa porta que nao existe, e a tela pergunta ate sete vezes ao abrir o ao
+  // vivo. Camera fixa responde "sem endereco" na hora, que e o que se quer.
+  //
+  // Quem tem ONVIF na 80 escreve "<ip>" na chave e segue igual; o botao
+  // Procurar da tela de cameras preenche isso sozinho.
+  if Trim(XAddr) = '' then Exit;
+  // EnderecoOnvif aceita as mesmas tres formas que o campo do app: so o host,
+  // host com porta, ou a URL inteira.
+  XAddr := EnderecoOnvif(XAddr, Url);
+
+  Result := TOnvifClient.Create(XAddr, Usuario, Senha, FLogger,
+                                'ptz.' + Camera);
+  FOnvifLock.Enter;
+  try
+    // Outra thread pode ter criado o mesmo enquanto esta falava com o banco: o
+    // dicionario e dono, entao o perdedor devolve o que ja estava la.
+    if FOnvif.ContainsKey(LowerCase(Camera)) then
+    begin
+      Result.Free;
+      FOnvif.TryGetValue(LowerCase(Camera), Result);
+    end
+    else
+      FOnvif.Add(LowerCase(Camera), Result);
+  finally
+    FOnvifLock.Leave;
+  end;
+end;
+
+function TApiRouter.HandlePtz(const Query: string): TApiResponse;
+var
+  Camera, Acao, Comando: string;
+  Passo, Canal: Integer;
+  Dir: string;
+  Sessao: IPtzSession;
+  Cli: TOnvifClient;
+  Root: TJSONObject;
+  Arr: TJSONArray;
+  Item: TJSONObject;
+  Presets: TArray<TOnvifPreset>;
+  I: Integer;
+  Ok: Boolean;
+
+  function Num(const Nome: string): Double;
+  var
+    S: string;
+  begin
+    // Em milesimos, e nao decimal na query: assim nao ha ponto nem virgula para
+    // o cliente errar, e a conversao de volta e uma divisao.
+    S := Trim(QueryValue(Query, Nome));
+    if S = '' then Exit(0);
+    Result := StrToIntDef(S, 0) / 1000;
+  end;
+
+begin
+  if not KnownCamera(QueryValue(Query, 'camera'), Camera) then
+    Exit(TApiResponse.Error(404, 'camera desconhecida'));
+
+  Acao := LowerCase(Trim(QueryValue(Query, 'acao')));
+
+  // DVRIP primeiro, quando ha sessao viva: o comando sai pela conexao que ja
+  // esta autenticada -- a mesma que grava -- e nao custa um login por clique.
+  // Estas cameras nao respondem ONVIF (medido: a porta 80 delas recusa
+  // conexao), entao para elas este e o unico caminho.
+  Sessao := TPtzRegistry.Achar(Camera);
+  if Sessao <> nil then
+  begin
+    Comando := '';
+    Passo := 5;
+    // Zero serve para camera solta, que e o caso das daqui; o parametro existe
+    // porque nem toda camera concorda com isso e descobrir qual e a certa e
+    // trabalho de tentativa, nao de leitura.
+    Canal := StrToIntDef(Trim(QueryValue(Query, 'canal')), 0);
+        if Acao = 'mover' then
+    begin
+      Comando := ComandoDvripDe(Num('pan'), Num('tilt'), Num('zoom'));
+      Passo := PassoDvripDe(Num('pan'), Num('tilt'), Num('zoom'));
+      if Comando = '' then
+        Exit(TApiResponse.Error(400, 'direcao vazia: informe pan, tilt ou zoom'));
+      FUltimoPtz.AddOrSetValue(LowerCase(Camera), Comando);
+      Ok := Sessao.MoverPtz(Comando, Passo, Canal, True);
+    end
+    else if Acao = 'parar' then
+    begin
+      // A parada repete o comando que estava andando: e a mesma mensagem com
+      // outro Preset, e a camera espera reconhecer qual movimento parar. Sem
+      // saber o anterior, para pela esquerda -- que e o que a captura mostrou
+      // e o que as cameras aceitam como "pare tudo".
+      if not FUltimoPtz.TryGetValue(LowerCase(Camera), Comando) then
+        Comando := DVRIP_PTZ_ESQUERDA;
+      Ok := Sessao.MoverPtz(Comando, Passo, Canal, False);
+    end
+    else if (Acao = 'foco') or (Acao = 'iris') then
+    begin
+      // Andam enquanto se segura, como as direcoes: mesma mensagem, so muda o
+      // nome do comando. Quem para e o `parar`, que repete o ultimo enviado.
+      Dir := LowerCase(Trim(QueryValue(Query, 'dir')));
+      if Acao = 'foco' then
+      begin
+        if Dir = 'perto' then Comando := DVRIP_PTZ_FOCO_PERTO
+        else if Dir = 'longe' then Comando := DVRIP_PTZ_FOCO_LONGE;
+      end
+      else
+      begin
+        if Dir = 'abrir' then Comando := DVRIP_PTZ_IRIS_ABRE
+        else if Dir = 'fechar' then Comando := DVRIP_PTZ_IRIS_FECHA;
+      end;
+      if Comando = '' then
+          Exit(TApiResponse.Error(400, 'informe dir'));
+      FUltimoPtz.AddOrSetValue(LowerCase(Camera), Comando);
+      Ok := Sessao.MoverPtz(Comando, Passo, Canal, True);
+    end
+    else if Acao = 'ronda' then
+    begin
+      // De um disparo so: o proprio nome do comando ja diz comecar ou parar.
+      if Trim(QueryValue(Query, 'ligar')) = '0' then Comando := DVRIP_PTZ_RONDA_FIM
+      else Comando := DVRIP_PTZ_RONDA_INI;
+      Ok := Sessao.MoverPtz(Comando, Passo, Canal, True);
+    end
+    else if Acao = 'preset' then
+    begin
+      // Sem parada depois: quem vai a um preset para sozinho ao chegar.
+      Passo := StrToIntDef(Trim(QueryValue(Query, 'n')), -1);
+      if Passo < 0 then
+        Exit(TApiResponse.Error(400, 'informe n, o numero do preset'));
+      // Ir e o padrao: e o que se faz o tempo todo. Gravar e apagar existem
+      // para a tela poder oferecer "guardar esta posicao" sem outra rota.
+      Dir := LowerCase(Trim(QueryValue(Query, 'op')));
+      if Dir = 'gravar' then Comando := DVRIP_PTZ_PRESET_POR
+      else if Dir = 'apagar' then Comando := DVRIP_PTZ_PRESET_LIMPA
+      else Comando := DVRIP_PTZ_PRESET_IR;
+      Ok := Sessao.IrParaPreset(Passo, Canal, Comando);
+    end
+    else if Acao = 'config' then
+    begin
+      // Diagnostico: pergunta a camera o que ela sabe. A resposta sai no log,
+      // com a marca ctrl:, porque quem le o socket e outra thread.
+      Comando := Trim(QueryValue(Query, 'nome'));
+      if Comando = '' then
+        Exit(TApiResponse.Error(400, 'informe nome, a secao da configuracao'));
+      Ok := Sessao.PerguntarConfig(Comando);
+    end
+    else if Acao = 'testar' then
+      Ok := True
+    else
+      Exit(TApiResponse.Error(400, Acao + ' nao existe no DVRIP: use mover, ' +
+                                   'parar, foco, iris, ronda, preset, config ou testar'));
+
+    Root := TJSONObject.Create;
+    Root.AddPair('camera', Camera);
+    Root.AddPair('acao', Acao);
+    Root.AddPair('via', 'dvrip');
+    Root.AddPair('ok', TJSONBool.Create(Ok));
+    if Comando <> '' then Root.AddPair('comando', Comando);
+    if not Ok then Root.AddPair('motivo', 'nao consegui escrever na sessao');
+    Exit(TApiResponse.FromJson(Root));
+  end;
+
+  Cli := ClienteOnvif(Camera);
+  if Cli = nil then
+    Exit(TApiResponse.Error(503,
+      'camera sem sessao DVRIP viva e sem cadastro utilizavel para ONVIF'));
+  Presets := nil;
+  if Acao = 'parar' then
+    Ok := Cli.Parar
+  else if Acao = 'mover' then
+    Ok := Cli.MoverContinuo(TOnvifMove.Criar(Num('pan'), Num('tilt'), Num('zoom')))
+  else if (Acao = 'ir') or (Acao = 'preset') then
+    // Dois nomes para a mesma coisa: `ir` e o que esta rota ja aceitava, e
+    // `preset` e o que a tela manda, igual ao DVRIP. O valor vem em `preset`
+    // ou em `n`, o que estiver preenchido.
+    Ok := Cli.IrParaPreset(Trim(QueryValue(Query, 'preset')) +
+                           Trim(QueryValue(Query, 'n')))
+  else if Acao = 'presets' then
+    Ok := Cli.LerPresets(Presets)
+  else if Acao = 'testar' then
+    Ok := Cli.Preparar
+  else
+    Exit(TApiResponse.Error(400, 'acao invalida: use mover, parar, presets, ' +
+                                 'ir ou testar'));
+
+  Root := TJSONObject.Create;
+  Root.AddPair('camera', Camera);
+  Root.AddPair('acao', Acao);
+  Root.AddPair('via', 'onvif');
+  Root.AddPair('ok', TJSONBool.Create(Ok));
+  // O motivo vai junto MESMO quando deu certo estar vazio: e ele que diz se a
+  // camera nao tem PTZ, se recusou a senha ou se nem respondeu, e sem ele a
+  // tela so teria "nao funcionou".
+  if not Ok then Root.AddPair('motivo', Cli.Motivo);
+  if Acao = 'testar' then
+  begin
+    Root.AddPair('ptz', TJSONBool.Create(Cli.TemPtz));
+    Root.AddPair('servico', Cli.PtzUrl);
+    Root.AddPair('perfil', Cli.Perfil);
+  end;
+  if Acao = 'presets' then
+  begin
+    Arr := TJSONArray.Create;
+    Root.AddPair('presets', Arr);
+    for I := 0 to High(Presets) do
+    begin
+      Item := TJSONObject.Create;
+      Item.AddPair('token', Presets[I].Token);
+      Item.AddPair('nome', Presets[I].Nome);
+      Arr.AddElement(Item);
+    end;
+  end;
+  Result := TApiResponse.FromJson(Root);
+end;
+
+// Em que porta esta camera atende ONVIF, vista DESTE servidor.
+//
+// POST, e nao GET com query: leva a senha da camera, e senha em URL fica no
+// historico e em qualquer registro de acesso pelo caminho.
+function TApiRouter.HandleProcurarPtz(const Body: TBytes): TApiResponse;
+var
+  Texto, Host: string;
+  Valor: TJSONValue;
+  Obj, Root, Item: TJSONObject;
+  Arr: TJSONArray;
+  Achados: TArray<TOnvifAchado>;
+  I: Integer;
+  Melhor: string;
+begin
+  Texto := TEncoding.UTF8.GetString(Body);
+  if Trim(Texto) = '' then
+    Exit(TApiResponse.Error(400, 'corpo vazio'));
+  Valor := TJSONObject.ParseJSONValue(Texto);
+  if not (Valor is TJSONObject) then
+  begin
+    Valor.Free;
+    Exit(TApiResponse.Error(400, 'mande {url, user, password}'));
+  end;
+  try
+    Obj := TJSONObject(Valor);
+    Host := HostDaUrl(Obj.GetValue<string>('url', ''));
+    if Host = '' then
+      Exit(TApiResponse.Error(400, 'a url nao tem host'));
+    Achados := ProcurarOnvif(Host, Obj.GetValue<string>('user', ''),
+                             Obj.GetValue<string>('password', ''), FLogger);
+  finally
+    Valor.Free;
+  end;
+
+  Melhor := '';
+  Root := TJSONObject.Create;
+  Arr := TJSONArray.Create;
+  Root.AddPair('host', Host);
+  Root.AddPair('achados', Arr);
+  for I := 0 to High(Achados) do
+  begin
+    Item := TJSONObject.Create;
+    Item.AddPair('porta', TJSONNumber.Create(Achados[I].Porta));
+    Item.AddPair('ptz', TJSONBool.Create(Achados[I].TemPtz));
+    Arr.AddElement(Item);
+    if Achados[I].TemPtz and (Melhor = '') then
+      Melhor := Host + ':' + IntToStr(Achados[I].Porta);
+  end;
+  // Vazio nao e erro: e camera que nao fala ONVIF, ou que fala e nao se move.
+  Root.AddPair('melhor', Melhor);
+  Result := TApiResponse.FromJson(Root);
+end;
+
+function TApiRouter.HandleCamerasUi: TApiResponse;
+begin
+  Result := HandleUiArquivo('cameras-ui.html', 'text/html; charset=utf-8');
+end;
+
+// O cadastro inteiro das cameras deste servidor.
+//
+// SEM as senhas. Elas nao voltam nem mascaradas com o tamanho certo: a tela nao
+// precisa delas para nada, e o que nao sai daqui nao vaza pelo cache do
+// navegador, pelo historico nem por uma captura de tela. No lugar vai um
+// `temSenha`, que e o que a tela precisa mostrar -- e, na hora de gravar, campo
+// de senha vazio quer dizer "mantenha a que ja esta la".
+function TApiRouter.HandleConfigCamerasGet: TApiResponse;
+var
+  Root: TJSONObject;
+  Arr, Eps: TJSONArray;
+  Cam: TJSONObject;
+  Ids: TList<Int64>;
+  I: Integer;
+  Xaddr: string;
+begin
+  if (FDb = nil) or (not FDb.IsOpen) then
+    Exit(TApiResponse.Error(503, 'banco indisponivel'));
+
+  Root := TJSONObject.Create;
+  Arr := TJSONArray.Create;
+  Root.AddPair('cameras', Arr);
+  Ids := TList<Int64>.Create;
+  try
+    FDb.Read('SELECT id, name, enabled, record_audio FROM camera ' +
+             'ORDER BY name COLLATE NOCASE', [],
+      procedure(const Row: IDbRow)
+      var
+        O: TJSONObject;
+      begin
+        O := TJSONObject.Create;
+        O.AddPair('id', TJSONNumber.Create(Row.AsInt64('id')));
+        O.AddPair('name', Row.AsString('name'));
+        O.AddPair('enabled', TJSONBool.Create(Row.AsBool('enabled')));
+        O.AddPair('recordAudio', TJSONBool.Create(Row.AsBool('record_audio')));
+        Arr.AddElement(O);
+        Ids.Add(Row.AsInt64('id'));
+      end);
+
+    for I := 0 to Ids.Count - 1 do
+    begin
+      Cam := Arr.Items[I] as TJSONObject;
+      Eps := TJSONArray.Create;
+      Cam.AddPair('endpoints', Eps);
+      FDb.Read('SELECT ord, label, url, user_name, password, transports, ' +
+               '  uses_tailscale FROM camera_endpoint WHERE camera_id = ? ' +
+               'ORDER BY ord', [Ids[I]],
+        procedure(const Row: IDbRow)
+        var
+          E: TJSONObject;
+        begin
+          E := TJSONObject.Create;
+          E.AddPair('label', Row.AsString('label'));
+          E.AddPair('url', Row.AsString('url'));
+          E.AddPair('user', Row.AsString('user_name'));
+          // A senha NAO vai; so o fato de existir uma.
+          E.AddPair('temSenha', TJSONBool.Create(Row.AsString('password') <> ''));
+          E.AddPair('transport', Row.AsString('transports'));
+          E.AddPair('tailscale', TJSONBool.Create(Row.AsBool('uses_tailscale')));
+          Eps.AddElement(E);
+        end);
+
+      Xaddr := '';
+      FDb.Read('SELECT value FROM setting WHERE key = ?',
+               ['ptz.' + LowerCase(Cam.GetValue<string>('name', '')) + '.xaddr'],
+        procedure(const Row: IDbRow)
+        begin
+          Xaddr := Row.AsString('value');
+        end);
+      Cam.AddPair('ptz', Xaddr);
+    end;
+  finally
+    Ids.Free;
+  end;
+  Result := TApiResponse.FromJson(Root);
+end;
+
+// Cria ou altera UMA camera.
+//
+// O nome nao se altera depois de criado, e a recusa e proposital: ele e o nome
+// da pasta em disco, o da rota RTSP e o parametro ?camera= de tudo. Renomear
+// aqui separaria a camera das gravacoes dela, que continuariam na pasta antiga.
+//
+// Nao ha apagar. Apagar a linha da camera leva junto, por cascata, o inventario
+// das gravacoes, os eventos e as miniaturas dela -- o historico inteiro, sendo
+// que os .vms continuariam ocupando disco sem ninguem que os indexe. Quem quer
+// parar uma camera desmarca "habilitada": a gravacao para e o passado continua
+// aberto para consulta.
+function TApiRouter.HandleConfigCamerasPost(const Body: TBytes): TApiResponse;
+var
+  Texto, Nome, NomeAtual, Ptz: string;
+  Valor: TJSONValue;
+  Obj, Root, EpObj: TJSONObject;
+  Eps: TJSONArray;
+  Id: Int64;
+  I, Ord_: Integer;
+  Agora: Int64;
+  Antigas: TDictionary<Integer, string>;
+  Senha, Url: string;
+  Ligada, ComAudio: Boolean;
+begin
+  if (FDb = nil) or (not FDb.IsOpen) then
+    Exit(TApiResponse.Error(503, 'banco indisponivel'));
+
+  Texto := TEncoding.UTF8.GetString(Body);
+  if Trim(Texto) = '' then
+    Exit(TApiResponse.Error(400, 'corpo vazio'));
+  Valor := TJSONObject.ParseJSONValue(Texto);
+  if not (Valor is TJSONObject) then
+  begin
+    Valor.Free;
+    Exit(TApiResponse.Error(400, 'esperava um objeto JSON'));
+  end;
+
+  Antigas := TDictionary<Integer, string>.Create;
+  try
+    Obj := TJSONObject(Valor);
+    Nome := Trim(Obj.GetValue<string>('name', ''));
+    Id := Obj.GetValue<Int64>('id', 0);
+    Ligada := Obj.GetValue<Boolean>('enabled', True);
+    ComAudio := Obj.GetValue<Boolean>('recordAudio', True);
+    Ptz := Trim(Obj.GetValue<string>('ptz', ''));
+
+    if Nome = '' then
+      Exit(TApiResponse.Error(400, 'a camera precisa de um nome'));
+    // O nome vira pasta em disco: o que nao serve num caminho nao serve aqui.
+    if (Pos('/', Nome) > 0) or (Pos('\', Nome) > 0) or (Pos(':', Nome) > 0) or
+       (Pos('..', Nome) > 0) then
+      Exit(TApiResponse.Error(400,
+        'o nome vira pasta em disco: sem / \ : nem ..'));
+
+    if not (Obj.GetValue('endpoints') is TJSONArray) then
+      Exit(TApiResponse.Error(400, 'informe ao menos um endereco em endpoints'));
+    Eps := Obj.GetValue('endpoints') as TJSONArray;
+    if Eps.Count = 0 then
+      Exit(TApiResponse.Error(400, 'informe ao menos um endereco em endpoints'));
+    for I := 0 to Eps.Count - 1 do
+    begin
+      if not (Eps.Items[I] is TJSONObject) then
+        Exit(TApiResponse.Error(400, 'endpoint invalido'));
+      if Trim((Eps.Items[I] as TJSONObject).GetValue<string>('url', '')) = '' then
+        Exit(TApiResponse.Error(400, 'endereco sem url'));
+    end;
+
+    Agora := DateTimeToUnix(TTimeZone.Local.ToUniversalTime(Now), True) * 1000;
+
+    if Id > 0 then
+    begin
+      NomeAtual := '';
+      FDb.Read('SELECT name FROM camera WHERE id = ?', [Id],
+        procedure(const Row: IDbRow)
+        begin
+          NomeAtual := Row.AsString('name');
+        end);
+      if NomeAtual = '' then
+        Exit(TApiResponse.Error(404, 'nao ha camera com este id'));
+      if not SameText(NomeAtual, Nome) then
+        Exit(TApiResponse.Error(400,
+          'o nome e a pasta em disco e a rota da camera: renomear a separaria ' +
+          'das gravacoes dela. Crie outra camera.'));
+      // So o que esta tela edita. As outras colunas (atrasos, reconexao) ficam
+      // como estao: sobrescreve-las com padroes apagaria ajuste feito a mao.
+      FDb.Exec('UPDATE camera SET enabled = ?, record_audio = ?, ' +
+               '  updated_at_ms = ? WHERE id = ?',
+               [Ord(Ligada), Ord(ComAudio), Agora, Id]);
+    end
+    else
+    begin
+      if FDb.ReadInt64('SELECT COUNT(*) AS n FROM camera WHERE name = ?',
+                       [Nome], 'n', 0) > 0 then
+        Exit(TApiResponse.Error(409, 'ja existe uma camera com este nome'));
+      FDb.Exec('INSERT INTO camera (name, enabled, record_audio, ' +
+               '  created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?)',
+               [Nome, Ord(Ligada), Ord(ComAudio), Agora, Agora]);
+      Id := FDb.ReadInt64('SELECT id AS n FROM camera WHERE name = ?',
+                          [Nome], 'n', 0);
+      if Id <= 0 then
+        Exit(TApiResponse.Error(500, 'gravei a camera e nao a encontrei'));
+    end;
+
+    // As senhas que ja estao la, por posicao. Campo vazio na tela quer dizer
+    // "mantenha": a tela nunca recebeu a senha, entao ela nao teria como
+    // devolve-la, e sem isto salvar qualquer outro campo apagaria a senha.
+    FDb.Read('SELECT ord, password FROM camera_endpoint WHERE camera_id = ?',
+             [Id],
+      procedure(const Row: IDbRow)
+      begin
+        Antigas.AddOrSetValue(Row.AsInt('ord'), Row.AsString('password'));
+      end);
+
+    // Apaga e regrava: e a unica forma simples de refletir a remocao de um
+    // caminho, e a lista tem tres itens no maximo.
+    FDb.Exec('DELETE FROM camera_endpoint WHERE camera_id = ?', [Id]);
+    for I := 0 to Eps.Count - 1 do
+    begin
+      EpObj := Eps.Items[I] as TJSONObject;
+      Ord_ := I;
+      Url := Trim(EpObj.GetValue<string>('url', ''));
+      Senha := EpObj.GetValue<string>('password', '');
+      if Senha = '' then
+        if not Antigas.TryGetValue(Ord_, Senha) then Senha := '';
+      FDb.Exec('INSERT INTO camera_endpoint (camera_id, ord, label, url, ' +
+               '  user_name, password, transports, uses_tailscale) ' +
+               'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+               [Id, Ord_, EpObj.GetValue<string>('label', ''), Url,
+                EpObj.GetValue<string>('user', ''), Senha,
+                EpObj.GetValue<string>('transport', 'tcp,udp'),
+                Ord(EpObj.GetValue<Boolean>('tailscale', False))]);
+    end;
+
+    // O endereco de ONVIF mora em `setting`, e nao numa coluna da camera,
+    // porque e o mesmo lugar de onde o /api/ptz ja o le hoje.
+    if Ptz <> '' then
+      FDb.Exec('INSERT INTO setting (key, value, updated_at_ms) ' +
+               'VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET ' +
+               '  value = excluded.value, updated_at_ms = excluded.updated_at_ms',
+               ['ptz.' + LowerCase(Nome) + '.xaddr', Ptz, Agora])
+    else
+      FDb.Exec('DELETE FROM setting WHERE key = ?',
+               ['ptz.' + LowerCase(Nome) + '.xaddr']);
+
+    // O pedido para a thread principal. Ver TomarCamerasPendentes.
+    FCamerasLock.Enter;
+    try
+      FPendentes.Add(Nome);
+    finally
+      FCamerasLock.Leave;
+    end;
+
+    if FLogger <> nil then
+      FLogger.Info('api', Format('cadastro da camera %s gravado (%d enderecos)',
+                                 [Nome, Eps.Count]));
+
+    Root := TJSONObject.Create;
+    Root.AddPair('id', TJSONNumber.Create(Id));
+    Root.AddPair('name', Nome);
+    // A captura tambem passa a valer, so que nao neste instante: quem a troca
+    // e a thread principal, na proxima volta do laco dela. Segundos, nao a
+    // proxima subida do servidor.
+    Root.AddPair('aplicando', TJSONBool.Create(True));
+    Result := TApiResponse.FromJson(Root);
+  finally
+    Antigas.Free;
+    Valor.Free;
+  end;
+end;
+
 function TApiRouter.HandleCameras: TApiResponse;
 var
+  Lista: TArray<string>;
   Root, Item: TJSONObject;
   Arr: TJSONArray;
   I, J: Integer;
@@ -1657,12 +2343,16 @@ begin
   Root.AddPair('events', TJSONBool.Create((FEvents <> nil) and FEvents.Available));
   Root.AddPair('thumbs', TJSONBool.Create((FThumbs <> nil) and FThumbs.Available));
   Root.AddPair('cameras', Arr);
-  for I := 0 to High(FCameras) do
+  // Numa referencia propria: outra thread pode publicar uma lista nova no meio
+  // deste laco, e ler o campo a cada volta daria metade de uma e metade da
+  // outra. Ver CamerasAgora.
+  Lista := CamerasAgora;
+  for I := 0 to High(Lista) do
   begin
-    Files := FCache.ListFiles(FCameras[I]);
+    Files := FCache.ListFiles(Lista[I]);
     Item := TJSONObject.Create;
-    Item.AddPair('name', FCameras[I]);
-    Item.AddPair('live', TJSONBool.Create(IsLive(FCameras[I])));
+    Item.AddPair('name', Lista[I]);
+    Item.AddPair('live', TJSONBool.Create(IsLive(Lista[I])));
     Item.AddPair('files', TJSONNumber.Create(Length(Files)));
     Bytes := 0;
     for J := 0 to High(Files) do

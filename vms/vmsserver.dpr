@@ -29,6 +29,7 @@ uses
   VMS.Domain.MediaSink in '..\src\Domain\VMS.Domain.MediaSink.pas',
   VMS.Domain.Reconnect in '..\src\Domain\VMS.Domain.Reconnect.pas',
   VMS.Domain.Session in '..\src\Domain\VMS.Domain.Session.pas',
+  VMS.Domain.Ptz in '..\src\Domain\VMS.Domain.Ptz.pas',
   VMS.Domain.Supervisor in '..\src\Domain\VMS.Domain.Supervisor.pas',
   VMS.Net.Intf in '..\src\Net\VMS.Net.Intf.pas',
   VMS.Net.Tcp in '..\src\Net\VMS.Net.Tcp.pas',
@@ -85,6 +86,7 @@ uses
   Tx.Server.Listener in 'src\Server\Tx.Server.Listener.pas',
   // ---- deste app ----
   Vms.Server.LiveHub in 'src\Live\Vms.Server.LiveHub.pas',
+  Vms.Onvif.Client in 'src\Onvif\Vms.Onvif.Client.pas',
   Vms.Server.IndexCache in 'src\Api\Vms.Server.IndexCache.pas',
   Vms.Server.Media in 'src\Api\Vms.Server.Media.pas',
   Vms.Server.Api in 'src\Api\Vms.Server.Api.pas',
@@ -180,6 +182,55 @@ begin
   Result := GetCurrentDir + PathDelim + ConfigName;
 end;
 
+// Poe UMA camera no estado que o banco descreve: para a que estiver rodando,
+// monta a nova se ela estiver habilitada, e avisa a analise.
+//
+// Serve aos tres casos com o mesmo codigo, e e por isso que ela fala em
+// "reconciliar" e nao em "acrescentar": criar e parar-nada-e-montar, alterar e
+// parar-e-montar, desabilitar e parar-e-nao-montar.
+procedure ReconciliarCamera(const Nome: string; const App: TAppConfig;
+  Supervisors: TAppSupervisorList; Hub: TLiveHub;
+  var Analytics: TAnalyticsRig; const Logger: ILogger; const Clock: IClock);
+var
+  I: Integer;
+  Novo: TCameraSupervisor;
+  Achou: Boolean;
+begin
+  // A que estiver rodando sai primeiro, SEMPRE: duas sessoes na mesma camera
+  // gravariam o mesmo video em dois arquivos e brigariam pelo mesmo nome.
+  for I := Supervisors.Count - 1 downto 0 do
+    if SameText(Supervisors[I].Camera, Nome) then
+    begin
+      Logger.Info('main', Format('camera %s: parando a captura atual', [Nome]));
+      Supervisors[I].Stop;
+      // A lista e dona: remover destroi, e o destrutor espera a thread.
+      Supervisors.Delete(I);
+    end;
+
+  Achou := False;
+  for I := 0 to High(App.Cameras) do
+    if SameText(App.Cameras[I].Name, Nome) then
+    begin
+      Achou := True;
+      Novo := MontarSupervisor(App, App.Cameras[I], Logger, Clock, Hub);
+      if Novo <> nil then
+      begin
+        Supervisors.Add(Novo);
+        Novo.Start;
+        Logger.Info('main', Format('camera %s: captura no ar', [Nome]));
+        // So depois de existir captura: analise em camera sem gravacao nao
+        // teria arquivo nenhum para percorrer.
+        Analytics.AcrescentarCamera(Nome);
+      end
+      else
+        Logger.Info('main', Format('camera %s: desabilitada, sem captura', [Nome]));
+      Break;
+    end;
+  if not Achou then
+    Logger.Warn('main', Format('camera %s mudou e sumiu do banco; sem captura',
+                               [Nome]));
+end;
+
 procedure RunApp;
 var
   ConfigPath, StorageDir, BindAddress: string;
@@ -206,6 +257,9 @@ var
   Clock: IClock;
   Supervisors: TAppSupervisorList;
   Listener: TTxServerListener;
+  // O lote de cameras que a API anotou, e a releitura da configuracao.
+  Pendentes: TArray<string>;
+  Recarga: TDbConfig;
   I: Integer;
 begin
   ConfigPath := ResolveConfigPath;
@@ -399,7 +453,37 @@ begin
           end;
           Logger.Info('main', 'No ar. Ctrl+C para parar.');
 
-          while GStopEvent.WaitFor(500) <> wrSignaled do ;
+          // O laco de sempre, agora com uma tarefa: aplicar as mudancas de
+          // camera que a API anotou. Ver TApiRouter.TomarCamerasPendentes.
+          while GStopEvent.WaitFor(500) <> wrSignaled do
+          begin
+            if Api = nil then Continue;
+            Pendentes := Api.TomarCamerasPendentes;
+            if Length(Pendentes) = 0 then Continue;
+
+            // Rele a configuracao INTEIRA do banco, uma vez por lote: o que
+            // passa a valer e exatamente o que ficou gravado, com os mesmos
+            // limites e padroes que valeriam numa subida.
+            Recarga := TDbConfig.Create(Db, Boot);
+            try
+              Recarga.Load;
+              App := Recarga.Config;
+            finally
+              Recarga.Free;
+            end;
+
+            // A API primeiro: sem isto a camera nova gravaria, mas o
+            // /api/cameras nao a listaria e o ao vivo dela responderia
+            // "camera desconhecida".
+            SetLength(CameraNames, Length(App.Cameras));
+            for I := 0 to High(App.Cameras) do
+              CameraNames[I] := App.Cameras[I].Name;
+            Api.DefinirCameras(CameraNames);
+
+            for I := 0 to High(Pendentes) do
+              ReconciliarCamera(Pendentes[I], App, Supervisors, Hub, Analytics,
+                                Logger, Clock);
+          end;
 
           Logger.Info('main', 'Parando...');
           Listener.Stop;

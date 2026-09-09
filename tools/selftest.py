@@ -11,8 +11,11 @@ mesmas contas, sobre os mesmos bytes.
   python selftest.py [-v]
 """
 
+import base64
+import hashlib
 import io
 import os
+import re
 import shutil
 import struct
 import sys
@@ -1225,6 +1228,819 @@ def teste_bloco_do_anel_ao_vivo(_pasta):
     check('o zero que o cliente manda ao abrir nao passa', le_cursor('0') is None)
 
 
+def teste_onvif(_pasta):
+    """As tres regras puras do cliente ONVIF: digest, leitura do XML e endereco.
+
+    O resto do cliente e conversa em rede e so se prova contra uma camera. Estas
+    tres nao: sao conta e texto, e sao exatamente onde a integracao costuma
+    quebrar calada -- o digest errado devolve "sender not authorized" sem dizer
+    por que, e a leitura errada do XAddr manda o comando para o servico errado.
+    """
+    print('cliente ONVIF')
+
+    # ------------------------------------------------------------- o digest
+    #
+    # WS-Security UsernameToken: base64(sha1(nonce + created + senha)), com o
+    # nonce nos BYTES crus, e nao no base64 dele -- e o engano classico, e ele
+    # passa despercebido porque produz um digest de aparencia perfeita.
+    def digest(nonce_b64, created, senha):
+        cru = base64.b64decode(nonce_b64)
+        return base64.b64encode(hashlib.sha1(
+            cru + created.encode('utf-8') + senha.encode('utf-8')).digest()).decode()
+
+    check('o digest bate com o vetor conhecido da norma',
+          digest('LKqI6G/AikKCQrN0zqZFlg==', '2010-09-16T07:50:45Z',
+                 'userpassword') == 'tuOSpGlFlIXsozq4HFNeeGeFLEI=')
+    check('nonce em base64 no lugar dos bytes daria outro digest',
+          digest('LKqI6G/AikKCQrN0zqZFlg==', '2010-09-16T07:50:45Z', 'userpassword')
+          != base64.b64encode(hashlib.sha1(
+              b'LKqI6G/AikKCQrN0zqZFlg==' + b'2010-09-16T07:50:45Z'
+              + b'userpassword').digest()).decode())
+    check('senha diferente, digest diferente',
+          digest('LKqI6G/AikKCQrN0zqZFlg==', '2010-09-16T07:50:45Z', 'outra')
+          != 'tuOSpGlFlIXsozq4HFNeeGeFLEI=')
+
+    # -------------------------------------------------- a leitura do XML
+    #
+    # Porte do ValorDaTag/ValorDentroDe: compara so a parte do nome depois do
+    # ultimo ':', porque o prefixo e escolha da camera (tt, tds, trt, nenhum).
+    def local(nome):
+        return nome.rsplit(':', 1)[-1]
+
+    def achar_abertura(xml, nome, de=0):
+        i = de
+        while True:
+            i = xml.find('<', i)
+            if i < 0:
+                return -1, -1
+            i += 1
+            if i >= len(xml) or xml[i] in '/?!':
+                continue
+            p = i
+            while p < len(xml) and xml[p] not in '> /\t\r\n':
+                p += 1
+            if local(xml[i:p]).lower() == nome.lower():
+                return i - 1, p
+            i = p
+
+    def achar_fechamento(xml, nome, de=0):
+        i = de
+        while True:
+            i = xml.find('</', i)
+            if i < 0:
+                return -1
+            p = i + 2
+            while p < len(xml) and xml[p] not in '> \t\r\n':
+                p += 1
+            if local(xml[i + 2:p]).lower() == nome.lower():
+                return i
+            i = p
+
+    def valor(xml, nome):
+        i = 0
+        while True:
+            abre, apos = achar_abertura(xml, nome, i)
+            if abre < 0:
+                return ''
+            ini = xml.find('>', apos)
+            if ini < 0:
+                return ''
+            if ini > 0 and xml[ini - 1] == '/':
+                i = ini
+                continue
+            fim = xml.find('</', ini)
+            if fim < 0:
+                return ''
+            return xml[ini + 1:fim].strip()
+
+    def valor_dentro(xml, dentro, nome):
+        abre, apos = achar_abertura(xml, dentro)
+        if abre < 0:
+            return ''
+        fecha = achar_fechamento(xml, dentro, apos)
+        if fecha < 0:
+            fecha = len(xml)
+        return valor(xml[abre:fecha], nome)
+
+    CAPS = (
+        '<tds:GetCapabilitiesResponse><tds:Capabilities>'
+        '<tt:Media><tt:XAddr>http://10.0.0.7/onvif/media</tt:XAddr></tt:Media>'
+        '<tt:PTZ><tt:XAddr>http://10.0.0.7/onvif/ptz</tt:XAddr></tt:PTZ>'
+        '</tds:Capabilities></tds:GetCapabilitiesResponse>')
+    check('o XAddr do PTZ sai de dentro do PTZ',
+          valor_dentro(CAPS, 'PTZ', 'XAddr') == 'http://10.0.0.7/onvif/ptz',
+          valor_dentro(CAPS, 'PTZ', 'XAddr'))
+    check('e o da midia de dentro da midia -- mesmo nome local, elementos',
+          valor_dentro(CAPS, 'Media', 'XAddr') == 'http://10.0.0.7/onvif/media',
+          valor_dentro(CAPS, 'Media', 'XAddr'))
+    check('procurar XAddr solto pegaria o primeiro, que e o errado',
+          valor(CAPS, 'XAddr') == 'http://10.0.0.7/onvif/media')
+
+    # Camera fixa: sem o elemento PTZ. Tem de dar vazio, e nao o da midia.
+    SEM_PTZ = ('<tds:Capabilities>'
+               '<tt:Media><tt:XAddr>http://10.0.0.7/onvif/media</tt:XAddr></tt:Media>'
+               '</tds:Capabilities>')
+    check('camera sem PTZ devolve vazio, e nao o endereco da midia',
+          valor_dentro(SEM_PTZ, 'PTZ', 'XAddr') == '',
+          valor_dentro(SEM_PTZ, 'PTZ', 'XAddr'))
+
+    # Prefixo e escolha da camera: as tres formas tem de dar no mesmo.
+    for xml in ('<a:Hour>13</a:Hour>', '<Hour>13</Hour>', '<qq:Hour>13</qq:Hour>'):
+        check('prefixo nao muda a leitura (%s)' % xml[:12], valor(xml, 'Hour') == '13')
+
+    # Profile x Profiles: comparar o nome inteiro, e nao por substring.
+    DOIS = '<trt:Profiles token="p0"><tt:Name>principal</tt:Name></trt:Profiles>'
+    check('Profiles nao e confundido com Profile',
+          achar_abertura(DOIS, 'Profile')[0] < 0)
+    check('e o nome do perfil e lido',
+          valor(DOIS, 'Name') == 'principal')
+
+    # Tag vazia nao tem conteudo: segue para a proxima ocorrencia.
+    check('tag vazia nao vira valor',
+          valor('<tt:XAddr/><tt:XAddr>http://x/</tt:XAddr>', 'XAddr') == 'http://x/')
+
+    # A hora da camera, que e de onde sai o acerto de relogio.
+    HORA = ('<tds:GetSystemDateAndTimeResponse><tt:SystemDateAndTime>'
+            '<tt:UTCDateTime><tt:Time><tt:Hour>7</tt:Hour><tt:Minute>50</tt:Minute>'
+            '<tt:Second>45</tt:Second></tt:Time><tt:Date><tt:Year>2010</tt:Year>'
+            '<tt:Month>9</tt:Month><tt:Day>16</tt:Day></tt:Date></tt:UTCDateTime>'
+            '</tt:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>')
+    d = valor_dentro(HORA, 'Date', 'Year'), valor_dentro(HORA, 'Date', 'Month')
+    h = valor_dentro(HORA, 'Time', 'Hour')
+    check('a data da camera e lida de dentro do Date', d == ('2010', '9'), str(d))
+    check('e a hora de dentro do Time', h == '7', h)
+
+    # ------------------------------------------------------- o endereco padrao
+    #
+    # A porta da midia nao serve ao ONVIF: 554 e do RTSP e 34567 e do DVRIP. O
+    # servico de dispositivo mora no HTTP da camera.
+    def endereco(url):
+        s2 = url.strip()
+        i = s2.find('://')
+        if i >= 0:
+            s2 = s2[i + 3:]
+        i = s2.find('@')
+        if i >= 0:
+            s2 = s2[i + 1:]
+        i = s2.find('/')
+        if i >= 0:
+            s2 = s2[:i]
+        host = s2.split(':')[0]
+        return 'http://' + host + '/onvif/device_service' if host else ''
+
+    for url, esperado in (
+            ('rtsp://192.168.0.10:554/onvif1', 'http://192.168.0.10/onvif/device_service'),
+            ('rtsp://user:pw@192.168.0.10:554/live', 'http://192.168.0.10/onvif/device_service'),
+            ('dvrip://192.168.0.11:34567/main', 'http://192.168.0.11/onvif/device_service'),
+            ('rtsp://cam.local/stream', 'http://cam.local/onvif/device_service')):
+        check('endereco padrao de %s' % url, endereco(url) == esperado, endereco(url))
+    check('url sem host nao vira endereco', endereco('') == '')
+
+    # ---------------------------------------------- a duracao do movimento
+    #
+    # Sem o campo Timeout a camera aplica o padrao dela, e nesta familia o
+    # padrao e curto: segurar o botao dava um passo so em vez de mover
+    # continuamente. Medido na Ayla.
+    #
+    # O valor acompanha o teto da tela: a pagina desiste em 8 s, e a camera
+    # para sozinha no mesmo tempo se a parada se perder no caminho. Menor
+    # engasgaria no meio do gesto; maior deixaria a camera girando depois de a
+    # tela ja ter desistido.
+    aqui = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    onvif_pas = io.open(os.path.join(aqui, 'vms', 'src', 'Onvif',
+                                     'Vms.Onvif.Client.pas'),
+                        encoding='utf-8-sig').read()
+    i6 = onvif_pas.index('function TOnvifClient.MoverContinuo')
+    mover = onvif_pas[i6:onvif_pas.index('function TOnvifClient.Parar')]
+    check('o movimento continuo diz por quanto tempo vale',
+          '<Timeout>' in mover)
+    check('e a duracao bate com o teto de tempo da tela',
+          "DURACAO = 'PT8S'" in onvif_pas)
+    pagina_ptz = io.open(os.path.join(aqui, 'src', 'UI', 'web', 'app-ui.html'),
+                         encoding='utf-8-sig').read()
+    check('que e o mesmo 8000 do TETO_PTZ_MS',
+          'TETO_PTZ_MS = 8000' in pagina_ptz)
+    parar_pas = onvif_pas[onvif_pas.index('function TOnvifClient.Parar'):]
+    parar_pas = parar_pas[:parar_pas.index('function TOnvifClient.LerPresets')]
+    check('a parada por velocidade zero NAO leva duracao',
+          '<Timeout>' not in parar_pas)
+
+    # ------------------------------------------- o endereco escrito no cadastro
+    #
+    # A porta NAO se adivinha. A norma sugere a 80; a Ayla daqui atende ONVIF na
+    # 5000, e nada na URL de video dela diz isso. Entao quem sabe escreve, em
+    # qualquer das tres formas que uma pessoa escreveria.
+    def endereco_do_cadastro(escrito, url_midia):
+        t = (escrito or '').strip()
+        if not t:
+            return endereco(url_midia)
+        if '://' not in t:
+            t = 'http://' + t
+        if '/' not in t[t.index('://') + 3:]:
+            t += '/onvif/device_service'
+        return t
+
+    ALVO = 'http://192.168.100.2:5000/onvif/device_service'
+    for escrito in ('192.168.100.2:5000',
+                    'http://192.168.100.2:5000',
+                    'http://192.168.100.2:5000/onvif/device_service'):
+        check('cadastro "%s" vira o mesmo endereco' % escrito,
+              endereco_do_cadastro(escrito, '') == ALVO,
+              endereco_do_cadastro(escrito, ''))
+    check('so o host tambem serve, e cai na porta 80',
+          endereco_do_cadastro('10.0.0.7', '') ==
+          'http://10.0.0.7/onvif/device_service')
+    check('cadastro vazio cai no palpite da norma',
+          endereco_do_cadastro('', 'rtsp://192.168.0.10:554/onvif1') ==
+          'http://192.168.0.10/onvif/device_service')
+    check('a porta do cadastro NAO e trocada pela 80',
+          ':5000' in endereco_do_cadastro('192.168.100.2:5000', ''))
+
+    # ------------------------------------ o endereco anunciado, atras do NAT
+    #
+    # Camera atras de encaminhamento anuncia o IP da rede DELA. A Ayla responde
+    # em 192.168.100.2:5000 e se diz 192.168.0.6:5000; seguir o anuncio seria
+    # falar com uma maquina que nao existe deste lado. Troca-se o host e
+    # guarda-se a porta, porque ha camera que legitimamente poe um servico em
+    # porta propria.
+    def mesmo_host(anunciado, base):
+        a, b = (anunciado or '').strip(), (base or '').strip()
+        if not a or not b:
+            return anunciado
+        if '://' in b:
+            b = b[b.index('://') + 3:]
+        if '/' in b:
+            b = b[:b.index('/')]
+        host_base = b.split(':')[0]
+        if not host_base or '://' not in a:
+            return anunciado
+        resto = a[a.index('://') + 3:]
+        if '/' in resto:
+            autoridade, resto = resto[:resto.index('/')], resto[resto.index('/'):]
+        else:
+            autoridade, resto = resto, ''
+        if ':' in autoridade:
+            autoridade = host_base + autoridade[autoridade.index(':'):]
+        else:
+            autoridade = host_base
+        return 'http://' + autoridade + resto
+
+    BASE = 'http://192.168.100.2:5000/onvif/device_service'
+    check('o anuncio da Ayla e trazido para o host alcancavel',
+          mesmo_host('http://192.168.0.6:5000/onvif/deviceio_service', BASE) ==
+          'http://192.168.100.2:5000/onvif/deviceio_service',
+          mesmo_host('http://192.168.0.6:5000/onvif/deviceio_service', BASE))
+    check('o caminho anunciado e preservado',
+          mesmo_host('http://192.168.0.6:5000/onvif/ptz_service', BASE)
+          .endswith('/onvif/ptz_service'))
+    check('a porta anunciada e preservada, e nao a da base',
+          mesmo_host('http://192.168.0.6:8000/x', BASE) ==
+          'http://192.168.100.2:8000/x',
+          mesmo_host('http://192.168.0.6:8000/x', BASE))
+    check('anuncio sem porta continua sem porta',
+          mesmo_host('http://192.168.0.6/x', BASE) == 'http://192.168.100.2/x')
+    check('camera na mesma rede nao muda de endereco',
+          mesmo_host(BASE, BASE) == BASE)
+    check('anuncio vazio nao vira endereco inventado',
+          mesmo_host('', BASE) == '')
+
+
+def teste_ptz_dvrip(_pasta):
+    """O comando de PTZ sai igual ao que o iCSee manda.
+
+    Nao ha ONVIF nestas cameras -- a varredura da rede provou que a porta 80
+    delas recusa conexao e que nenhuma porta encaminhada fala SOAP. O que move a
+    PTZ e DVRIP, o mesmo protocolo que o projeto ja usa para gravar.
+
+    O formato veio de uma captura do iCSee movendo a camera. Para que lado, a
+    captura NAO diz -- e eu supus esquerda, o que estava errado e inverteu o
+    horizontal inteiro ate ser medido nas cameras. Ver abaixo. E a captura
+    PROVA o resultado, por um caminho que nao depende de eu ter
+    lido o JSON direito: o DataLen do pacote dela vale 328 no comando e 325 na
+    parada. Se o texto montado aqui der outro tamanho, ele nao e o mesmo texto.
+
+    Os 3 bytes de diferenca entre os dois sao exatamente "65535" contra "-1",
+    que e o unico campo que muda entre andar e parar.
+    """
+    print('PTZ por DVRIP')
+
+    def ptz(comando, passo, canal, iniciar, sessao):
+        preset = 65535 if iniciar else -1
+        passo = max(1, min(8, passo))
+        return ('{ "Name" : "OPPTZControl", "OPPTZControl" : { "Command" : "%s"'
+                ', "Parameter" : { "AUX" : { "Number" : 0, "Status" : "On" }, '
+                '"Channel" : %d, "MenuOpts" : "Enter", '
+                '"POINT" : { "bottom" : 0, "left" : 0, "right" : 0, "top" : 0 }'
+                ', "Pattern" : "SetBegin", "Preset" : %d, "Step" : %d, '
+                '"Tour" : 0 } }, "SessionID" : "%s" }'
+                % (comando, canal, preset, passo, sessao))
+
+    # O DataLen do pacote inclui o \n final (ver o cabecalho do VMS.Dvrip.Protocol).
+    anda = ptz('DirectionLeft', 5, 0, True, '0x2d')
+    para = ptz('DirectionLeft', 5, 0, False, '0x2d')
+    check('o comando tem os 328 bytes do pacote capturado',
+          len(anda) + 1 == 328, '%d' % (len(anda) + 1))
+    check('e a parada tem os 325 do pacote seguinte',
+          len(para) + 1 == 325, '%d' % (len(para) + 1))
+    check('a diferenca e so o Preset, 3 caracteres',
+          len(anda) - len(para) == 3)
+    check('andar manda Preset 65535', '"Preset" : 65535' in anda)
+    check('parar manda Preset -1', '"Preset" : -1' in para)
+    check('e o comando e o MESMO nos dois -- so o Preset muda',
+          anda.replace('65535', '-1') == para)
+
+    # O MsgID saiu dos dois bytes antes do DataLen no pacote: 78 05, em little
+    # endian. Vale registrar a conta, que e o que liga o numero a captura.
+    check('MsgID 1400 e o 0x0578 lido no pacote', 0x0578 == 1400)
+    check('e o byte baixo do DataLen bate com o que aparecia em texto',
+          (328 & 0xFF, 325 & 0xFF) == (0x48, 0x45),
+          'H=0x48 e E=0x45 eram os bytes visiveis')
+
+    # Passo fora da faixa nao vai para a camera como veio.
+    check('passo abaixo de 1 vira 1', '"Step" : 1' in ptz('DirectionUp', 0, 0, True, '0x1'))
+    check('passo acima de 8 vira 8', '"Step" : 8' in ptz('DirectionUp', 99, 0, True, '0x1'))
+
+    # Canal e sessao entram como vieram.
+    j = ptz('DirectionRight', 5, 3, True, '0x0000002d')
+    check('o canal pedido vai no JSON', '"Channel" : 3' in j)
+    check('a sessao vai como a camera a escreve',
+          '"SessionID" : "0x0000002d"' in j)
+
+    # ------------------------------------------ a resposta do PTZ e controle
+    #
+    # 1401 estava fora da tabela de mensagens de controle. O efeito: a camera
+    # respondia ao comando de movimento e o log dizia "MsgID desconhecido" em
+    # vez do JSON dela -- justamente a resposta que se quer ler quando a camera
+    # aceita o comando e nao se mexe.
+    proto1 = io.open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'src', 'Dvrip', 'VMS.Dvrip.Protocol.pas'), encoding='utf-8-sig').read()
+    i7 = proto1.index('function DvripClassifyMsg')
+    i7 = proto1.index('case MsgID of', i7)
+    # Ate o fim do case, e nao ate a primeira mencao de mkUnknown: ela aparece
+    # tambem no comentario que explica por que a entrada foi acrescentada.
+    tabela = proto1[i7:proto1.index('  else', i7)]
+    check('o pedido e a resposta de PTZ contam como controle',
+          'DVRIP_PTZ, DVRIP_PTZ_RSP' in tabela)
+    check('e o ramo de midia continua so com o canal de dados',
+          tabela.index('mkMedia') < tabela.index('DVRIP_PTZ,'))
+
+    # ------------------------------------------------ o aviso de evento
+    #
+    # A camera manda AlarmInfo (1504) sozinha, com numero de sessao PROPRIO.
+    # Recusar por causa da sessao custava caro: o leitor perdia o sincronismo
+    # e varria o fluxo atras do proximo cabecalho, jogando fora mais de cem
+    # bytes de video. Medido nas duas cameras, a cada comando de PTZ.
+    check('o aviso de evento tem numero e e controle',
+          'DVRIP_ALARM_INFO          = 1504' in proto1 and
+          'DVRIP_ALARM_INFO' in tabela)
+    i8 = proto1.index('function HeaderReject')
+    rej = proto1[i8:proto1.index('function HeaderPlausible')]
+    check('cabecalho de outra sessao passa quando o MsgID e conhecido',
+          'DvripClassifyMsg' in rej and 'mkUnknown' in rej)
+    # A regra do SessionID continua: e ela que separa cabecalho de verdade de
+    # coincidencia dentro do video comprimido.
+    check('e a regra do SessionID continua valendo para MsgID desconhecido',
+          "Exit(Format('sessao=%x" in rej)
+
+    # -------------------------------------------------- o lado de cada nome
+    #
+    # MEDIDO em duas cameras: mandando 'DirectionRight' a imagem anda para a
+    # ESQUERDA nas duas. O nome da camera e o espelho do que se ve na tela --
+    # parece ser do ponto de vista de quem olha para ela.
+    #
+    # Isto ficou errado por um tempo porque eu tinha deduzido os nomes de uma
+    # captura sem saber para que lado o dedo tinha ido. O teste existe para a
+    # deducao nao voltar.
+    proto0 = io.open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'src', 'Dvrip', 'VMS.Dvrip.Protocol.pas'), encoding='utf-8-sig').read()
+
+    def valor(nome):
+        i = proto0.index(nome + ' ')
+        i = proto0.index("'", i)
+        return proto0[i + 1:proto0.index("'", i + 1)]
+
+    check('a direita da tela manda o nome de esquerda da camera',
+          valor('DVRIP_PTZ_DIREITA') == 'DirectionLeft',
+          valor('DVRIP_PTZ_DIREITA'))
+    check('e a esquerda da tela manda o de direita',
+          valor('DVRIP_PTZ_ESQUERDA') == 'DirectionRight',
+          valor('DVRIP_PTZ_ESQUERDA'))
+    check('as diagonais seguem a mesma troca no horizontal',
+          valor('DVRIP_PTZ_CIMA_DIR') == 'DirectionLeftUp' and
+          valor('DVRIP_PTZ_BAIXO_DIR') == 'DirectionLeftDown' and
+          valor('DVRIP_PTZ_CIMA_ESQ') == 'DirectionRightUp' and
+          valor('DVRIP_PTZ_BAIXO_ESQ') == 'DirectionRightDown')
+    check('e o vertical NAO inverte: cima e cima',
+          valor('DVRIP_PTZ_CIMA') == 'DirectionUp' and
+          valor('DVRIP_PTZ_BAIXO') == 'DirectionDown')
+
+    # ------------------------------------------------------------ presets
+    #
+    # O preset e a MESMA mensagem, com outro Command e o numero onde as
+    # direcoes poem 65535. Isto NAO veio de captura, ao contrario das oito
+    # direcoes; se a camera ignorar, e o primeiro lugar a olhar.
+    ir = ptz('GotoPreset', 5, 0, True, '0x2d').replace('"Preset" : 65535',
+                                                       '"Preset" : 3')
+    check('o preset entra no campo que as direcoes usam para 65535',
+          '"Preset" : 3' in ir)
+    check('e o resto da mensagem e identico ao de andar',
+          ir.replace('"Preset" : 3', '"Preset" : 65535')
+          .replace('GotoPreset', 'DirectionLeft') == anda)
+    proto = io.open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'src', 'Dvrip', 'VMS.Dvrip.Protocol.pas'), encoding='utf-8-sig').read()
+    check('as duas mensagens saem do mesmo texto, sem copia',
+          proto.count("'{ \"Name\" : \"OPPTZControl\"") == 1)
+    check('e o comando de ir ao preset tem nome proprio',
+          'DVRIP_PTZ_PRESET_IR' in proto)
+
+    # -------------------------------------------------- os dezenove comandos
+    #
+    # A lista da implementacao de referencia (python-dvr). Ela CONFIRMOU, nome
+    # por nome, os quatro que eu tinha deduzido da familia -- ZoomTile,
+    # ZoomWide, GotoPreset e SetPreset -- e trouxe os outros que faltavam.
+    REF = ['DirectionUp', 'DirectionDown', 'DirectionLeft', 'DirectionRight',
+           'DirectionLeftUp', 'DirectionLeftDown', 'DirectionRightUp',
+           'DirectionRightDown', 'ZoomTile', 'ZoomWide', 'FocusNear',
+           'FocusFar', 'IrisSmall', 'IrisLarge', 'SetPreset', 'GotoPreset',
+           'ClearPreset', 'StartTour', 'StopTour']
+    protoc = io.open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'src', 'Dvrip', 'VMS.Dvrip.Protocol.pas'), encoding='utf-8-sig').read()
+    faltando = [c for c in REF if ("'%s'" % c) not in protoc]
+    check('os dezenove comandos da referencia estao no codigo',
+          not faltando, 'faltam: %s' % faltando)
+    # O comentario que marcava zoom e preset como deducao sai: eles foram
+    # confirmados. Deixar o aviso seria mandar procurar defeito onde nao ha.
+    check('e nenhum deles segue marcado como deducao',
+          'NAO vieram de captura' not in protoc)
+
+    # ------------------------------------------------------ as duas formas
+    #
+    # A implementacao de referencia (python-dvr) monta OPPTZControl de dois
+    # jeitos: ptz_step usa Pattern "SetBegin" COM o campo POINT, e ptz usa
+    # Pattern "Start" SEM ele. Nos so tinhamos a primeira, que e a da captura
+    # do iCSee e a que a Isis obedece. A Frente aceita essa e nao se move, e a
+    # segunda nunca tinha sido tentada nela.
+    def op(comando, passo, canal, preset, sessao, forma):
+        ponto = ('"POINT" : { "bottom" : 0, "left" : 0, "right" : 0, '
+                 '"top" : 0 }, ') if forma == 'passo' else ''
+        padrao = 'SetBegin' if forma == 'passo' else 'Start'
+        return ('{ "Name" : "OPPTZControl", "OPPTZControl" : { "Command" : "%s"'
+                ', "Parameter" : { "AUX" : { "Number" : 0, "Status" : "On" }, '
+                '"Channel" : %d, "MenuOpts" : "Enter", %s'
+                '"Pattern" : "%s", "Preset" : %d, "Step" : %d, '
+                '"Tour" : 0 } }, "SessionID" : "%s" }'
+                % (comando, canal, ponto, padrao, preset, passo, sessao))
+
+    check('a forma de passo continua identica a da captura',
+          op('DirectionLeft', 5, 0, 65535, '0x2d', 'passo') == anda)
+    outra = op('DirectionLeft', 5, 0, 65535, '0x2d', 'start')
+    check('a outra forma troca o Pattern', '"Pattern" : "Start"' in outra)
+    check('e tira o POINT', 'POINT' not in outra)
+    check('e so isso muda entre as duas',
+          outra.replace('"Pattern" : "Start"', '"Pattern" : "SetBegin"')
+          == anda.replace('"POINT" : { "bottom" : 0, "left" : 0, '
+                          '"right" : 0, "top" : 0 }, ', ''))
+
+    proto2 = io.open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'src', 'Dvrip', 'VMS.Dvrip.Protocol.pas'), encoding='utf-8-sig').read()
+    check('o codigo tem as duas formas', 'TDvripPtzForma = (fPasso, fStart)'
+          in proto2)
+    # Preset usa a forma que a referencia usa para preset, e nao a de mover.
+    # Cada forma e usada onde a referencia a usa, e nao ha botao para escolher:
+    # a Frente obedece as duas, entao escolher nao discrimina nada. O que a
+    # fazia ignorar o comando era o AlarmInfo recusado.
+    check('mover usa a forma de passo',
+          'OpPtzJson(Comando, Passo, Canal, Preset, SessionHex, fPasso)'
+          in proto2)
+    check('e o preset usa a de Start, como na referencia',
+          'OpPtzJson(Comando, 5, Canal, Preset, SessionHex, fStart)' in proto2)
+
+    # ------------------------------------------------- as tres velocidades
+    #
+    # A tela manda a velocidade normalizada, em milesimos, e cada protocolo faz
+    # a conta dele. No DVRIP e passo de 1 a 8. Os tres degraus da tela tem de
+    # cair em passos DIFERENTES: dois degraus com o mesmo passo seriam dois
+    # botoes que fazem a mesma coisa.
+    raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pagina = io.open(os.path.join(raiz, 'src', 'UI', 'web', 'app-ui.html'),
+                     encoding='utf-8-sig').read()
+    i = pagina.index('<div id="ptz-vel">')
+    niveis = [int(x) for x in
+              re.findall(r'data-vel="(\d+)"', pagina[i:pagina.index('</div>', i)])]
+
+    def passo(milesimos):
+        # PassoDvripDe: round(v * 8), com piso em 1.
+        return max(1, round(milesimos / 1000 * 8))
+
+    check('a tela oferece tres velocidades', len(niveis) == 3, str(niveis))
+    check('em ordem crescente', niveis == sorted(niveis), str(niveis))
+    check('a mais rapida e o maximo normalizado', niveis[-1] == 1000)
+    passos = [passo(v) for v in niveis]
+    check('cada uma cai num passo DIFERENTE do DVRIP',
+          len(set(passos)) == 3, str(passos))
+    check('e a mais rapida chega ao passo 8, o teto do protocolo',
+          passos[-1] == 8, str(passos))
+    check('nenhuma cai em meio passo, onde o arredondamento seria discutivel',
+          all(abs(v / 1000 * 8 - int(v / 1000 * 8)) != 0.5 for v in niveis))
+
+
+def teste_ptz_no_aparelho(_pasta):
+    """A PTZ de uma camera do aparelho e atendida pelo aparelho.
+
+    Este e o defeito que existiu: a pagina so perguntava se havia PTZ quando
+    havia um vmsserver escolhido, e o servidor local encaminhava /api/ptz para
+    la. Quem conecta direto na camera nao tem servidor nenhum -- e e justamente
+    ele quem tem a sessao DVRIP autenticada na mao. Resultado: os botoes nunca
+    apareciam no caso em que eram mais faceis de atender.
+
+    Nao da para provar isto por conta; o que da para provar e que as duas
+    condicoes que causavam o defeito nao voltaram ao texto.
+    """
+    print('PTZ da camera do proprio aparelho')
+    raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    pagina = io.open(os.path.join(raiz, 'src', 'UI', 'web', 'app-ui.html'),
+                     encoding='utf-8-sig').read()
+    i = pagina.index('function verSeTemPtz()')
+    # Ate a chave que fecha a funcao, na coluna zero: as de dentro sao
+    # indentadas, entao esta e sempre o fim.
+    corpo = pagina[i:pagina.index(chr(10) + '}' + chr(10), i)]
+    check('a pagina pergunta por PTZ sem exigir servidor',
+          'comServidor' not in corpo)
+    check('e ainda exige saber de que camera se trata',
+          '!camAtual' in corpo)
+
+    # A segunda metade do mesmo defeito: perguntar UMA vez respondia sempre
+    # "nao tem sessao viva", porque no instante em que a tela abre a camera
+    # ainda esta logando. A resposta muda com o tempo, entao a pergunta repete.
+    esperas = pagina[pagina.index('var ESPERAS_PTZ_MS'):]
+    esperas = esperas[esperas.index('[') + 1:esperas.index(']')]
+    esperas = [int(x) for x in esperas.split(',')]
+    check('a pergunta se repete enquanto a camera conecta', len(esperas) > 1)
+    check('a primeira sai na hora, sem espera', esperas[0] == 0)
+    check('as esperas so crescem', esperas == sorted(esperas))
+    check('e a insistencia acaba, em vez de durar a tela inteira',
+          30000 <= sum(esperas) <= 120000, '%d ms' % sum(esperas))
+    # O teclado nasce FECHADO, atras de um botao: ele ocupa um canto do video e
+    # a maior parte do tempo o que se quer e olhar a imagem.
+    check('o teclado nasce fechado a cada abertura do ao vivo',
+          'alternarPtz(false)' in corpo)
+    fechar = pagina[pagina.index('function alternarPtz'):]
+    fechar = fechar[:fechar.index(chr(10) + '}' + chr(10))]
+    # Fechar com um movimento em curso tem de parar a camera: some-lo da tela
+    # sem parar deixaria ela girando ate o teto de tempo, fora de vista.
+    check('e fechar para o que estiver andando',
+          'ptzParar()' in fechar)
+
+    check('desiste quando a tela ou a camera mudou',
+          "classList.contains(" + chr(34) + "on" + chr(34) + ")" in corpo
+          and 'camAtual !== cam' in corpo)
+
+    # -------------------------------------------------- a barreira de ponteiro
+    #
+    # A PTZ mora DENTRO do palco, e o palco pede setPointerCapture no
+    # pointerdown para a pinca de zoom nao se perder. Sem barreira, apertar um
+    # botao da PTZ borbulhava ate la, a captura mudava de dono no meio do
+    # aperto, e o navegador passava a entregar os eventos ao palco: o botao de
+    # velocidade ficava sem o pointerup que gera o click, e a seta levava um
+    # pointerleave -- que e uma das paradas -- milissegundos depois de comecar.
+    # O sintoma era a camera dar um cutucao em vez de andar enquanto apertada.
+    i2 = pagina.index('id="palco"')
+    j2 = pagina.index('id="ptz"')
+    check('a PTZ fica dentro do palco, que e por isso que a barreira existe',
+          i2 < j2)
+    check('e o palco realmente toma a captura do ponteiro',
+          'palco.setPointerCapture' in pagina)
+    barreira = pagina[pagina.index('O que comeca na PTZ e da PTZ'):]
+    barreira = barreira[:barreira.index('});') + 3]
+    for evento in ('pointerdown', 'pointerup', 'pointercancel'):
+        check('a PTZ segura o %s dela' % evento, evento in barreira)
+    check('segurando por stopPropagation, e nao por preventDefault',
+          'stopPropagation' in barreira and 'preventDefault' not in barreira)
+
+    local = io.open(os.path.join(raiz, 'src', 'Api', 'VMS.Local.Server.pas'),
+                    encoding='utf-8-sig').read()
+    rota = local.find("Caminho = '/api/ptz'")
+    encaminha = local.find("Caminho.StartsWith('/api/')")
+    check('o servidor do app atende /api/ptz antes de encaminhar',
+          0 <= rota < encaminha,
+          'rota=%d encaminhamento=%d' % (rota, encaminha))
+    # A rota so e dele quando NAO ha escopo de servidor: com escopo, a camera e
+    # do servidor e a sessao viva esta la, nao aqui.
+    trecho = local[max(rota, 0):max(encaminha, 0)]
+    check('e so quando o pedido nao tem escopo de servidor',
+          "Params.Values['server']" in trecho and "= ''" in trecho)
+    check('o comando sai pela sessao ja autenticada, e nao por um login novo',
+          'TPtzRegistry.Achar' in local)
+    # Nenhum dos dois caminhos: a resposta diz OS DOIS que faltaram, porque
+    # "sem PTZ" sozinho nao distingue camera fixa de camera desconectada.
+    check('camera sem nenhum caminho vira 503, e nao um erro mudo',
+          'sem sessao viva e sem endereco de ONVIF' in local)
+
+    # ------------------------------------------------------ a procura de ONVIF
+    #
+    # A porta do ONVIF nao se adivinha: a norma nao fixa nenhuma e nenhuma das
+    # cameras daqui usa a 80. Sem procura, cadastrar camera nova exigiria
+    # capturar a rede do aplicativo do fabricante -- que foi como a 5000 da
+    # Ayla apareceu, e nao e pedido que se faca a alguem.
+    onvif = io.open(os.path.join(raiz, 'vms', 'src', 'Onvif',
+                                 'Vms.Onvif.Client.pas'),
+                    encoding='utf-8-sig').read()
+    i = onvif.index('function PortasComunsOnvif: TArray<Integer>;', 
+                    onvif.index('implementation'))
+    portas = [int(x) for x in
+              re.findall(r'\d+', onvif[onvif.index('[', i):onvif.index(']', i)])]
+    check('a procura tenta a porta da norma', 80 in portas)
+    check('e a porta em que a Ayla realmente atende', 5000 in portas)
+    check('sem porta repetida, que so custaria espera',
+          len(portas) == len(set(portas)), str(portas))
+    check('a lista e curta: cada porta custa uma espera',
+          3 <= len(portas) <= 14, '%d portas' % len(portas))
+    check('a procura para na primeira com PTZ',
+          'if Achado.TemPtz then Exit;' in onvif)
+    check('e distingue "nao ha nada" de "ha camera fixa"',
+          'RespondeOnvif' in onvif)
+    check('o servidor do app expoe a procura', "'/api/ptz/procurar'" in local)
+
+    # Os dois hospedeiros aceitam o endereco escrito do mesmo jeito. No app ele
+    # vem do cadastro da camera; no vmsserver, da chave ptz.<camera>.xaddr. Se
+    # so um deles passasse pelo EnderecoOnvif, "192.168.0.6:5000" funcionaria
+    # de um lado e falharia calado do outro -- os dois hospedeiros aceitam o
+    # mesmo texto ou nenhum.
+    api = io.open(os.path.join(raiz, 'vms', 'src', 'Api', 'Vms.Server.Api.pas'),
+                  encoding='utf-8-sig').read()
+    check('o vmsserver normaliza o endereco escrito na chave dele',
+          'EnderecoOnvif(XAddr, Url)' in api)
+    check('e nao usa mais so o palpite da porta 80',
+          'XAddr := EnderecoPadrao(' not in api)
+    # Sem palpite nenhum, alias: chave vazia responde "sem ONVIF" na hora.
+    # Medido no servidor do usuario, adivinhar a porta 80 custava 8 segundos
+    # por pergunta numa camera que nao tem ONVIF, e a tela pergunta ate sete
+    # vezes ao abrir o ao vivo.
+    i5 = api.index('function TApiRouter.ClienteOnvif')
+    cli = api[i5:api.index('function ', i5 + 10)]
+    check('chave de ONVIF vazia nao vira tentativa na porta 80',
+          "if Trim(XAddr) = '' then Exit;" in cli)
+
+    # A senha da camera vai no CORPO, nunca na URL: em URL ela ficaria no
+    # historico do navegador e em qualquer log de acesso pelo caminho.
+    j = pagina.index('$("f-procurar").onclick')
+    handler = pagina[j:pagina.index(chr(10) + '};', j)]
+    check('a procura vai por POST', '"POST"' in handler)
+    check('e a senha nao entra na URL',
+          'password' in handler and
+          'procurar?' not in handler and 'password=' not in handler)
+    check('e o ONVIF e tentado quando nao ha sessao DVRIP',
+          'ServirPtzOnvif' in local and 'MoverContinuo' in local)
+
+
+def teste_cadastro_de_cameras(_pasta):
+    """A tela que cadastra as cameras do servidor, e o que ela promete.
+
+    Ate ela existir, mexer numa camera do vmsserver so dava por /api/sql -- a
+    mesma rota que le camera_endpoint.password em texto claro e sabe apagar
+    qualquer tabela.
+
+    Tres promessas aqui valem verificacao, porque as tres sao invisiveis quando
+    estao certas e caras quando quebram: a senha nunca sai do servidor,
+    ninguem renomeia uma camera, e ninguem apaga uma.
+    """
+    print('cadastro de cameras do servidor')
+    raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    pagina = io.open(os.path.join(raiz, 'src', 'UI', 'web', 'cameras-ui.html'),
+                     encoding='utf-8').read()
+    check('a pagina e ASCII puro, como as outras',
+          all(ord(c) < 127 for c in pagina))
+    # No SCRIPT, e nao na pagina toda: o comentario do cabecalho cita o
+    # /api/sql justamente para dizer por que esta tela existe.
+    script = pagina[pagina.index('<script>'):]
+    check('ela le o cadastro pela rota propria, e nao pelo /api/sql',
+          '/api/config/cameras' in script and '/api/sql' not in script)
+    check('e leva o escopo do servidor, para funcionar dentro do app',
+          'server=' in pagina)
+
+    api = io.open(os.path.join(raiz, 'vms', 'src', 'Api', 'Vms.Server.Api.pas'),
+                  encoding='utf-8-sig').read()
+    corpo = api[api.index('function TApiRouter.HandleConfigCamerasGet'):
+                api.index('function TApiRouter.HandleCameras:')]
+
+    # ------------------------------------------------------------- a senha
+    #
+    # O que nao sai do servidor nao vaza pelo cache do navegador, pelo
+    # historico nem por uma captura de tela. A tela nao precisa da senha para
+    # nada: precisa saber se EXISTE uma.
+    check('a leitura devolve se ha senha, e nao a senha',
+          "'temSenha'" in corpo)
+    check('nenhum AddPair despeja a senha na resposta',
+          "AddPair('password'" not in corpo)
+    check('campo de senha vazio mantem a que ja esta gravada',
+          'Antigas.TryGetValue' in corpo)
+
+    # ------------------------------------------------------------- o nome
+    #
+    # O nome e a pasta em disco, a rota RTSP e o ?camera= de tudo. Renomear
+    # separaria a camera das gravacoes dela, que ficariam na pasta antiga.
+    check('renomear e recusado, e com o motivo',
+          'renomear a separaria' in corpo)
+    check('e o nome nao pode virar caminho', "Pos('..', Nome)" in corpo)
+
+    # ------------------------------------------------------------- apagar
+    #
+    # Apagar a linha da camera leva junto, por cascata, o inventario das
+    # gravacoes, os eventos e as miniaturas -- e os .vms ficariam no disco sem
+    # ninguem que os indexe. Desabilitar para a gravacao e guarda o passado.
+    check('a rota nao apaga camera nenhuma',
+          'DELETE FROM camera WHERE' not in corpo)
+    check('so os enderecos dela, que sao regravados em seguida',
+          'DELETE FROM camera_endpoint WHERE camera_id' in corpo)
+
+    # A captura passa a valer sozinha, em segundos: a rota anota a camera que
+    # mudou e a thread principal aplica na volta seguinte do laco dela. Fazer
+    # isso na thread do HTTP prenderia a resposta enquanto o supervisor antigo
+    # fecha a conexao com a camera, e poria duas threads na mesma lista.
+    check('a resposta diz que a mudanca esta sendo aplicada',
+          "'aplicando'" in corpo)
+    check('a rota anota a camera em vez de trabalhar na thread do HTTP',
+          'FPendentes.Add(Nome)' in corpo)
+    check('e a tela avisa que a captura reinicia', 'aviso-boot' in pagina)
+
+    dpr = io.open(os.path.join(raiz, 'vms', 'vmsserver.dpr'),
+                  encoding='utf-8-sig').read()
+    check('a thread principal drena a fila no laco dela',
+          'TomarCamerasPendentes' in dpr)
+    check('e reconcilia UMA camera por vez, sem tocar nas outras',
+          'ReconciliarCamera' in dpr and 'BuildServerSupervisors' in dpr)
+    check('a camera nova entra na lista que a API reconhece',
+          'DefinirCameras' in dpr)
+    check('e tambem sob analise', 'AcrescentarCamera' in dpr)
+    # Parar antes de montar, sempre: duas sessoes na mesma camera gravariam o
+    # mesmo video em dois arquivos e brigariam pelo mesmo nome.
+    i3 = dpr.index('procedure ReconciliarCamera')
+    rec = dpr[i3:dpr.index('procedure RunApp')]
+    check('a captura antiga sai antes de a nova entrar',
+          rec.index('.Stop') < rec.index('MontarSupervisor'))
+
+    # A procura de ONVIF do servidor roda NO servidor: o que o navegador de
+    # quem abriu a tela alcanca nao e o que a maquina do servidor alcanca.
+    check('o servidor tem a procura de ONVIF dele',
+          "'config/ptz/procurar'" in api)
+    check('e a pagina a chama por POST, com a senha no corpo',
+          'config/ptz/procurar' in pagina and 'method: "POST"' in pagina)
+
+    # A pagina e servida pelos DOIS: pelo vmsserver, e pelo app, que a mostra
+    # num iframe com o escopo do servidor.
+    local = io.open(os.path.join(raiz, 'src', 'Api', 'VMS.Local.Server.pas'),
+                    encoding='utf-8-sig').read()
+    check('o vmsserver serve a pagina', "'cameras-ui.html'" in api)
+
+    # ----------------------------------------- a interface do aparelho
+    #
+    # No Android a interface e copiada do APK para uma pasta gravavel, e a
+    # copia da RTL so CRIA o que falta: instalar por cima deixava o aparelho
+    # servindo a pagina da versao anterior enquanto o binario ja era o novo.
+    # Custou uma hora de procura no lugar errado.
+    assets = io.open(os.path.join(raiz, 'src', 'Android',
+                                  'VMS.Android.UiAssets.pas'),
+                     encoding='utf-8-sig').read()
+    check('o app le a interface de dentro do proprio pacote',
+          'getPackageCodePath' in assets and 'TZipFile' in assets)
+    check('e do mesmo prefixo que o Deployment usa',
+          "'assets/internal/ui/'" in assets)
+    # Grava por cima sem comparar: o conteudo ja esta descompactado na mao, e
+    # comparar custaria ler o arquivo inteiro do disco para, no caso comum,
+    # concluir que nao ha nada a fazer. Sem comparacao a garantia tambem deixa
+    # de ser condicional -- a pasta E a do pacote, sem "se".
+    check('grava por cima, sem ler o disco para decidir',
+          'TFile.WriteAllBytes' in assets and
+          'CompareMem' not in assets and 'ReadAllBytes' not in assets)
+    check('e diz no log quanto veio do pacote',
+          'interface do pacote' in assets)
+    check('pacote sem interface e AVISO, e nao silencio',
+          'nao trouxe interface nenhuma' in assets)
+    # Pasta padrao, e nao UiDir: a variavel de ambiente aponta o FONTE na
+    # maquina de quem desenvolve, e sobrescreve-lo seria o contrario do que
+    # ela serve.
+    check('escreve na pasta do aparelho, nunca na apontada pela variavel',
+          'UiDirPadrao' in assets and 'UiDir;' not in assets)
+
+    dpr_app = io.open(os.path.join(raiz, 'rtsplayer.dpr'),
+                      encoding='utf-8-sig').read()
+    check('a unit esta no projeto do app', 'VMS.Android.UiAssets' in dpr_app)
+    inicio = io.open(os.path.join(raiz, 'src', 'UI', 'Inicio.pas'),
+                     encoding='utf-8-sig').read()
+    i4 = inicio.index('AtualizarUiDoPacote(FLogger)')
+    check('e roda ANTES de o servidor local existir',
+          i4 < inicio.index('FLocal := TLocalServer.Create'))
+    check('e o app tambem, para mostra-la por dentro',
+          "'cameras-ui.html'" in local)
+
+
 def main():
     pasta = tempfile.mkdtemp(prefix='vms_selftest_')
     try:
@@ -1247,6 +2063,10 @@ def main():
         teste_parameter_sets_da_sequencia(pasta)
         teste_entrada_no_keyframe(pasta)
         teste_bloco_do_anel_ao_vivo(pasta)
+        teste_onvif(pasta)
+        teste_ptz_dvrip(pasta)
+        teste_ptz_no_aparelho(pasta)
+        teste_cadastro_de_cameras(pasta)
         teste_agregacao_eventos(pasta)
     finally:
         shutil.rmtree(pasta, ignore_errors=True)

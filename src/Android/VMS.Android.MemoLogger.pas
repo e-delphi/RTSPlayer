@@ -1,8 +1,9 @@
 unit VMS.Android.MemoLogger;
 
-// Logger que acumula as linhas num buffer thread-safe. A UI (timer) drena via
-// Drain() e joga no TMemo. Evita marshaling/lifetime: os logs chegam na thread
-// de rede; só strings cruzam a fronteira.
+// Logger que acumula as linhas num buffer thread-safe. Quem mostra le por
+// posição (ver Desde) -- hoje é a página, pelo /api/app/log, que as escreve no
+// console do navegador. Evita marshaling/lifetime: os logs chegam na thread de
+// rede; só strings cruzam a fronteira.
 //
 // ## O espelho no logcat
 //
@@ -32,11 +33,19 @@ type
     FLock: TCriticalSection;
     FBuffer: TStringList;
     FMaxBuffered: Integer;
+    // Quantas linhas ja passaram por aqui desde que o app abriu, contando as
+    // que o buffer descartou. E este numero, e nao o indice no buffer, que o
+    // leitor guarda: descartar a linha mais velha nao pode mover o lugar das
+    // outras debaixo dele.
+    FTotal: Int64;
     procedure Emit(Level: TLogLevel; const Tag, Msg: string);
   public
     constructor Create;
     destructor Destroy; override;
-    function Drain: TArray<string>;
+    // As linhas a partir da posicao Desde, e a posicao seguinte. Posicao fora
+    // do que o buffer ainda guarda devolve tudo que ha -- e o que a pagina
+    // quer ao abrir: o que aconteceu antes dela chegar.
+    function Desde(Posicao: Int64; out Proxima: Int64): TArray<string>;
     { ILogger }
     procedure Log(Level: TLogLevel; const Tag, Msg: string);
     procedure Debug(const Tag, Msg: string);
@@ -101,6 +110,7 @@ begin
   FLock.Enter;
   try
     FBuffer.Add(Line);
+    Inc(FTotal);
     while FBuffer.Count > FMaxBuffered do
       FBuffer.Delete(0);
   finally
@@ -108,12 +118,23 @@ begin
   end;
 end;
 
-function TMemoLogger.Drain: TArray<string>;
+function TMemoLogger.Desde(Posicao: Int64;
+  out Proxima: Int64): TArray<string>;
+var
+  Primeira: Int64;
+  I, N: Integer;
 begin
   FLock.Enter;
   try
-    Result := FBuffer.ToStringArray;
-    FBuffer.Clear;
+    Proxima := FTotal;
+    // A posicao da linha mais velha que ainda esta no buffer.
+    Primeira := FTotal - FBuffer.Count;
+    if (Posicao < Primeira) or (Posicao > FTotal) then
+      Posicao := Primeira;
+    N := Integer(FTotal - Posicao);
+    SetLength(Result, N);
+    for I := 0 to N - 1 do
+      Result[I] := FBuffer[FBuffer.Count - N + I];
   finally
     FLock.Leave;
   end;

@@ -55,6 +55,9 @@ type
                        const APolicy: IReconnectPolicy; const AMediaSink: IMediaSink = nil);
     destructor Destroy; override;
     procedure Stop;
+    // De qual camera este supervisor cuida. Publico para quem administra a
+    // lista poder achar o de uma camera pelo nome, que e a chave do sistema.
+    function Camera: string;
     function State: TSupervisorState;
     function Metrics: TSupervisorMetrics;
   end;
@@ -157,6 +160,11 @@ begin
     Format('%s -> %s', [StateToStr(FState), StateToStr(NewState)]));
   FState := NewState;
   FMetrics.State := NewState;
+end;
+
+function TCameraSupervisor.Camera: string;
+begin
+  Result := FConfig.Name;
 end;
 
 function TCameraSupervisor.State: TSupervisorState;

@@ -5,11 +5,10 @@
         <FrameworkType>FMX</FrameworkType>
         <Base>True</Base>
         <Config Condition="'$(Config)'==''">Release</Config>
-        <Platform Condition="'$(Platform)'==''">Win64</Platform>
+        <Platform Condition="'$(Platform)'==''">Android64</Platform>
         <TargetedPlatforms>32786</TargetedPlatforms>
         <AppType>Application</AppType>
         <MainSource>rtsplayer.dpr</MainSource>
-        <ProjectName Condition="'$(ProjectName)'==''">rtsplayer</ProjectName>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
         <Base>true</Base>
@@ -297,6 +296,7 @@
         <DCCReference Include="src\App\VMS.App.Config.pas"/>
         <DCCReference Include="src\App\VMS.App.Logger.pas"/>
         <DCCReference Include="src\App\VMS.App.Decodificacao.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.UiAssets.pas"/>
         <DCCReference Include="src\Android\VMS.Android.Jpeg.pas"/>
         <DCCReference Include="src\Android\VMS.Android.JNIUtil.pas"/>
         <DCCReference Include="src\Android\VMS.Android.VideoDecoder.pas"/>
@@ -317,6 +317,7 @@
         <DCCReference Include="src\Domain\VMS.Domain.MediaSink.pas"/>
         <DCCReference Include="src\Domain\VMS.Domain.Reconnect.pas"/>
         <DCCReference Include="src\Domain\VMS.Domain.Session.pas"/>
+        <DCCReference Include="src\Domain\VMS.Domain.Ptz.pas"/>
         <DCCReference Include="src\Domain\VMS.Domain.Supervisor.pas"/>
         <DCCReference Include="src\Domain\VMS.Domain.Types.pas"/>
         <DCCReference Include="src\Net\VMS.Net.Intf.pas"/>
@@ -346,6 +347,7 @@
         <DCCReference Include="src\Win\VMS.Win.Edge.pas"/>
         <DCCReference Include="src\Api\VMS.Local.Server.pas"/>
         <DCCReference Include="src\App\VMS.App.Servers.pas"/>
+        <DCCReference Include="vms\src\Onvif\Vms.Onvif.Client.pas"/>
         <DCCReference Include="vms\src\Api\Vms.Server.UiFiles.pas"/>
         <DCCReference Include="src\UI\UI.Shell.pas"/>
         <BuildConfiguration Include="Base">
@@ -1096,6 +1098,18 @@
                     <Platform Name="Android64">
                         <RemoteDir>assets\internal\ui\</RemoteDir>
                         <RemoteName>app-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="src\UI\web\cameras-ui.html" Class="File">
+                    <Platform Name="Android">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>cameras-ui.html</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                    <Platform Name="Android64">
+                        <RemoteDir>assets\internal\ui\</RemoteDir>
+                        <RemoteName>cameras-ui.html</RemoteName>
                         <Overwrite>true</Overwrite>
                     </Platform>
                 </DeployFile>

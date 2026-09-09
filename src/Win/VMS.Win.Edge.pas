@@ -1,5 +1,10 @@
 unit VMS.Win.Edge;
 
+// O que o app precisa pedir ao Windows e que nao existe nas outras
+// plataformas: o motor do WebView e o tema da moldura da janela. Fora do
+// Windows tudo aqui e chamada vazia, e por isso nao precisa de IFDEF em volta
+// de quem chama.
+//
 // Faz o TWebBrowser do Windows usar o Edge (WebView2), e nao o Internet
 // Explorer.
 //
@@ -24,6 +29,7 @@ unit VMS.Win.Edge;
 interface
 
 uses
+  FMX.Forms,        // TCommonCustomForm, para achar a janela nativa
   FMX.WebBrowser;   // TWindowsEngine, comum a todas as plataformas
 
 // Chame UMA vez, antes de criar qualquer TWebBrowser. Em plataforma que nao e
@@ -35,6 +41,13 @@ procedure ConfigurarEdge;
 // que e comum a todas elas -- so o TGlobalEdgeBrowserSettings e do Windows.
 function MotorPreferido: TWindowsEngine;
 
+// Poe a moldura da janela no tema escuro. Chame depois que o formulario existe.
+//
+// A moldura -- barra de titulo, botoes de fechar, borda -- nao e desenhada pelo
+// FMX e sim pelo Windows, entao pintar o fundo do formulario nao alcanca ela.
+// Uma faixa clara em volta de uma interface escura era o que restava.
+procedure EscurecerJanela(const Janela: TCommonCustomForm);
+
 implementation
 
 uses
@@ -42,6 +55,9 @@ uses
   System.IOUtils
 {$IFDEF MSWINDOWS}
   , FMX.WebBrowser.Win
+  , FMX.Platform.Win     // FormToHWND
+  , Winapi.Windows
+  , Winapi.DwmApi
 {$ENDIF}
   ;
 
@@ -55,6 +71,34 @@ begin
   Result := TWindowsEngine.EdgeIfAvailable;
 {$ELSE}
   Result := TWindowsEngine.None;
+{$ENDIF}
+end;
+
+procedure EscurecerJanela(const Janela: TCommonCustomForm);
+{$IFDEF MSWINDOWS}
+const
+  // A Microsoft trocou o numero deste atributo no meio do Windows 10: 19 antes
+  // da build 18985, 20 dali em diante. Tentar os dois sai mais barato do que
+  // descobrir a build, e o que nao vale e simplesmente ignorado.
+  DARK_ANTIGO = 19;
+  DARK = 20;
+var
+  Ligado: BOOL;
+  H: HWND;
+{$ENDIF}
+begin
+{$IFDEF MSWINDOWS}
+  if Janela = nil then Exit;
+  try
+    H := FormToHWND(Janela);
+    if H = 0 then Exit;
+    Ligado := True;
+    if DwmSetWindowAttribute(H, DARK, @Ligado, SizeOf(Ligado)) <> S_OK then
+      DwmSetWindowAttribute(H, DARK_ANTIGO, @Ligado, SizeOf(Ligado));
+  except
+    // Moldura clara e um defeito de aparencia; derrubar o app por causa dela
+    // seria trocar um incomodo por uma falha.
+  end;
 {$ENDIF}
 end;
 

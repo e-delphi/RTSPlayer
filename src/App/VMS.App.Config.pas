@@ -56,6 +56,14 @@ type
     // túnel do Tailscale esteja de pé (ver VMS.App.Tailscale). Fica desligado
     // por padrão — quem está na LAN não deve pagar por essa espera.
     UsesTailscale: Boolean;
+    // Onde falar ONVIF com esta camera, quando nao e no lugar obvio. Aceita
+    // "ip", "ip:porta" ou a URL inteira do servico. Vazio = tenta o padrao da
+    // norma, HTTP na 80 do mesmo host da midia.
+    //
+    // Existe porque a porta NAO sai da URL de video: a Ayla transmite em
+    // rtsp://...:554 e atende ONVIF na 5000, e nao ha nada ligando as duas
+    // coisas alem de alguem ter descoberto.
+    Ptz: string;
   end;
 
   TAppConfig = record
@@ -285,6 +293,7 @@ begin
   Result.MaxReconnectAttempts := GetJsonInt(Obj, 'maxRetries', 0);
   Result.AudioDelayMs := GetJsonInt(Obj, 'audioDelayMs', 200);
   Result.VideoDelayMs := GetJsonInt(Obj, 'videoDelayMs', 200);
+  Result.Ptz := GetJsonStr(Obj, 'ptz', '');
 end;
 
 procedure ValidateConfig(const Cfg: TAppConfig);

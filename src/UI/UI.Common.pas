@@ -277,6 +277,7 @@ begin
   Result.AudioDelayMs := AudioDelay;
   Result.VideoDelayMs := VideoDelay;
   Result.UsesTailscale := UsesTailscale;
+  Result.Ptz := '';
 end;
 
 function CamerasToJson(const Cams: TArray<TCameraConfigEntry>): string;
@@ -321,6 +322,11 @@ begin
       O.AddPair('audioDelayMs', TJSONNumber.Create(Cams[I].AudioDelayMs));
       O.AddPair('videoDelayMs', TJSONNumber.Create(Cams[I].VideoDelayMs));
       O.AddPair('tailscale', TJSONBool.Create(Cams[I].UsesTailscale));
+      // So quando ha o que dizer: a maioria das cameras nao precisa deste
+      // campo, e uma chave vazia em cada uma sujaria o arquivo que o usuario
+      // le e manda por mensagem.
+      if Trim(Cams[I].Ptz) <> '' then
+        O.AddPair('ptz', Cams[I].Ptz);
       Arr.AddElement(O);
     end;
     // Format e não ToJSON: o ToJSON devolve TUDO numa linha só, e o JSON não tem
@@ -373,6 +379,7 @@ begin
         // Ausente = habilitada. O campo e novo, e cameras.json antigo nao o tem
         // -- assumir False la faria as cameras existentes sumirem da lista.
         Cam.Enabled := JsonBool(O, 'enabled', True);
+        Cam.Ptz := JsonStr(O, 'ptz');
 
         EpValue := O.GetValue('endpoints');
         if EpValue is TJSONArray then

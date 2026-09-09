@@ -181,6 +181,49 @@
            border-radius:var(--r-l); max-width:80%; }
   #aviso:empty { display:none; }
 
+  /* A PTZ, num canto do video. No canto e nao no rodape porque o rodape some
+     no modo imerso, e mover a camera e justamente quando se quer a imagem
+     grande. Translucida, do mesmo jeito das barras. */
+  #ptz { position:absolute; right:12px; bottom:12px; z-index:4;
+         display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
+  #ptz[hidden] { display:none; }
+  /* O teclado propriamente dito. O botao que o abre fica FORA dele, para
+     continuar alcancavel quando ele esta fechado. */
+  #ptz-corpo { display:flex; flex-direction:column; align-items:flex-end;
+               gap:6px; }
+  #ptz-corpo[hidden] { display:none; }
+  /* Um pouco maior que os outros: e a porta de entrada, e precisa ser achada
+     sem procurar. */
+  #ptz-abrir { width:auto; padding:7px 14px; font-size:12px;
+               letter-spacing:.06em; }
+  #ptz-linha { display:flex; align-items:flex-end; gap:8px; }
+  #ptz-pad { display:grid; grid-template-columns:repeat(3, 44px);
+             grid-auto-rows:44px; gap:2px; }
+  #ptz-zoom { display:grid; grid-auto-rows:44px; gap:2px; }
+  #ptz-zoom .pt { width:44px; font-size:22px; }
+  /* A velocidade, embaixo do teclado. Tres degraus e nao um controle
+     continuo: no meio de um movimento ninguem vai mirar num valor exato, e
+     tres botoes se acertam com o polegar sem olhar. */
+  #ptz-vel { display:flex; gap:2px; }
+  /* A tira de presets, embaixo de tudo e escondida ate alguem pedir: o
+     teclado ja ocupa um canto do video, e mover e o uso comum. */
+  #ptz-presets { display:flex; gap:2px; flex-wrap:wrap;
+                 justify-content:flex-end; max-width:188px; }
+  #ptz-presets[hidden] { display:none; }
+  .pv { border:0; border-radius:var(--r-s); cursor:pointer; width:60px;
+        padding:5px 0; font-size:11px; touch-action:none;
+        background:rgba(18,18,18,.62); color:var(--sobre-sup);
+        -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px); }
+  .pv.on { background:var(--p); color:var(--sobre-p); }
+  .pt { border:0; border-radius:var(--r-s); cursor:pointer;
+        background:rgba(18,18,18,.62); color:var(--sobre-sup); font-size:18px;
+        -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
+        display:flex; align-items:center; justify-content:center;
+        /* none: o dedo aqui e comando, e nao rolagem nem zoom da pagina. */
+        touch-action:none; }
+  .pt:active { background:var(--p); color:var(--sobre-p); }
+  .pt.vazio { background:none; cursor:default; }
+
   /* As duas barras da reproducao flutuam SOBRE o video, e nao ao lado dele.
      Empilhado no fluxo, regua e controles comiam uns 120px de altura de imagem
      -- e numa janela em pe, onde o video 16:9 ja e uma faixa no meio da tela,
@@ -223,76 +266,6 @@
 
   /* ------------------------------------------------------------- textos */
   .vazio { color:var(--sobre-sup-var); text-align:center; padding:32px 16px; }
-  .err { color:var(--erro); }
-  .ajuda { color:var(--sobre-sup-var);
-           font:400 12px/16px Roboto, system-ui, sans-serif;
-           padding:4px 16px 0; margin:-8px 0 12px; }
-  .divisor { height:1px; background:var(--contorno-var); margin:8px 0; }
-
-  /* ------------------------------------------------------ campos de texto
-
-     Campo cheio do M3: fundo proprio, canto arredondado so em cima, e um
-     traco embaixo que acende na cor primaria com o foco. O rotulo comeca
-     dentro e SOBE quando ha texto -- e por isso que o input vem antes do
-     rotulo na marcacao, para o :placeholder-shown alcancar o irmao.
-
-     `label.campo`, e nao `.campo`: a regra generica de input logo abaixo tem a
-     MESMA especificidade e vem depois, entao ganhava dela -- o campo nascia com
-     o padding do input simples, sem o espaco de cima, e o rotulo flutuado caia
-     por cima do proprio valor. */
-  .campo { display:block; position:relative; margin-bottom:20px; }
-  label.campo input {
-    display:block; width:100%; box-sizing:border-box; margin:0;
-    background:var(--sup3); color:var(--sobre-sup);
-    border:0; border-bottom:1px solid var(--contorno);
-    border-radius:var(--r-xs) var(--r-xs) 0 0;
-    padding:24px 16px 8px; font:400 16px/24px Roboto, system-ui, sans-serif; }
-  label.campo input:focus { outline:none; border-bottom:2px solid var(--p);
-                       padding-bottom:7px; }
-  label.campo > span { position:absolute; left:16px; top:16px; pointer-events:none;
-                  color:var(--sobre-sup-var);
-                  font:400 16px/24px Roboto, system-ui, sans-serif;
-                  transition:transform .12s ease, color .12s ease;
-                  transform-origin:left top; }
-  /* Vazio E sem foco: o rotulo desce e ocupa o lugar do texto. */
-  label.campo input + span { transform:translateY(-10px) scale(.75); }
-  label.campo input:placeholder-shown:not(:focus) + span {
-    transform:translateY(8px) scale(1); }
-  label.campo input:focus + span { color:var(--p); }
-
-  /* Fora dos .campo (filtro, linhas de parametro) o input continua simples. */
-  input[type=text], input:not([type]), input[type=password] {
-    display:block; width:100%; box-sizing:border-box; margin-top:4px;
-    background:var(--sup3); color:var(--sobre-sup);
-    border:1px solid var(--contorno-var); border-radius:var(--r-xs);
-    padding:10px 12px; font:400 14px/20px Roboto, system-ui, sans-serif; }
-  input[type=text]:focus, input:not([type]):focus, input[type=password]:focus {
-    outline:none; border-color:var(--p); }
-  label { display:block; margin-bottom:12px; color:var(--sobre-sup-var);
-          font:400 12px/16px Roboto, system-ui, sans-serif; }
-
-  /* ------------------------------------------------------------- chave
-
-     O quadradinho virou a chave do Material: alvo maior, estado legivel de
-     longe, e o polegar cresce quando liga. */
-  label.chk { display:flex; align-items:center; gap:16px;
-              font:400 16px/24px Roboto, system-ui, sans-serif;
-              color:var(--sobre-sup); margin:8px 0 16px; cursor:pointer; }
-  label.chk input[type=checkbox] {
-    appearance:none; -webkit-appearance:none; margin:0; flex:0 0 auto;
-    width:52px; height:32px; border-radius:16px; background:var(--sup4);
-    border:2px solid var(--contorno); position:relative; cursor:pointer;
-    transition:background .12s, border-color .12s; }
-  label.chk input[type=checkbox]::after {
-    content:""; position:absolute; left:6px; top:50%; width:16px; height:16px;
-    border-radius:50%; background:var(--contorno); transform:translateY(-50%);
-    transition:left .12s ease, width .12s, height .12s, background .12s; }
-  label.chk input[type=checkbox]:checked {
-    background:var(--p); border-color:var(--p); }
-  label.chk input[type=checkbox]:checked::after {
-    left:26px; width:24px; height:24px; background:var(--sobre-p); }
-
-  .acoes { display:flex; gap:8px; margin-top:24px; flex-wrap:wrap; }
 
   /* Uma rota por linha: endereco largo, a marca de tailnet e o remover ao lado.
      Em tela estreita a marca e o botao caem para a linha de baixo em vez de
@@ -490,6 +463,7 @@
   <div class="menu" id="menu-cams">
     <button id="cfg"><svg class="ico"><use href="#i-param"/></svg>Par&acirc;metros</button>
     <button id="mov2"><svg class="ico"><use href="#i-mov"/></svg>Detec&ccedil;&atilde;o de movimento</button>
+    <button id="srvcam"><svg class="ico"><use href="#i-param"/></svg>C&acirc;meras do servidor</button>
   </div>
   <div class="rola" id="lista-cams"><div class="vazio">carregando...</div></div>
 </div>
@@ -511,6 +485,15 @@
       <span>Usu&aacute;rio</span></label>
     <label class="campo"><input id="f-senha" type="password" autocomplete="off"
       placeholder=" "><span>Senha</span></label>
+    <label class="campo"><input id="f-ptz" placeholder=" ">
+      <span>PTZ por ONVIF</span></label>
+    <div class="acoes" id="f-ptz-acoes">
+      <button class="b" id="f-procurar">Procurar</button>
+    </div>
+    <div class="ajuda">192.168.0.10:5000 &nbsp;&mdash;&nbsp; onde a c&acirc;mera
+      atende ONVIF. Deixe vazio se ela n&atilde;o se move, ou se a PTZ dela vai
+      pela pr&oacute;pria conex&atilde;o de v&iacute;deo (dvrip).
+      <b>Procurar</b> testa as portas comuns e preenche sozinho.</div>
     <label class="chk"><input type="checkbox" id="f-ativa" checked> habilitada</label>
     <div id="f-erro" class="err"></div>
     <div class="acoes">
@@ -543,6 +526,37 @@
     <canvas id="tela2d"></canvas>
     <img id="previa" alt="">
     <div id="aviso"></div>
+    <!-- A PTZ. Escondida ate o servidor dizer que esta camera se move. -->
+    <div id="ptz" hidden>
+      <div id="ptz-corpo" hidden>
+      <div id="ptz-linha">
+      <div id="ptz-pad">
+        <button class="pt" data-pan="-1" data-tilt="1">&#8598;</button>
+        <button class="pt" data-pan="0"  data-tilt="1">&#8593;</button>
+        <button class="pt" data-pan="1"  data-tilt="1">&#8599;</button>
+        <button class="pt" data-pan="-1" data-tilt="0">&#8592;</button>
+        <button class="pt vazio" disabled></button>
+        <button class="pt" data-pan="1"  data-tilt="0">&#8594;</button>
+        <button class="pt" data-pan="-1" data-tilt="-1">&#8601;</button>
+        <button class="pt" data-pan="0"  data-tilt="-1">&#8595;</button>
+        <button class="pt" data-pan="1"  data-tilt="-1">&#8600;</button>
+      </div>
+      <div id="ptz-zoom">
+        <button class="pt" data-zoom="1">+</button>
+        <button class="pt" data-zoom="-1">&minus;</button>
+      </div>
+      </div>
+      <div id="ptz-vel">
+        <button class="pv" data-vel="350">lenta</button>
+        <button class="pv" data-vel="700">m&eacute;dia</button>
+        <button class="pv" data-vel="1000">r&aacute;pida</button>
+        <button class="pv" id="ptz-p" title="Posi&ccedil;&otilde;es guardadas"
+                hidden>P</button>
+      </div>
+      <div id="ptz-presets" hidden></div>
+      </div>
+      <button class="pv" id="ptz-abrir">PTZ</button>
+    </div>
   </div>
   <div id="rodape">
     <div id="linha"><canvas id="regua"></canvas></div>
@@ -578,6 +592,19 @@
 </div>
 
 <!-- ------------------------------------------------------------ sintonia -->
+<div class="tela" id="t-srvcam">
+  <header>
+    <button class="icone" id="v-srvcam" title="Voltar">
+      <svg class="ico"><use href="#i-voltar"/></svg></button>
+    <h1>C&acirc;meras do servidor</h1>
+  </header>
+  <!-- Em iframe pelo mesmo motivo da sintonia: a pagina e a MESMA que o
+       vmsserver serve, e o que ela le e grava vai encaminhado para la. Quem
+       tem o banco de cameras e o servidor, nao o aparelho. -->
+  <iframe id="quadro-srvcam" style="flex:1 1 0; min-height:0; border:0;
+          width:100%; background:#121212"></iframe>
+</div>
+
 <div class="tela" id="t-mov">
   <header>
     <button class="icone" id="v-mov" title="Voltar">
@@ -628,9 +655,13 @@ var tocavaAoSair = false;
 
 function mostrar(qual) {
   ["t-home", "t-servs", "t-edserv", "t-cfg", "t-cams", "t-dias", "t-play",
-   "t-edit", "t-mov", "t-evs"].forEach(function (id) {
+   "t-edit", "t-mov", "t-evs", "t-srvcam"].forEach(function (id) {
     $(id).className = "tela" + (id === qual ? " on" : "");
   });
+  // A parada da PTZ vem ANTES de qualquer saida antecipada, e nao depende de
+  // haver player: trocar de tela com o botao ainda apertado deixaria a camera
+  // girando ate o teto de tempo, e ninguem estaria olhando para ela.
+  ptzParar();
   if (!tocador) return;
   if (qual !== "t-play") {
     // Sair da reproducao encerra o player: decodificador de hardware e recurso
@@ -739,6 +770,9 @@ function ajustarBotoesDaLista() {
   $("cams-menu").style.display = srv ? "" : "none";
   $("cfg").style.display = srv ? "" : "none";
   $("mov2").style.display = srv ? "" : "none";
+  // O cadastro de cameras e do SERVIDOR: fora de um, nao ha o que cadastrar
+  // aqui -- as cameras do aparelho tem a tela propria.
+  $("srvcam").style.display = srv ? "" : "none";
   // No proprio servidor a lista e a raiz: nao ha tela atras dela.
   $("v-cams").style.display = hostServidor ? "none" : "";
 }
@@ -1070,6 +1104,9 @@ function aoVivo(camera) {
   // gravacao anterior, ela sai agora.
   esconderPrevia();
   mostrar("t-play");
+  // Depois do mostrar, e nao antes: quem pergunta pela PTZ desiste sozinho ao
+  // ver que a tela mudou, e antes do mostrar a tela ainda e a anterior.
+  verSeTemPtz();
   garantirTocador();
   tocador.abrirAoVivo(camera);
   $("tocar").textContent = "Pausar";
@@ -1148,6 +1185,9 @@ function abrirPlayer(camera, d, msInicial) {
 
   // No instante pedido, quando houve um; senao no fim do dia gravado, que e
   // onde quase sempre se quer olhar.
+  // Gravacao nao mostra PTZ: mover a camera nao muda o que ja foi gravado.
+  ptzParar();
+  $("ptz").hidden = true;
   var alvo = msInicial || (Math.min(d.endMs, Date.now()) - 30000);
   // Abrir um dia e um salto como qualquer outro: a previa cobre a espera pelo
   // fragmento e pela decodificacao, e sai no primeiro quadro.
@@ -1344,6 +1384,305 @@ function esconderPrevia() {
 // Minuto sem imagem responde 404, e uma imagem quebrada seria pior do que o
 // video velho: some, e o palco volta a ser o que era.
 $("previa").addEventListener("error", esconderPrevia);
+
+
+// -------------------------------------------------- o log do app no console
+//
+// O que o Delphi registra sai aqui, no console do navegador: F12 no Windows,
+// chrome://inspect no Android. Antes da interface em HTML havia um TMemo na
+// tela mostrando estas linhas; ele saiu junto com o formulario, e desde entao
+// o log so existia no arquivo -- que no aparelho ninguem abre.
+//
+// Fica nesta pagina e nao nas outras porque as outras sao iframes DENTRO
+// dela: esta casca nao e abandonada enquanto o app estiver aberto, e um
+// console so basta.
+//
+// A posicao da ultima linha vista viaja no pedido, entao recarregar a pagina
+// nao perde o que ja aconteceu e nada e mostrado duas vezes.
+(function () {
+  var pos = -1, tropecos = 0;
+  var PASSO_MS = 700;
+  function ciclo(atraso) {
+    setTimeout(function () {
+      fetch("/api/app/log" + (pos >= 0 ? "?desde=" + pos : ""))
+        .then(function (r) {
+          if (!r.ok) throw new Error("http " + r.status);
+          return r.json();
+        })
+        .then(function (j) {
+          tropecos = 0;
+          pos = j.proxima;
+          (j.linhas || []).forEach(function (l) {
+            // O nivel abre a linha, em cinco colunas: "ERROR", "WARN ", ...
+            var n = l.slice(0, 5).trim();
+            var m = n === "ERROR" ? "error" : (n === "WARN" ? "warn" : "log");
+            // DEBUG entra como log, e nao como console.debug: o devtools
+            // esconde debug por padrao, e um log que so aparece depois de
+            // mexer num filtro nao e um log que se tem.
+            console[m]("[app] " + l);
+          });
+          ciclo(PASSO_MS);
+        })
+        .catch(function (e) {
+          // Servida pelo vmsserver, esta rota nao existe -- e ai o certo e
+          // desistir, nao insistir para sempre. Tres tropecos separam isso de
+          // uma falha de rede passageira.
+          tropecos++;
+          if (tropecos >= 3) {
+            console.info("[app] sem log local (" + e.message +
+                         "): esta pagina nao esta rodando dentro do app");
+            return;
+          }
+          ciclo(2000);
+        });
+    }, atraso);
+  }
+  ciclo(0);
+})();
+
+// ------------------------------------------------------------------- PTZ
+//
+// Botao que se segura: apertar manda andar, soltar manda parar. Nao ha "andar
+// um pouquinho" no protocolo -- a camera anda ate mandarem parar, e se a
+// parada nao chegar ela vai ate o fim do curso. Por isso a parada e amarrada em
+// pointerup, pointercancel E pointerleave, e ainda ha um teto de tempo: dedo
+// que escorrega para fora da tela, aba que perde o foco no meio do gesto, ou
+// uma resposta que nunca volta nao podem deixar a camera girando.
+//
+// A tela nao sabe se a camera fala ONVIF ou DVRIP, e nem precisa: o servidor
+// resolve isso e a rota e a mesma. Aqui so se diz para onde ir.
+
+var TETO_PTZ_MS = 8000;
+var ptzAndando = false;
+var ptzRelogio = null;
+
+function ptzPedir(params) {
+  if (!camAtual) return Promise.resolve({});
+  // O corpo do erro vale tanto quanto o do acerto: e nele que vem "sem sessao
+  // viva para X", que e a diferenca entre "esta camera nao tem PTZ" e "nao
+  // estou conectado nela".
+  return fetch(api("/api/ptz?camera=" + encodeURIComponent(camAtual) + params))
+    .then(function (r) { return r.json(); })
+    .catch(function () { return {}; });
+}
+
+function ptzParar() {
+  if (ptzRelogio) { clearTimeout(ptzRelogio); ptzRelogio = null; }
+  if (!ptzAndando) return;
+  ptzAndando = false;
+  ptzPedir("&acao=parar");
+}
+
+function ptzAndar(pan, tilt, zoom) {
+  if (ptzAndando) return;
+  ptzAndando = true;
+  // Milesimos, e nao decimal: sem ponto nem virgula para errar na query.
+  ptzPedir("&acao=mover&pan=" + Math.round(pan * 1000) +
+           "&tilt=" + Math.round(tilt * 1000) +
+           "&zoom=" + Math.round(zoom * 1000));
+  if (ptzRelogio) clearTimeout(ptzRelogio);
+  ptzRelogio = setTimeout(ptzParar, TETO_PTZ_MS);
+}
+
+// Os presets: posicoes que alguem guardou NA CAMERA, pelo aplicativo do
+// fabricante ou pela interface dela.
+//
+// Os dois protocolos os tratam diferente, e a tela esconde isso. A ONVIF sabe
+// listar: cada preset tem token e nome, e os botoes saem com o nome de verdade.
+// O DVRIP nao lista nada -- so aceita "va para o numero N" --, entao ali os
+// botoes sao numeros, e um numero sem preset guardado simplesmente nao move a
+// camera. Quatro deles, que e o que cabe na largura do teclado.
+var PRESETS_DVRIP = 4;
+
+function montarPresets(via) {
+  var alvo = $("ptz-presets");
+  alvo.innerHTML = "";
+  alvo.hidden = true;
+  if (via === "onvif") {
+    ptzPedir("&acao=presets").then(function (j) {
+      var lista = (j && j.presets) || [];
+      lista.forEach(function (p) {
+        alvo.appendChild(botaoPreset(p.token, p.nome || p.token));
+      });
+      // Camera ONVIF sem preset guardado nao ganha tira nenhuma: um botao que
+      // nao leva a lugar nenhum e pior do que a ausencia dele.
+      $("ptz-p").hidden = lista.length === 0;
+    });
+    return;
+  }
+  for (var i = 1; i <= PRESETS_DVRIP; i++)
+    alvo.appendChild(botaoPreset(String(i), String(i)));
+  $("ptz-p").hidden = false;
+}
+
+function botaoPreset(valor, rotulo) {
+  var b = document.createElement("button");
+  b.className = "pv";
+  b.style.width = "44px";
+  b.textContent = rotulo.length > 6 ? rotulo.slice(0, 6) : rotulo;
+  b.title = rotulo;
+  b.addEventListener("click", function () {
+    ptzPedir("&acao=preset&n=" + encodeURIComponent(valor)).then(function (j) {
+      if (!(j && j.ok))
+        console.info("[ptz] preset " + rotulo + ": " +
+                     ((j && (j.error || j.motivo)) || "sem resposta"));
+    });
+  });
+  return b;
+}
+
+// Pergunta ao servidor se ESTA camera se move, e so entao mostra os controles.
+// Prometer botao que nao faz nada e pior do que nao ter botao.
+//
+// Perguntando VARIAS vezes, porque a resposta muda com o tempo. Quem executa o
+// comando e a sessao ja autenticada da camera, e no instante em que esta tela
+// abre ela ainda esta conectando: no log do app o "login resp" chega segundos
+// depois do primeiro testar. Uma pergunta so respondia sempre "nao tem sessao
+// viva", e era esse o motivo de os botoes nunca aparecerem.
+//
+// As esperas dobram e acabam em pouco mais de um minuto. Passado isso nao e
+// demora: ou a camera nao fala PTZ, ou a conexao nao vai vir, e insistir para
+// sempre seria um pedido por segundo pelo resto da tela aberta.
+var ESPERAS_PTZ_MS = [0, 1000, 2000, 4000, 8000, 16000, 30000];
+
+// Abre ou fecha o teclado. A parada vem junto do fechar: pode haver um
+// movimento em curso, e some-lo da tela sem parar deixaria a camera girando
+// ate o teto de tempo com o teclado ja fora de vista.
+function alternarPtz(abrir) {
+  var corpo = $("ptz-corpo");
+  var mostrar = (abrir === undefined) ? corpo.hidden : abrir;
+  if (!mostrar) ptzParar();
+  corpo.hidden = !mostrar;
+  $("ptz-abrir").classList.toggle("on", mostrar);
+}
+
+function verSeTemPtz() {
+  $("ptz").hidden = true;
+  // Fechado a cada abertura do ao vivo: o estado normal e assistir, e quem
+  // quer mover pede.
+  alternarPtz(false);
+  $("ptz-presets").hidden = true;
+  $("ptz-p").hidden = true;
+  // Sem exigir servidor: quem conecta direto na camera e justamente quem tem a
+  // sessao viva capaz de mover, e o proprio app responde esta rota.
+  if (!camAtual) return;
+  var cam = camAtual, i = 0;
+
+  function tentar() {
+    // Trocou de camera, ou saiu da reproducao: esta pergunta ja nao interessa
+    // a ninguem, e quem entrar na proxima tela faz a dele.
+    if (camAtual !== cam || !$("t-play").classList.contains("on")) return;
+    ptzPedir("&acao=testar").then(function (j) {
+      if (camAtual !== cam || !$("t-play").classList.contains("on")) return;
+      if (j && j.ok) {
+        $("ptz").hidden = false;
+        // O `via` diz qual protocolo atendeu, e e ele que decide se da para
+        // listar os presets ou se eles viram numeros.
+        montarPresets(j.via);
+        return;
+      }
+      var porque = (j && (j.error || j.motivo)) || "sem resposta";
+      i++;
+      if (i < ESPERAS_PTZ_MS.length) {
+        // A PRIMEIRA recusa ja aparece, marcada como provisoria. Guardar o
+        // motivo ate a ultima tentativa deixava um minuto de silencio entre
+        // "abri o ao vivo" e "por que nao ha botao" -- e nesse minuto a
+        // impressao e de que nada foi tentado.
+        if (i === 1)
+          console.info("[ptz] " + cam + ": " + porque +
+                       " (pergunto de novo enquanto ela conecta)");
+        setTimeout(tentar, ESPERAS_PTZ_MS[i]);
+        return;
+      }
+      console.info("[ptz] " + cam + " sem PTZ: " + porque);
+    });
+  }
+
+  tentar();
+}
+
+// A velocidade escolhida, em milesimos do maximo.
+//
+// O comando sai normalizado (0 a 1) e cada protocolo faz a conta dele: o DVRIP
+// tem oito passos discretos, o ONVIF tem velocidade continua. Guardar o valor
+// normalizado, e nao "passo 6", deixa a tela sem saber com qual dos dois esta
+// falando -- que e o mesmo motivo de a rota ser uma so.
+var ptzVel = 1000;
+var PTZ_VEL_CHAVE = "vms.ptz.vel";
+
+function lembrarVelocidade() {
+  // O acesso pode LEVANTAR excecao, e nao so vir vazio: aba anonima e
+  // navegador com dados de site bloqueados fazem isso.
+  try {
+    var v = parseInt(localStorage.getItem(PTZ_VEL_CHAVE), 10);
+    if (v === 350 || v === 700 || v === 1000) ptzVel = v;
+  } catch (e) {}
+  Array.prototype.forEach.call(document.querySelectorAll("#ptz-vel .pv[data-vel]"),
+    function (b) {
+      b.classList.toggle("on", parseInt(b.dataset.vel, 10) === ptzVel);
+    });
+}
+
+(function () {
+  // O que comeca na PTZ e da PTZ, e nao do palco.
+  //
+  // O palco esta debaixo dela e pede setPointerCapture no pointerdown, para a
+  // pinca de zoom nao se perder quando o dedo sai do canvas. Sem esta barreira
+  // a captura mudava de dono no meio do aperto, e o navegador passava a
+  // entregar os eventos ao palco: o botao de velocidade ficava sem o pointerup
+  // que gera o click, e a seta levava um pointerleave -- que e uma das paradas
+  // da PTZ -- milissegundos depois de comecar a andar.
+  //
+  // No borbulhamento, e nao na captura: os proprios botoes ja trataram o
+  // evento quando ele chega aqui.
+  ["pointerdown", "pointerup", "pointercancel", "pointermove",
+   "dblclick", "wheel"].forEach(function (n) {
+    $("ptz").addEventListener(n, function (ev) { ev.stopPropagation(); });
+  });
+
+  $("ptz-abrir").addEventListener("click", function () { alternarPtz(); });
+
+  // O botao que abre e fecha a tira de presets. Fica na linha da velocidade
+  // porque as duas sao escolhas, e nao comandos que se seguram.
+  $("ptz-p").addEventListener("click", function () {
+    $("ptz-presets").hidden = !$("ptz-presets").hidden;
+  });
+
+  Array.prototype.forEach.call(document.querySelectorAll("#ptz-vel .pv[data-vel]"),
+    function (b) {
+      b.addEventListener("click", function () {
+        ptzVel = parseInt(b.dataset.vel, 10);
+        try { localStorage.setItem(PTZ_VEL_CHAVE, String(ptzVel)); } catch (e) {}
+        lembrarVelocidade();
+      });
+    });
+  lembrarVelocidade();
+
+  var VEL = function () { return ptzVel / 1000; };
+  Array.prototype.forEach.call(document.querySelectorAll("#ptz .pt"),
+    function (b) {
+      if (b.disabled) return;
+      b.addEventListener("pointerdown", function (ev) {
+        ev.preventDefault();
+        // Captura: o pointerup vem para ESTE botao mesmo que o dedo tenha
+        // escorregado para fora dele.
+        try { b.setPointerCapture(ev.pointerId); } catch (e) {}
+        // Lida no APERTO, e nao guardada: trocar a velocidade entre um
+        // movimento e outro tem de valer no proximo, sem recarregar a tela.
+        var v = VEL();
+        ptzAndar((b.dataset.pan | 0) * v, (b.dataset.tilt | 0) * v,
+                 (b.dataset.zoom | 0) * v);
+      });
+      ["pointerup", "pointercancel", "pointerleave"].forEach(function (n) {
+        b.addEventListener(n, ptzParar);
+      });
+    });
+  // Sair da tela, trocar de camera ou esconder a aba tambem para: qualquer um
+  // desses acontece com o dedo ainda apertado.
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) ptzParar();
+  });
+})();
 
 // ---------------------------------------------------- gestos sobre a regua
 
@@ -2030,7 +2369,9 @@ function editar(nome) {
   $("f-url").value = c ? (c.url || "") : "";
   $("f-user").value = c ? (c.user || "") : "";
   $("f-senha").value = c ? (c.password || "") : "";
+  $("f-ptz").value = c ? (c.ptz || "") : "";
   $("f-ativa").checked = c ? (c.enabled !== false) : true;
+  $("f-erro").className = "err";
   $("f-erro").textContent = "";
   $("f-excluir").style.display = c ? "" : "none";
   mostrar("t-edit");
@@ -2053,6 +2394,57 @@ function gravarCadastro(lista) {
 
 $("v-edit").onclick = voltarParaLista;
 
+// Descobre em que porta a camera atende ONVIF, e preenche o campo.
+//
+// A porta nao se adivinha: a norma nao fixa nenhuma, e nenhuma das cameras
+// daqui usa a 80. Sem este botao, cadastrar camera nova exigia capturar a rede
+// do aplicativo do fabricante para ler o endereco -- que foi como a porta 5000
+// da Ayla apareceu, e nao e um pedido razoavel de se fazer a alguem.
+//
+// Vai por POST porque leva a senha da camera, e senha nao entra em URL: ela
+// ficaria no historico e em qualquer log de acesso pelo caminho.
+$("f-procurar").onclick = function () {
+  var url = $("f-url").value.trim();
+  if (!url) {
+    $("f-erro").className = "err";
+    $("f-erro").textContent = "escreva a URL da c\u00e2mera primeiro";
+    return;
+  }
+  $("f-erro").className = "warn";
+  $("f-erro").textContent = "procurando nas portas comuns...";
+  fetch("/api/ptz/procurar", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: url, user: $("f-user").value,
+                           password: $("f-senha").value })
+  }).then(function (r) {
+    return r.json().then(function (j) {
+      if (!r.ok) throw new Error(j.error || ("erro " + r.status));
+      return j;
+    });
+  }).then(function (j) {
+    if (j.melhor) {
+      $("f-ptz").value = j.melhor;
+      $("f-erro").className = "ok";
+      $("f-erro").textContent = "achei em " + j.melhor + ". Salve para valer.";
+      return;
+    }
+    // Respondeu ONVIF mas sem PTZ e uma resposta diferente de nao respondeu
+    // nada: a primeira quer dizer camera fixa, e nao vale procurar de novo.
+    var portas = (j.achados || []).map(function (a) { return a.porta; });
+    $("f-erro").className = "warn";
+    $("f-erro").textContent = portas.length
+      ? ("responde ONVIF na porta " + portas.join(", ") +
+         ", mas essa c\u00e2mera n\u00e3o tem PTZ")
+      : "n\u00e3o achei ONVIF nas portas comuns. Se a c\u00e2mera for " +
+        "dvrip, a PTZ dela vai pela conex\u00e3o de v\u00eddeo e este " +
+        "campo fica vazio.";
+  }).catch(function (e) {
+    $("f-erro").className = "err";
+    $("f-erro").textContent = String(e.message || e);
+  });
+};
+
 $("f-salvar").onclick = function () {
   if (!temCadastro()) return;
   var nome = $("f-nome").value.trim(), url = $("f-url").value.trim();
@@ -2060,11 +2452,20 @@ $("f-salvar").onclick = function () {
     $("f-erro").textContent = "nome e URL s\u00e3o obrigat\u00f3rios";
     return;
   }
-  var c = {
-    name: nome, url: url,
-    user: $("f-user").value, password: $("f-senha").value,
-    enabled: $("f-ativa").checked
-  };
+  // Parte da camera que ja existe, e nao de um objeto novo: o formulario mostra
+  // cinco campos, mas o arquivo guarda mais (caminhos alternativos, atrasos de
+  // audio e video, tentativas). Montando do zero, editar o nome apagava tudo
+  // isso em silencio.
+  var c = editando >= 0 ? JSON.parse(JSON.stringify(config[editando])) : {};
+  c.name = nome;
+  c.url = url;
+  c.user = $("f-user").value;
+  c.password = $("f-senha").value;
+  c.enabled = $("f-ativa").checked;
+  c.ptz = $("f-ptz").value.trim();
+  // Vazio sai do objeto em vez de virar "": e assim que o Delphi entende
+  // "esta camera nao tem ONVIF".
+  if (!c.ptz) delete c.ptz;
   // A lista inteira vai de uma vez: o servidor substitui, e assim nao e preciso
   // inventar identidade estavel para camera que o usuario pode renomear.
   var lista = config.slice();
@@ -2127,6 +2528,20 @@ function abrirSintonia() {
   quadro.setAttribute("src", "about:blank");
   setTimeout(function () { quadro.setAttribute("src", u); }, 0);
   mostrar("t-mov");
+}
+
+// O cadastro de cameras do servidor, na pagina que ele mesmo serve.
+//
+// Recarrega sempre, como a sintonia: voltando a esta tela o que interessa e o
+// que esta gravado agora, e nao o formulario deixado pela metade da vez
+// passada.
+function abrirCamerasDoServidor() {
+  var u = "/ui/cameras";
+  if (servAtual) u += "?server=" + encodeURIComponent(servAtual);
+  var quadro = $("quadro-srvcam");
+  quadro.setAttribute("src", "about:blank");
+  setTimeout(function () { quadro.setAttribute("src", u); }, 0);
+  mostrar("t-srvcam");
 }
 
 // Os eventos do dia aberto. Fora de um dia (ao vivo), a janela e o dia de hoje
@@ -2258,6 +2673,8 @@ $("v-evs").onclick = function () { mostrar("t-play"); };
 // So pela lista de cameras: a sintonia e do SERVIDOR, e nao da visualizacao de
 // uma camera -- de dentro dela o botao so competia por espaco.
 $("mov2").onclick = abrirSintonia;
+$("srvcam").onclick = abrirCamerasDoServidor;
+$("v-srvcam").onclick = function () { mostrar("t-cams"); };
 $("v-mov").onclick = function () { mostrar("t-cams"); };
 
 // --------------------------------------------- barras que sao do video
@@ -2511,6 +2928,7 @@ window.vmsVoltar = function () {
   if (qual === "t-dias") { mostrar(listaDeOrigem); return true; }
   if (qual === "t-edit") { voltarParaLista(); return true; }
   if (qual === "t-mov") { mostrar("t-cams"); return true; }
+  if (qual === "t-srvcam") { mostrar("t-cams"); return true; }
   if (qual === "t-evs") { mostrar("t-play"); return true; }
   return false;   // ja na raiz: o app que decida
 };

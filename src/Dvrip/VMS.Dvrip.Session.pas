@@ -18,11 +18,12 @@ uses
   VMS.Domain.Clock,
   VMS.Domain.MediaSink,
   VMS.Domain.Session,
+  VMS.Domain.Ptz,
   VMS.Dvrip.Protocol,
   VMS.Dvrip.Media;
 
 type
-  TDvripSession = class
+  TDvripSession = class(TInterfacedObject, IPtzSession)
   strict private
     FConfig: TCameraSessionConfig;
     FLogger: ILogger;
@@ -53,6 +54,11 @@ type
     FFramingResyncs: Integer;  // quantas vezes o enquadramento saiu de sincronia
     FWarnedMsgIDs: array[0..7] of Word; // rate-limit: 1 aviso por MsgID duvidoso
     FWarnedCount: Integer;
+    // Escrever no socket deixou de ser coisa de uma thread so quando a PTZ
+    // entrou: o comando vem da thread do HTTP e o keepalive continua saindo
+    // desta aqui. Duas escritas ao mesmo tempo intercalariam bytes no meio de
+    // um pacote, e o que a camera veria seria lixo com cabecalho valido.
+    FEnvio: TCriticalSection;
     function ParseHostPort(out Host: string; out Port: Word): Boolean;
     function NextSeq: Cardinal;
     function MonitorJson(const Action, StreamType: string): string;
@@ -79,6 +85,20 @@ type
     function StreamedOk: Boolean;
     // Teste de conexão: connect + login + config, sem OPMonitor Start.
     function TestConnection(out Info: string): Boolean;
+    { IPtzSession }
+    //
+    // SEM contagem de referência, de propósito. Quem cria e destrói esta sessão
+    // é o supervisor, com Free. Se a interface contasse referências, o registro
+    // largar a dele zeraria a conta, o objeto se destruiria sozinho, e o
+    // supervisor destruiria de novo logo depois. O tempo de vida continua sendo
+    // de quem criou; o registro apenas aponta.
+    function _AddRef: Integer; stdcall;
+    function _Release: Integer; stdcall;
+    function MoverPtz(const Comando: string; Passo, Canal: Integer;
+                      Iniciar: Boolean): Boolean;
+    function IrParaPreset(Preset, Canal: Integer;
+                          const Comando: string = ''): Boolean;
+    function PerguntarConfig(const Nome: string): Boolean;
   end;
 
 implementation
@@ -93,6 +113,7 @@ begin
   FStopEvent := AStopEvent;
   FMediaSink := AMediaSink;
   FTag := 'dvrip.' + FConfig.Name;
+  FEnvio := TCriticalSection.Create;
   FParser := TDvripMediaParser.Create;
   FParser.SetLogger(FLogger, FTag);
   FParser.SetOnVideo(
@@ -112,7 +133,8 @@ begin
   try
     if FTcp <> nil then FTcp.Disconnect;
   except
-  end;
+    FEnvio.Free;
+end;
   FTcp := nil;
   FParser.Free;
   inherited;
@@ -284,7 +306,13 @@ var
   Ret: Integer;
 begin
   // Claim (reserva o stream) no MsgID 1413 e lê a resposta.
-  DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_OPMONITOR_CLAIM, MonitorJson('Claim', FStreamType));
+  FEnvio.Enter;
+  try
+    DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_OPMONITOR_CLAIM,
+                 MonitorJson('Claim', FStreamType));
+  finally
+    FEnvio.Leave;
+  end;
   if DvripRecv(FTcp, Hdr, Payload, FConfig.RtspTimeoutMs) then
   begin
     Ret := JsonGetInt(TEncoding.UTF8.GetString(Payload), 'Ret', -1);
@@ -294,7 +322,13 @@ begin
         '); a câmera pode não aceitar esse StreamType');
   end;
   // Start (abre o fluxo) no MsgID 1410. A resposta e a mídia são tratadas no loop.
-  DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_OPMONITOR, MonitorJson('Start', FStreamType));
+  FEnvio.Enter;
+  try
+    DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_OPMONITOR,
+                 MonitorJson('Start', FStreamType));
+  finally
+    FEnvio.Leave;
+  end;
 end;
 
 procedure TDvripSession.CheckKeepAlive;
@@ -303,8 +337,13 @@ var
 begin
   ElapsedS := (FClock.MonotonicMs - FLastKeepAliveMs) div 1000;
   if ElapsedS < (FAliveInterval div 2) then Exit;
-  DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_KEEPALIVE,
-    Format('{ "Name" : "KeepAlive", "SessionID" : "0x%x" }', [FSessionID]));
+  FEnvio.Enter;
+  try
+    DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_KEEPALIVE,
+      Format('{ "Name" : "KeepAlive", "SessionID" : "0x%x" }', [FSessionID]));
+  finally
+    FEnvio.Leave;
+  end;
   FLastKeepAliveMs := FClock.MonotonicMs;
 end;
 
@@ -657,8 +696,14 @@ begin
     FLogger.Info(FTag, Format('StreamType=%s CombinMode=%s', [FStreamType, FCombinMode]));
 
     StartMonitor;
+    // Daqui em diante ha conexao autenticada: a rota de PTZ pode achar esta
+    // sessao pelo nome da camera. Sai do registro no finally, aconteca o que
+    // acontecer -- sessao morta no registro faria a rota escrever num socket
+    // fechado em vez de dizer que a camera caiu.
+    TPtzRegistry.Anunciar(FConfig.Name, Self);
     ReceiveLoop;
   finally
+    TPtzRegistry.Apagar(FConfig.Name);
     try
       if FTcp <> nil then FTcp.Disconnect;
     except
@@ -666,6 +711,101 @@ begin
     FTcp := nil;
     if FMediaSink <> nil then
       FMediaSink.OnStreamStopped;
+  end;
+end;
+
+// -1 nos dois: a contagem de referência fica desligada. Ver a declaração.
+function TDvripSession._AddRef: Integer;
+begin
+  Result := -1;
+end;
+
+function TDvripSession._Release: Integer;
+begin
+  Result := -1;
+end;
+
+// Manda um comando de PTZ pela conexao que ja esta logada.
+//
+// Andar e parar sao a MESMA mensagem, mudando so o Preset -- ver DvripPtzJson.
+// Quem chama e responsavel por mandar a parada.
+//
+// Nao ha espera por resposta: a confirmacao da camera chega no laco de recepcao
+// como qualquer outra mensagem, e bloquear aqui esperando por ela seguraria a
+// thread do HTTP por um tempo que nao se controla. Falso aqui quer dizer "nao
+// consegui ESCREVER", que e o unico erro que este lado enxerga.
+// Pede uma secao da configuracao. A resposta chega pelo laco de recepcao e vai
+// para o log; ver o comentario da declaracao em VMS.Domain.Ptz.
+function TDvripSession.PerguntarConfig(const Nome: string): Boolean;
+begin
+  Result := False;
+  if (FTcp = nil) or (Trim(Nome) = '') then Exit;
+  FEnvio.Enter;
+  try
+    if FTcp = nil then Exit;
+    try
+      DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_CONFIG_GET,
+        Format('{ "Name" : "%s", "SessionID" : "0x%.8x" }',
+               [Nome, FSessionID]));
+      FLogger.Info(FTag, 'perguntei a configuracao ' + Nome);
+      Result := True;
+    except
+      on E: Exception do
+        FLogger.Warn(FTag, 'config ' + Nome + ': ' + E.Message);
+    end;
+  finally
+    FEnvio.Leave;
+  end;
+end;
+
+// A mesma trava e o mesmo cuidado do MoverPtz: a conexao pode cair entre o
+// teste e o envio, e duas threads nao podem escrever no mesmo socket.
+function TDvripSession.IrParaPreset(Preset, Canal: Integer;
+  const Comando: string): Boolean;
+var
+  Qual: string;
+begin
+  Result := False;
+  if FTcp = nil then Exit;
+  if Trim(Comando) = '' then Qual := DVRIP_PTZ_PRESET_IR else Qual := Comando;
+  FEnvio.Enter;
+  try
+    if FTcp = nil then Exit;
+    try
+      DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_PTZ,
+                   DvripPresetJson(Preset, Canal,
+                                   Format('0x%.8x', [FSessionID]), Qual));
+      Result := True;
+    except
+      on E: Exception do
+        FLogger.Warn(FTag, Format('ptz %s %d: %s', [Qual, Preset, E.Message]));
+    end;
+  finally
+    FEnvio.Leave;
+  end;
+end;
+
+function TDvripSession.MoverPtz(const Comando: string; Passo, Canal: Integer;
+  Iniciar: Boolean): Boolean;
+begin
+  Result := False;
+  if (FTcp = nil) or (Trim(Comando) = '') then Exit;
+  FEnvio.Enter;
+  try
+    // Reconferido DENTRO da trava: entre o teste acima e aqui, o laco de
+    // recepcao pode ter derrubado a conexao.
+    if FTcp = nil then Exit;
+    try
+      DvripSendCmd(FTcp, FSessionID, NextSeq, DVRIP_PTZ,
+                   DvripPtzJson(Comando, Passo, Canal, Iniciar,
+                                Format('0x%.8x', [FSessionID])));
+      Result := True;
+    except
+      on E: Exception do
+        FLogger.Warn(FTag, 'ptz ' + Comando + ': ' + E.Message);
+    end;
+  finally
+    FEnvio.Leave;
   end;
 end;
 

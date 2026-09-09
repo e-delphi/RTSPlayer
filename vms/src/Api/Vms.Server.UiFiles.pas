@@ -78,6 +78,14 @@ function UiTexto(const NomeArquivo: string): string;
 // concordarem sobre o que a pasta precisa ter.
 function UiArquivos: TArray<string>;
 
+// Tamanho e data do arquivo principal da interface, em uma linha.
+//
+// É a diferença entre "a pasta está lá" e "a pasta está ATUAL". No aparelho a
+// interface é uma cópia depositada na instalação; quando ela fica para trás, o
+// sintoma é uma tela que se comporta como versão antiga, e sem isto a procura
+// começa pelo lado errado, no Delphi.
+function UiCarimbo: string;
+
 // Os que faltam na pasta, em uma linha. Vazio = está tudo lá.
 //
 // É o que o servidor diz no log ao subir. Descobrir pelo navegador que um
@@ -156,7 +164,27 @@ function UiArquivos: TArray<string>;
 begin
   Result := TArray<string>.Create(
     'app-ui.html', 'player-ui.html', 'events-ui.html', 'motion-ui.html',
-    'login-ui.html', 'ui.css', 'player.js', 'vmsreader.js', 'favicon.svg');
+    'cameras-ui.html', 'login-ui.html', 'ui.css', 'player.js', 'vmsreader.js',
+    'favicon.svg');
+end;
+
+function UiCarimbo: string;
+var
+  Alvo: string;
+begin
+  Alvo := TPath.Combine(UiDir, 'app-ui.html');
+  if not TFile.Exists(Alvo) then Exit('app-ui.html AUSENTE');
+  try
+    Result := Format('app-ui.html %d bytes de %s',
+                     [TFile.GetSize(Alvo),
+                      FormatDateTime('yyyy-mm-dd hh:nn',
+                                     TFile.GetLastWriteTime(Alvo))]);
+  except
+    // Pasta sem permissão de leitura de atributo: o carimbo é diagnóstico, e
+    // diagnóstico que levanta exceção atrapalha mais do que ajuda.
+    on E: Exception do
+      Result := 'app-ui.html sem carimbo: ' + E.Message;
+  end;
 end;
 
 function UiFaltando: string;

@@ -44,6 +44,7 @@ uses
   System.Classes,
   System.SyncObjs,
   System.JSON,
+  System.Generics.Collections,
   System.Net.HttpClient,
   System.Net.URLClient,   // TNameValuePair, do cabecalho encaminhado
   System.NetEncoding,     // Base64 do Authorization: Basic
@@ -52,6 +53,10 @@ uses
   IdCustomHTTPServer,
   IdHTTPServer,
   IdSocketHandle,
+  // O MESMO cliente que o vmsserver usa: camera nao muda de protocolo por
+  // estar sendo vista de um celular. Na interface, e nao na implementacao,
+  // porque o tipo dele aparece na declaracao da classe.
+  Vms.Onvif.Client,
   VMS.Domain.Logging;
 
 type
@@ -92,6 +97,17 @@ type
   // "o voltar chegou na pagina ja na raiz": e para o app fechar.
   TSairProc = procedure of object;
 
+  // Onde falar ONVIF com uma camera DESTE aparelho, e com que credencial.
+  // False = a camera nao esta no cadastro. Endereco vazio nao e erro: e camera
+  // que nao tem ONVIF, e a rota responde isso em vez de tentar a esmo.
+  TOnvifCamFunc = function(const Camera: string;
+                           out XAddr, Usuario, Senha: string): Boolean of object;
+
+  // As linhas de log a partir de uma posicao, e a posicao seguinte. E o app
+  // que guarda o buffer (ver TMemoLogger); aqui so se transporta.
+  TLogLerFunc = function(Posicao: Int64;
+                         out Proxima: Int64): TArray<string> of object;
+
   // Decodificacao nativa, para o que o WebView nao da conta (ver
   // VMS.App.Decodificacao). Devolve quantos samples ficaram pendentes, ou -1
   // quando o fragmento nao serviu.
@@ -126,6 +142,17 @@ type
     FOnDecodeAlimentar: TDecodeAlimentarFunc;
     FOnDecodeQuadro: TDecodeQuadroFunc;
     FOnDecodeReiniciar: TDecodeReiniciarProc;
+    FOnLerLog: TLogLerFunc;
+    FOnOnvifCam: TOnvifCamFunc;
+    // Um cliente ONVIF por camera, guardado entre chamadas. Ele carrega o que
+    // custou tres idas a camera para descobrir -- endereco do servico, perfil
+    // de midia, diferenca de relogio --, e um gesto de PTZ manda dois
+    // comandos: refazer isso a cada toque seria pagar a descoberta duas vezes
+    // por clique.
+    FOnvif: TObjectDictionary<string, TOnvifClient>;
+    // O ultimo comando de PTZ por camera. A parada do DVRIP repete o comando
+    // que estava andando; sem guardar, nao haveria o que repetir.
+    FUltimoPtz: TDictionary<string, string>;
     FLock: TCriticalSection;
     procedure Comando(AContext: TIdContext; ARequestInfo: TIdHTTPRequestInfo;
                       AResponseInfo: TIdHTTPResponseInfo);
@@ -148,6 +175,16 @@ type
     procedure ServirSonda(ARequestInfo: TIdHTTPRequestInfo;
                           AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirSair(AResponseInfo: TIdHTTPResponseInfo);
+    procedure ServirPtz(ARequestInfo: TIdHTTPRequestInfo;
+                        AResponseInfo: TIdHTTPResponseInfo);
+    function ClienteOnvif(const Camera: string): TOnvifClient;
+    procedure ProcurarPtz(ARequestInfo: TIdHTTPRequestInfo;
+                          AResponseInfo: TIdHTTPResponseInfo);
+    procedure ServirPtzOnvif(ARequestInfo: TIdHTTPRequestInfo;
+                             AResponseInfo: TIdHTTPResponseInfo;
+                             const Camera, Acao: string);
+    procedure ServirLog(ARequestInfo: TIdHTTPRequestInfo;
+                        AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirDecodeAlimentar(ARequestInfo: TIdHTTPRequestInfo;
                                     AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirDecodeQuadro(ARequestInfo: TIdHTTPRequestInfo;
@@ -206,6 +243,15 @@ type
                                                      write FOnDecodeReiniciar;
     property OnServidorDiag: TServidorDiagFunc read FOnServidorDiag
                                                write FOnServidorDiag;
+    // O log do app, para a pagina despejar no console do navegador. Sem isto
+    // /api/app/log responde 503 e a pagina para de pedir.
+    property OnLerLog: TLogLerFunc read FOnLerLog write FOnLerLog;
+    // O endereco de ONVIF de cada camera. Sem isto, so o caminho DVRIP existe.
+    property OnOnvifCam: TOnvifCamFunc read FOnOnvifCam write FOnOnvifCam;
+    // Joga fora os clientes ONVIF guardados. Chamar quando o cadastro muda:
+    // sem isto, corrigir o endereco de uma camera nao teria efeito nenhum ate
+    // fechar o app, e a impressao seria de que a correcao nao serviu.
+    procedure EsquecerOnvif;
   end;
 
 implementation
@@ -214,6 +260,10 @@ uses
   // A MESMA leitura de arquivo que o vmsserver usa: uma pasta, dois
   // hospedeiros, e as mesmas páginas para os dois.
   Vms.Server.UiFiles,
+  // O registro onde a sessao viva da camera se anuncia, e o vocabulario de
+  // PTZ do DVRIP. As duas coisas que /api/ptz precisa saber.
+  VMS.Domain.Ptz,
+  VMS.Dvrip.Protocol,
   IdURI;
 
 const
@@ -251,11 +301,15 @@ begin
   inherited Create;
   FLogger := ALogger;
   FLock := TCriticalSection.Create;
+  FUltimoPtz := TDictionary<string, string>.Create;
+  FOnvif := TObjectDictionary<string, TOnvifClient>.Create([doOwnsValues]);
 end;
 
 destructor TLocalServer.Destroy;
 begin
   Stop;
+  FUltimoPtz.Free;
+  FOnvif.Free;
   FLock.Free;
   inherited;
 end;
@@ -316,7 +370,7 @@ begin
         FLogger.Warn('local', 'faltam na interface (' + UiExplicacao + '): ' +
                               UiFaltando)
       else
-        FLogger.Info('local', 'interface em ' + UiExplicacao);
+        FLogger.Info('local', 'interface em ' + UiExplicacao + ' -- ' + UiCarimbo);
       Exit(True);
     except
       on E: Exception do
@@ -737,6 +791,422 @@ begin
   AResponseInfo.ContentStream := Fluxo;   // o Indy libera depois de enviar
 end;
 
+procedure TLocalServer.EsquecerOnvif;
+begin
+  FLock.Enter;
+  try
+    FOnvif.Clear;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+// Em que porta esta camera atende ONVIF, se atender.
+//
+// Existe porque a porta nao se adivinha nem se pergunta a camera: a norma nao
+// fixa nenhuma, e das tres cameras daqui nenhuma usa a 80. Descobrir isso
+// exigia captura de rede do aplicativo do fabricante, que nao e coisa que se
+// peca a quem so quer cadastrar uma camera.
+//
+// A procura vai por tentativa, porta a porta, com espera curta: quase todas
+// nao tem ninguem e recusam a conexao na hora. Para na primeira que tiver PTZ.
+procedure TLocalServer.ProcurarPtz(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo);
+var
+  Corpo, Host: string;
+  Leitor: TStreamReader;
+  Pedido: TJSONValue;
+  Obj, Item: TJSONObject;
+  Arr: TJSONArray;
+  Achados: TArray<TOnvifAchado>;
+  I: Integer;
+  Melhor: string;
+begin
+  Corpo := '';
+  if ARequestInfo.PostStream <> nil then
+  begin
+    ARequestInfo.PostStream.Position := 0;
+    Leitor := TStreamReader.Create(ARequestInfo.PostStream, TEncoding.UTF8);
+    try
+      Corpo := Leitor.ReadToEnd;
+    finally
+      Leitor.Free;
+    end;
+  end;
+
+  Pedido := nil;
+  if Trim(Corpo) <> '' then
+    Pedido := TJSONObject.ParseJSONValue(Corpo);
+  try
+    if not (Pedido is TJSONObject) then
+    begin
+      ResponderErro(AResponseInfo, 400, 'mande {url, user, password}');
+      Exit;
+    end;
+    Obj := TJSONObject(Pedido);
+    Host := HostDaUrl(Obj.GetValue<string>('url', ''));
+    if Host = '' then
+    begin
+      ResponderErro(AResponseInfo, 400, 'a url nao tem host');
+      Exit;
+    end;
+    Achados := ProcurarOnvif(Host, Obj.GetValue<string>('user', ''),
+                             Obj.GetValue<string>('password', ''), FLogger);
+  finally
+    Pedido.Free;
+  end;
+
+  Melhor := '';
+  Arr := TJSONArray.Create;
+  Obj := TJSONObject.Create;
+  try
+    for I := 0 to High(Achados) do
+    begin
+      Item := TJSONObject.Create;
+      Item.AddPair('porta', TJSONNumber.Create(Achados[I].Porta));
+      Item.AddPair('ptz', TJSONBool.Create(Achados[I].TemPtz));
+      Arr.AddElement(Item);
+      if Achados[I].TemPtz and (Melhor = '') then
+        Melhor := Host + ':' + IntToStr(Achados[I].Porta);
+    end;
+    Obj.AddPair('host', Host);
+    Obj.AddPair('achados', Arr);
+    // O endereco pronto para o campo do cadastro, quando ha um. Vazio nao e
+    // erro: e camera que nao fala ONVIF, ou que fala e nao se move.
+    Obj.AddPair('melhor', Melhor);
+    AResponseInfo.ResponseNo := 200;
+    AResponseInfo.ContentType := 'application/json; charset=utf-8';
+    AResponseInfo.CharSet := 'utf-8';
+    AResponseInfo.ContentText := Obj.ToJSON;
+  finally
+    Obj.Free;
+  end;
+end;
+
+// O cliente ONVIF desta camera, criado na primeira vez. nil = a camera nao tem
+// endereco de ONVIF no cadastro.
+function TLocalServer.ClienteOnvif(const Camera: string): TOnvifClient;
+var
+  XAddr, Usuario, Senha, Chave: string;
+begin
+  Result := nil;
+  if not Assigned(FOnOnvifCam) then Exit;
+  if not FOnOnvifCam(Camera, XAddr, Usuario, Senha) then Exit;
+  if Trim(XAddr) = '' then Exit;
+  Chave := LowerCase(Trim(Camera));
+  FLock.Enter;
+  try
+    if FOnvif.TryGetValue(Chave, Result) then Exit;
+    Result := TOnvifClient.Create(XAddr, Usuario, Senha, FLogger,
+                                  'onvif.' + Camera);
+    FOnvif.Add(Chave, Result);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+// A PTZ das cameras DESTE aparelho.
+//
+// Encaminhar isto para o vmsserver seria errado por dois motivos: quem conecta
+// direto na camera nao tem servidor para onde encaminhar, e o registro de
+// sessoes vivas do servidor so conhece as cameras dele. A sessao que sabe
+// mover a camera esta aqui dentro, na mesma conexao que ja esta autenticada.
+//
+// Dois caminhos, nesta ordem. DVRIP quando ha sessao de video viva, porque o
+// comando sai pela conexao que ja esta autenticada e nao custa um login por
+// toque. ONVIF quando o cadastro diz onde ela atende -- e esse nao depende de
+// estar vendo a camera, porque e um canal proprio.
+//
+// Camera sem nenhum dos dois responde 503, e a pagina esconde os botoes.
+procedure TLocalServer.ServirPtz(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo);
+var
+  Camera, Acao, Comando: string;
+  Passo, Canal: Integer;
+  Dir: string;
+  Sessao: IPtzSession;
+  Ok: Boolean;
+  Obj: TJSONObject;
+
+  function Num(const Nome: string): Double;
+  var
+    T: string;
+  begin
+    // Em milesimos, e nao decimal na query: assim nao ha ponto nem virgula
+    // para o cliente errar, e a conversao de volta e uma divisao.
+    T := Trim(ARequestInfo.Params.Values[Nome]);
+    if T = '' then Exit(0);
+    Result := StrToIntDef(T, 0) / 1000;
+  end;
+
+begin
+  Camera := Trim(ARequestInfo.Params.Values['camera']);
+  if Camera = '' then
+  begin
+    ResponderErro(AResponseInfo, 400, 'informe camera');
+    Exit;
+  end;
+  Acao := LowerCase(Trim(ARequestInfo.Params.Values['acao']));
+  Sessao := TPtzRegistry.Achar(Camera);
+  if Sessao = nil then
+  begin
+    ServirPtzOnvif(ARequestInfo, AResponseInfo, Camera, Acao);
+    Exit;
+  end;
+
+  Comando := '';
+  Passo := 5;
+  // Ver o mesmo parametro na rota do vmsserver: zero serve para camera solta,
+  // e existe para poder varrer os outros valores sem recompilar.
+  Canal := StrToIntDef(Trim(ARequestInfo.Params.Values['canal']), 0);
+    if Acao = 'mover' then
+  begin
+    Comando := ComandoDvripDe(Num('pan'), Num('tilt'), Num('zoom'));
+    Passo := PassoDvripDe(Num('pan'), Num('tilt'), Num('zoom'));
+    if Comando = '' then
+    begin
+      ResponderErro(AResponseInfo, 400, 'direcao vazia: informe pan, tilt ou zoom');
+      Exit;
+    end;
+    FLock.Enter;
+    try
+      FUltimoPtz.AddOrSetValue(LowerCase(Camera), Comando);
+    finally
+      FLock.Leave;
+    end;
+    Ok := Sessao.MoverPtz(Comando, Passo, Canal, True);
+  end
+  else if Acao = 'parar' then
+  begin
+    // A parada repete o comando que estava andando: e a mesma mensagem com
+    // outro Preset, e a camera espera reconhecer qual movimento parar.
+    FLock.Enter;
+    try
+      if not FUltimoPtz.TryGetValue(LowerCase(Camera), Comando) then
+        Comando := DVRIP_PTZ_ESQUERDA;
+    finally
+      FLock.Leave;
+    end;
+    Ok := Sessao.MoverPtz(Comando, Passo, Canal, False);
+  end
+  else if (Acao = 'foco') or (Acao = 'iris') then
+  begin
+    // Andam enquanto se segura, como as direcoes: mesma mensagem, so muda o
+    // nome do comando. Quem para e o `parar`, que repete o ultimo enviado.
+    Dir := LowerCase(Trim(ARequestInfo.Params.Values['dir']));
+    if Acao = 'foco' then
+    begin
+      if Dir = 'perto' then Comando := DVRIP_PTZ_FOCO_PERTO
+      else if Dir = 'longe' then Comando := DVRIP_PTZ_FOCO_LONGE;
+    end
+    else
+    begin
+      if Dir = 'abrir' then Comando := DVRIP_PTZ_IRIS_ABRE
+      else if Dir = 'fechar' then Comando := DVRIP_PTZ_IRIS_FECHA;
+    end;
+    if Comando = '' then
+    begin
+      ResponderErro(AResponseInfo, 400, 'informe dir');
+      Exit;
+    end;
+    FLock.Enter;
+    try
+      FUltimoPtz.AddOrSetValue(LowerCase(Camera), Comando);
+    finally
+      FLock.Leave;
+    end;
+    Ok := Sessao.MoverPtz(Comando, Passo, Canal, True);
+  end
+  else if Acao = 'ronda' then
+  begin
+    // De um disparo so: o proprio nome do comando ja diz comecar ou parar.
+    if Trim(ARequestInfo.Params.Values['ligar']) = '0' then Comando := DVRIP_PTZ_RONDA_FIM
+    else Comando := DVRIP_PTZ_RONDA_INI;
+    Ok := Sessao.MoverPtz(Comando, Passo, Canal, True);
+  end
+  else if Acao = 'preset' then
+  begin
+    // Sem parada depois: quem vai a um preset para sozinho ao chegar.
+    Passo := StrToIntDef(Trim(ARequestInfo.Params.Values['n']), -1);
+    if Passo < 0 then
+    begin
+      ResponderErro(AResponseInfo, 400, 'informe n, o numero do preset');
+      Exit;
+    end;
+    // Ver a mesma rota no vmsserver.
+    Dir := LowerCase(Trim(ARequestInfo.Params.Values['op']));
+    if Dir = 'gravar' then Comando := DVRIP_PTZ_PRESET_POR
+    else if Dir = 'apagar' then Comando := DVRIP_PTZ_PRESET_LIMPA
+    else Comando := DVRIP_PTZ_PRESET_IR;
+    Ok := Sessao.IrParaPreset(Passo, Canal, Comando);
+  end
+  else if Acao = 'config' then
+  begin
+    // Diagnostico: pergunta a camera o que ela sabe. A resposta sai no log --
+    // que aqui chega ao console do navegador -- porque quem le o socket e
+    // outra thread.
+    Comando := Trim(ARequestInfo.Params.Values['nome']);
+    if Comando = '' then
+    begin
+      ResponderErro(AResponseInfo, 400, 'informe nome, a secao da configuracao');
+      Exit;
+    end;
+    Ok := Sessao.PerguntarConfig(Comando);
+  end
+  else if Acao = 'testar' then
+    Ok := True
+  else
+  begin
+    ResponderErro(AResponseInfo, 400, Acao + ' nao existe: use mover, parar, ' +
+                                      'foco, iris, ronda, preset, config ou testar');
+    Exit;
+  end;
+
+  AResponseInfo.ResponseNo := 200;
+  AResponseInfo.ContentType := 'application/json; charset=utf-8';
+  AResponseInfo.CharSet := 'utf-8';
+  Obj := TJSONObject.Create;
+  try
+    Obj.AddPair('camera', Camera);
+    Obj.AddPair('acao', Acao);
+    Obj.AddPair('via', 'dvrip');
+    Obj.AddPair('ok', TJSONBool.Create(Ok));
+    if Comando <> '' then Obj.AddPair('comando', Comando);
+    if not Ok then Obj.AddPair('motivo', 'nao consegui escrever na sessao');
+    AResponseInfo.ContentText := Obj.ToJSON;
+  finally
+    Obj.Free;
+  end;
+end;
+
+// O ramo ONVIF do /api/ptz. Separado do DVRIP porque nao ha nada em comum
+// entre os dois alem do nome da camera: um fala JSON por socket proprio, o
+// outro SOAP por HTTP, e as acoes nem coincidem.
+procedure TLocalServer.ServirPtzOnvif(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo; const Camera, Acao: string);
+var
+  Cli: TOnvifClient;
+  Ok: Boolean;
+  Obj, Item: TJSONObject;
+  Lista: TJSONArray;
+  Presets: TArray<TOnvifPreset>;
+  I: Integer;
+
+  function Num(const Nome: string): Double;
+  var
+    T: string;
+  begin
+    T := Trim(ARequestInfo.Params.Values[Nome]);
+    if T = '' then Exit(0);
+    Result := StrToIntDef(T, 0) / 1000;
+  end;
+
+begin
+  Cli := ClienteOnvif(Camera);
+  if Cli = nil then
+  begin
+    ResponderErro(AResponseInfo, 503,
+      'sem sessao viva e sem endereco de ONVIF para ' + Camera);
+    Exit;
+  end;
+
+  Presets := nil;
+  if Acao = 'mover' then
+    Ok := Cli.MoverContinuo(TOnvifMove.Criar(Num('pan'), Num('tilt'),
+                                             Num('zoom')))
+  else if Acao = 'parar' then
+    Ok := Cli.Parar
+  else if Acao = 'preset' then
+    // No ONVIF o preset tem token, que e texto e nem sempre e o numero. Vai
+    // como veio da tela: quem monta a lista e o `presets` logo abaixo.
+    Ok := Cli.IrParaPreset(Trim(ARequestInfo.Params.Values['n']))
+  else if Acao = 'presets' then
+    Ok := Cli.LerPresets(Presets)
+  else if Acao = 'testar' then
+    Ok := Cli.Preparar
+  else
+  begin
+    ResponderErro(AResponseInfo, 400, Acao + ' nao existe: use mover, parar, ' +
+                                      'preset, presets ou testar');
+    Exit;
+  end;
+
+  AResponseInfo.ResponseNo := 200;
+  AResponseInfo.ContentType := 'application/json; charset=utf-8';
+  AResponseInfo.CharSet := 'utf-8';
+  Obj := TJSONObject.Create;
+  try
+    Obj.AddPair('camera', Camera);
+    Obj.AddPair('acao', Acao);
+    Obj.AddPair('via', 'onvif');
+    Obj.AddPair('ok', TJSONBool.Create(Ok));
+    // O motivo diz a diferenca entre "camera fixa", "senha recusada" e "nao
+    // respondeu", que sem ele virariam todas o mesmo "nao funcionou".
+    if not Ok then Obj.AddPair('motivo', Cli.Motivo);
+    if Acao = 'testar' then Obj.AddPair('servico', Cli.PtzUrl);
+    if Acao = 'presets' then
+    begin
+      Lista := TJSONArray.Create;
+      Obj.AddPair('presets', Lista);
+      for I := 0 to High(Presets) do
+      begin
+        Item := TJSONObject.Create;
+        Item.AddPair('token', Presets[I].Token);
+        Item.AddPair('nome', Presets[I].Nome);
+        Lista.AddElement(Item);
+      end;
+    end;
+    AResponseInfo.ContentText := Obj.ToJSON;
+  finally
+    Obj.Free;
+  end;
+end;
+
+// O log do app, para o console do navegador.
+//
+// Antes da interface em HTML havia um TMemo na tela mostrando estas linhas.
+// Ele saiu com o resto do formulario e o log ficou so no arquivo -- que no
+// aparelho nao se abre com o dedo. Aqui ele volta pela porta que ja existe: a
+// pagina pede a partir da ultima posicao que viu e escreve no console.
+//
+// Por posicao, e nao esvaziando: recarregar a pagina nao pode apagar o que
+// aconteceu, e duas abas abertas devem ver as mesmas linhas.
+procedure TLocalServer.ServirLog(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo);
+var
+  Desde, Prox: Int64;
+  Linhas: TArray<string>;
+  Arr: TJSONArray;
+  Obj: TJSONObject;
+  I: Integer;
+begin
+  if not Assigned(FOnLerLog) then
+  begin
+    ResponderErro(AResponseInfo, 503, 'log indisponivel');
+    Exit;
+  end;
+  // -1 quando nao veio: "me de o que voce tem", que e o primeiro pedido da
+  // pagina. Zero significaria "desde o inicio dos tempos" e daria o mesmo
+  // resultado, mas so por acidente de o buffer ser limitado.
+  Desde := StrToInt64Def(Trim(ARequestInfo.Params.Values['desde']), -1);
+  Linhas := FOnLerLog(Desde, Prox);
+
+  AResponseInfo.ResponseNo := 200;
+  AResponseInfo.ContentType := 'application/json; charset=utf-8';
+  AResponseInfo.CharSet := 'utf-8';
+  Obj := TJSONObject.Create;
+  try
+    Obj.AddPair('proxima', TJSONNumber.Create(Prox));
+    Arr := TJSONArray.Create;
+    Obj.AddPair('linhas', Arr);
+    for I := 0 to High(Linhas) do
+      Arr.Add(Linhas[I]);
+    AResponseInfo.ContentText := Obj.ToJSON;
+  finally
+    Obj.Free;
+  end;
+end;
+
 procedure TLocalServer.ServirJs(AResponseInfo: TIdHTTPResponseInfo;
   const NomeArquivo: string);
 begin
@@ -950,6 +1420,10 @@ begin
       ServirPagina(AResponseInfo, 'motion-ui.html')
     else if Caminho = '/ui/player' then
       ServirPagina(AResponseInfo, 'player-ui.html')
+    // O cadastro de cameras DO SERVIDOR. A pagina e a mesma que o vmsserver
+    // serve; o que ela le e grava vai encaminhado para la, como a de sintonia.
+    else if Caminho = '/ui/cameras' then
+      ServirPagina(AResponseInfo, 'cameras-ui.html')
     // A folha comum a todas as paginas: paleta, base do documento e os poucos
     // componentes que aparecem em mais de uma tela. Solta, e nao embutida em
     // cada uma, para a cor existir num lugar so -- e o navegador guarda uma
@@ -977,6 +1451,19 @@ begin
       ServirSonda(ARequestInfo, AResponseInfo)
     else if Caminho = '/api/app/sair' then
       ServirSair(AResponseInfo)
+    // O log deste app. Nao existe versao "do servidor" desta rota: o que se
+    // quer aqui e o que ESTE processo registrou.
+    else if Caminho = '/api/app/log' then
+      ServirLog(ARequestInfo, AResponseInfo)
+    // Mesma regra do /api/live: sem escopo, a camera e do aparelho e quem
+    // manda o comando e a sessao daqui; com escopo, e do servidor.
+    // Antes da /api/ptz por leitura, nao por necessidade: as duas comecam
+    // igual e ler a mais especifica primeiro evita a duvida.
+    else if Caminho = '/api/ptz/procurar' then
+      ProcurarPtz(ARequestInfo, AResponseInfo)
+    else if (Caminho = '/api/ptz') and
+            (Trim(ARequestInfo.Params.Values['server']) = '') then
+      ServirPtz(ARequestInfo, AResponseInfo)
     // O caminho de quem nao consegue decodificar na pagina: ela manda o
     // fragmento e pede quadro por quadro, ja em JPEG.
     else if Caminho = '/api/decode' then

@@ -42,6 +42,7 @@ uses
   FMX.Platform,
   VMS.Domain.Types,
   VMS.Domain.Logging,
+  VMS.Android.MemoLogger,  // o buffer que a pagina le pelo /api/app/log
   VMS.Domain.Clock,
   VMS.App.Clock,           // TSystemClock
   VMS.Rtsp.Client,         // TRtspKeepAliveMethod (kamGetParameter)
@@ -56,6 +57,8 @@ uses
   VMS.App.Servers,         // TRegistroServidores: escolhe a rota do servidor
   VMS.Live.Ring,
   VMS.Win.Edge,
+  VMS.Android.UiAssets,    // a interface do aparelho, igual a do pacote
+  Vms.Onvif.Client,        // EnderecoOnvif: o endereco escrito no cadastro
   UI.Common,
   UI.Shell;
 
@@ -72,6 +75,10 @@ type
     procedure DecodeReiniciar(const Camera: string);
   private
     FLogger: ILogger;
+    // O MESMO objeto que FLogger aponta, no tipo concreto: e por ele que se
+    // le o buffer. Nao e uma segunda referencia contada -- FLogger e quem
+    // mantem o objeto vivo, e os dois morrem juntos.
+    FMemo: TMemoLogger;
     FClock: IClock;
     FAppCfg: TAppConfig;
     FCameras: TArray<TCameraConfigEntry>;
@@ -121,6 +128,10 @@ type
     function GravarConfigCameras(const Json: string): string;
     function LerAoVivo(const Camera: string; Cursor: Cardinal;
                        out Dados: TBytes; out ProxCursor: Cardinal): Boolean;
+    function LerLogDoApp(Posicao: Int64;
+                         out Proxima: Int64): TArray<string>;
+    function OnvifDaCamera(const Camera: string;
+                           out XAddr, Usuario, Senha: string): Boolean;
 
     procedure PararAoVivo;
     // Abre a câmera de FIndiceAbrir. Sem parâmetros de propósito: é essa a
@@ -144,8 +155,7 @@ implementation
 uses
   System.JSON,
   System.StrUtils,          // IfThen, na linha de log do servers.json
-  System.Generics.Collections,
-  VMS.Android.MemoLogger;
+  System.Generics.Collections;
 
 procedure TForm1.FormCreate(Sender: TObject);
 var
@@ -153,7 +163,8 @@ var
 begin
   DefaultAppCfg;
   FClock := TSystemClock.Create;
-  FLogger := TMemoLogger.Create;
+  FMemo := TMemoLogger.Create;
+  FLogger := FMemo;
   LoadCameras;
   LoadServidores;
 
@@ -166,6 +177,14 @@ begin
   // FMX era exatamente a "tela branca" que aparecia no fim.
   Fill.Kind := TBrushKind.Solid;
   Fill.Color := COLOR_BG;
+  // E a moldura do Windows em volta dele. Nao faz nada nas outras plataformas.
+  EscurecerJanela(Self);
+
+  // ANTES do servidor local: e ele quem serve os arquivos, e a primeira
+  // pagina pode ser pedida no instante seguinte. No Android isto reescreve o
+  // que estiver diferente do pacote instalado; nas outras plataformas nao faz
+  // nada, porque la a pasta e o proprio fonte.
+  AtualizarUiDoPacote(FLogger);
 
   FLiveLock := TCriticalSection.Create;
   FLocal := TLocalServer.Create(FLogger);
@@ -181,6 +200,8 @@ begin
   FLocal.OnSondarServidor := SondarServidor;
   FLocal.OnServidorDiag := DiagServidores;
   FLocal.OnSair := SairPelaPagina;
+  FLocal.OnLerLog := LerLogDoApp;
+  FLocal.OnOnvifCam := OnvifDaCamera;
   // Só existe no Android; no Windows o WebView2 decodifica o que precisamos, e
   // o serviço responde que não está disponível.
   FDecodificacao := TDecodificacaoNativa.Create(FLogger);
@@ -476,6 +497,8 @@ begin
       try
         FCameras := Novas;
         SaveCameras;
+        // O endereco de ONVIF pode ter mudado nesta gravacao.
+        if FLocal <> nil then FLocal.EsquecerOnvif;
       except
         on E: Exception do
           Erro := E.Message;
@@ -523,6 +546,41 @@ begin
       PararAoVivo;
     end;
   end;
+end;
+
+// Onde falar ONVIF com esta camera, do cadastro.
+//
+// SO quando o cadastro escreve o endereco. Cair no palpite da norma (HTTP na
+// porta 80 do mesmo host) sairia caro aqui: a tela pergunta se ha PTZ ate sete
+// vezes ao abrir o ao vivo, e cada pergunta a uma porta fechada custa o tempo
+// de espera inteiro. Camera fixa responderia "sem endereco" na hora, que e o
+// que se quer.
+function TForm1.OnvifDaCamera(const Camera: string;
+  out XAddr, Usuario, Senha: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  XAddr := '';
+  Usuario := '';
+  Senha := '';
+  for I := 0 to High(FCameras) do
+    if SameText(Trim(FCameras[I].Name), Trim(Camera)) then
+    begin
+      if Trim(FCameras[I].Ptz) <> '' then
+        XAddr := EnderecoOnvif(FCameras[I].Ptz, FCameras[I].Url);
+      Usuario := FCameras[I].User;
+      Senha := FCameras[I].Password;
+      Exit(True);
+    end;
+end;
+
+// Chamado de uma thread do Indy. O TMemoLogger tem lock proprio, entao nao ha
+// nada a sincronizar aqui.
+function TForm1.LerLogDoApp(Posicao: Int64;
+  out Proxima: Int64): TArray<string>;
+begin
+  Result := FMemo.Desde(Posicao, Proxima);
 end;
 
 function TForm1.LerAoVivo(const Camera: string; Cursor: Cardinal;

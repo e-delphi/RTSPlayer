@@ -107,6 +107,11 @@ type
     // Vale na proxima rodada do laco, e nao daqui a uma subida do servidor.
     // Pode ser chamado de qualquer thread.
     procedure Ajustar(const ACfg: TAnalyticsConfig);
+    // De quem este trabalhador cuida. Publico para quem administra a lista
+    // poder perguntar se uma camera ja esta sob analise antes de acrescentar
+    // outro -- dois na mesma camera leriam os mesmos arquivos e gravariam o
+    // mesmo evento duas vezes.
+    property Camera: string read FCamera;
   end;
 
 implementation

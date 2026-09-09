@@ -172,6 +172,7 @@
         <DCCReference Include="..\src\Domain\VMS.Domain.MediaSink.pas"/>
         <DCCReference Include="..\src\Domain\VMS.Domain.Reconnect.pas"/>
         <DCCReference Include="..\src\Domain\VMS.Domain.Session.pas"/>
+        <DCCReference Include="..\src\Domain\VMS.Domain.Ptz.pas"/>
         <DCCReference Include="..\src\Domain\VMS.Domain.Supervisor.pas"/>
         <DCCReference Include="..\src\Net\VMS.Net.Intf.pas"/>
         <DCCReference Include="..\src\Net\VMS.Net.Tcp.pas"/>
@@ -226,6 +227,7 @@
         <DCCReference Include="src\Server\Tx.Server.Session.pas"/>
         <DCCReference Include="src\Server\Tx.Server.Listener.pas"/>
         <DCCReference Include="src\Live\Vms.Server.LiveHub.pas"/>
+        <DCCReference Include="src\Onvif\Vms.Onvif.Client.pas"/>
         <DCCReference Include="src\Api\Vms.Server.IndexCache.pas"/>
         <DCCReference Include="src\Api\Vms.Server.Media.pas"/>
         <DCCReference Include="src\Api\Vms.Server.Api.pas"/>

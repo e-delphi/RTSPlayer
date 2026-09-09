@@ -45,8 +45,73 @@ const
   DVRIP_OPMONITOR           = 1410; // 0x0582  Action="Start"
   DVRIP_OPMONITOR_RSP       = 1411; // 0x0583  resposta do Start (JSON com Ret)
   DVRIP_OPMONITOR_DATA      = 1412; // 0x0584  canal de dados de mídia
+  // PTZ. Confirmado por captura do iCSee movendo a câmera (ver DvripPtzJson):
+  // no pacote, os bytes logo antes do DataLen são 78 05, e o DataLen bate com
+  // o tamanho do JSON -- 328 no comando e 325 na parada, que é exatamente a
+  // diferença entre escrever "65535" e escrever "-1".
+  // O aviso de evento que a camera manda sozinha, com numero de sessao
+  // proprio. Nao pedimos nada disso; ele chega no meio do video.
+  DVRIP_ALARM_INFO          = 1504; // 0x05e0
+  DVRIP_PTZ                 = 1400; // 0x0578
+  DVRIP_PTZ_RSP             = 1401; // 0x0579
+
+  // Os comandos de direção. O NOME aqui é o da imagem, o que o usuário vê; o
+  // VALOR é como a câmera chama o mesmo movimento.
+  //
+  // No horizontal os dois são opostos, e isso foi MEDIDO em duas câmeras
+  // diferentes: mandando 'DirectionRight' a imagem anda para a esquerda nas
+  // duas. O nome da câmera parece ser do ponto de vista de quem olha PARA ela,
+  // que é o espelho do que se vê na tela.
+  //
+  // A troca fica aqui, e não em quem chama, por dois motivos. Quem lê o resto
+  // do código pensa no que o usuário vê, que é o único ponto de vista que
+  // importa numa tela. E se um dia aparecer câmera que não inverte, o conserto
+  // é neste bloco e não espalhado.
+  //
+  // O vertical não inverte: cima é cima. Se algum dia aparecer câmera montada
+  // de cabeça para baixo, ela inverte os dois, e aí o ajuste é por câmera.
+  DVRIP_PTZ_CIMA        = 'DirectionUp';
+  DVRIP_PTZ_BAIXO       = 'DirectionDown';
+  DVRIP_PTZ_ESQUERDA    = 'DirectionRight';
+  DVRIP_PTZ_DIREITA     = 'DirectionLeft';
+  DVRIP_PTZ_CIMA_ESQ    = 'DirectionRightUp';
+  DVRIP_PTZ_CIMA_DIR    = 'DirectionLeftUp';
+  DVRIP_PTZ_BAIXO_ESQ   = 'DirectionRightDown';
+  DVRIP_PTZ_BAIXO_DIR   = 'DirectionLeftDown';
+  // O resto da lista, conferida contra a implementação de referência do
+  // protocolo (python-dvr, do projeto OpenIPC), que traz os dezenove nomes.
+  //
+  // Os quatro primeiros abaixo eu tinha DEDUZIDO da família de nomes, e a
+  // lista confirmou os quatro palavra por palavra. Os cinco últimos vieram
+  // dela.
+  //
+  // Zoom e foco andam enquanto se segura, como as direções: a mesma mensagem
+  // com Preset 65535 para começar e -1 para parar. Ronda e preset são de um
+  // disparo só.
+  DVRIP_PTZ_ZOOM_MAIS   = 'ZoomTile';
+  DVRIP_PTZ_ZOOM_MENOS  = 'ZoomWide';
+  DVRIP_PTZ_PRESET_IR   = 'GotoPreset';
+  DVRIP_PTZ_PRESET_POR  = 'SetPreset';
+  DVRIP_PTZ_PRESET_LIMPA = 'ClearPreset';
+  DVRIP_PTZ_FOCO_PERTO  = 'FocusNear';
+  DVRIP_PTZ_FOCO_LONGE  = 'FocusFar';
+  DVRIP_PTZ_IRIS_FECHA  = 'IrisSmall';
+  DVRIP_PTZ_IRIS_ABRE   = 'IrisLarge';
+  DVRIP_PTZ_RONDA_INI   = 'StartTour';
+  DVRIP_PTZ_RONDA_FIM   = 'StopTour';
 
 type
+  // As duas formas de OPPTZControl que existem na implementacao de referencia.
+  //
+  // fPasso  Pattern "SetBegin" e o campo POINT presente. E a da captura do
+  //         iCSee e a que a Isis obedece.
+  // fStart  Pattern "Start" e SEM o POINT. A referencia usa esta para preset,
+  //         e ela nunca foi tentada nas cameras daqui.
+  //
+  // Existem as duas porque camera que ignora uma pode obedecer a outra, e
+  // descobrir qual e trabalho de tentativa.
+  TDvripPtzForma = (fPasso, fStart);
+
   TDvripHeader = record
     SessionID: Cardinal;
     Sequence: Cardinal;
@@ -113,6 +178,41 @@ function JsonGetInt(const Json, Key: string; Default: Integer): Integer;
 function ExtractSection(const Json, Section: string): string;
 // Bytes -> "aa bb cc ..." (para log de diagnóstico).
 function BytesToHex(const B: TBytes; MaxCount: Integer): string;
+
+// O JSON do comando de PTZ, no formato exato que a câmera espera.
+//
+// Reproduzido de uma captura do iCSee movendo a câmera, e conferido pelo
+// TAMANHO: o DataLen do pacote dela é 328 no comando e 325 na parada, e este
+// texto dá os mesmos 328 e 325 contando o \n final. O espaçamento e a ordem dos
+// campos são os da captura de propósito -- não porque a câmera exija, mas
+// porque qualquer diferença aqui tiraria a comparação de pé.
+//
+// Andar e parar são a MESMA mensagem, com o mesmo Command e o mesmo Step. Muda
+// um campo só: Preset vale 65535 para começar e -1 para parar. Quem manda o
+// comando é responsável por mandar a parada -- sem ela a câmera gira até o fim
+// do curso.
+//
+// Passo vai de 1 a 8 na prática; a captura usou 5.
+function DvripPtzJson(const Comando: string; Passo, Canal: Integer;
+                      Iniciar: Boolean; const SessionHex: string): string;
+
+// "Vá para o preset N", na mesma mensagem dos comandos de direção.
+//
+// O número entra onde nos comandos de direção entra o 65535: é o único campo
+// que muda. Preset abaixo de 0 não existe e vira 0.
+function DvripPresetJson(Preset, Canal: Integer; const SessionHex: string;
+                         const Comando: string = DVRIP_PTZ_PRESET_IR): string;
+
+// A direcao pedida, no nome que a camera DVRIP usa. Vazio = direcao invalida.
+//
+// Quem chama fala em pan/tilt/zoom porque e o vocabulario da ONVIF, que e
+// continuo. O DVRIP e discreto: oito direcoes com nome. A conversao mora aqui,
+// e nao em cada rota, porque tanto o servidor quanto o app mandam PTZ -- e uma
+// segunda copia seria uma segunda chance de divergir.
+function ComandoDvripDe(Pan, Tilt, Zoom: Double): string;
+
+// O passo do DVRIP, de 1 a 8, a partir da velocidade normalizada.
+function PassoDvripDe(Pan, Tilt, Zoom: Double): Integer;
 
 implementation
 
@@ -301,7 +401,18 @@ begin
   if ExpectedSession <> 0 then
   begin
     Session := GetLE32(HBuf, 4);
-    if (Session <> ExpectedSession) and (Session <> 0) then
+    // Sessao diferente passa quando o MsgID e um dos que conhecemos.
+    //
+    // A camera manda AlarmInfo (1504) com numero de sessao proprio, e recusar
+    // custava caro: o leitor perdia o sincronismo e varria o fluxo atras do
+    // proximo cabecalho, jogando fora mais de cem bytes de video a cada
+    // comando de PTZ. Medido nas duas cameras.
+    //
+    // MsgID conhecido e prova tao forte quanto o SessionID: video comprimido
+    // nao imita por acaso a marca 0xFF 0x01, o reservado em zero E um numero
+    // da nossa tabela, tudo nas posicoes certas.
+    if (Session <> ExpectedSession) and (Session <> 0) and
+       (DvripClassifyMsg(Word(HBuf[14]) or (Word(HBuf[15]) shl 8)) = mkUnknown) then
       Exit(Format('sessao=%x (esperada %x)', [Session, ExpectedSession]));
   end;
   if GetLE32(HBuf, 16) > MAX_PAYLOAD then
@@ -403,7 +514,13 @@ begin
     DVRIP_SYSINFO, DVRIP_SYSINFO_RSP,
     DVRIP_CONFIG_GET, DVRIP_CONFIG_GET_RSP,
     DVRIP_OPMONITOR_CLAIM, DVRIP_OPMONITOR_CLAIM_RSP,
-    DVRIP_OPMONITOR_RSP:
+    DVRIP_OPMONITOR_RSP,
+    // A resposta do PTZ. Estava faltando, e o efeito era ela cair em
+    // mkUnknown: a camera respondia ao comando de movimento e o log dizia
+    // "MsgID desconhecido" em vez do JSON. Justamente a resposta que se quer
+    // ler quando a camera aceita o comando e nao se mexe.
+    DVRIP_PTZ, DVRIP_PTZ_RSP,
+    DVRIP_ALARM_INFO:
       Result := mkControl;
     // DVRIP_OPMONITOR (1410) fica de fora de propósito: é o ID em que mandamos
     // o Start, e não sabemos se esta câmera responde nele ou se manda mídia por
@@ -500,6 +617,92 @@ begin
     Result[I * 3 + 2] := HEX[(B[I] and $F) + 1];
     Result[I * 3 + 3] := ' ';
   end;
+end;
+
+// O corpo comum das duas mensagens de OPPTZControl. O que as separa é o par
+// (Command, Preset), e é por isso que ele entra por parâmetro em vez de haver
+// duas cópias deste texto -- que é comprido e foi conferido byte a byte contra
+// uma captura.
+function OpPtzJson(const Comando: string; Passo, Canal, Preset: Integer;
+  const SessionHex: string; Forma: TDvripPtzForma): string;
+var
+  Ponto, Padrao: string;
+begin
+  if Passo < 1 then Passo := 1
+  else if Passo > 8 then Passo := 8;
+  // A unica diferenca entre as duas formas: o campo POINT existir, e o valor
+  // do Pattern. O resto e igual, na mesma ordem.
+  if Forma = fPasso then
+  begin
+    Ponto := '"POINT" : { "bottom" : 0, "left" : 0, "right" : 0, "top" : 0 }, ';
+    Padrao := 'SetBegin';
+  end
+  else
+  begin
+    Ponto := '';
+    Padrao := 'Start';
+  end;
+  Result :=
+    '{ "Name" : "OPPTZControl", "OPPTZControl" : { "Command" : "' + Comando +
+    '", "Parameter" : { "AUX" : { "Number" : 0, "Status" : "On" }, ' +
+    '"Channel" : ' + IntToStr(Canal) + ', "MenuOpts" : "Enter", ' + Ponto +
+    '"Pattern" : "' + Padrao + '", "Preset" : ' + IntToStr(Preset) +
+    ', "Step" : ' + IntToStr(Passo) + ', "Tour" : 0 } }, ' +
+    '"SessionID" : "' + SessionHex + '" }';
+end;
+
+function DvripPtzJson(const Comando: string; Passo, Canal: Integer;
+  Iniciar: Boolean; const SessionHex: string): string;
+var
+  Preset: Integer;
+begin
+  // 65535 anda, -1 para. Ver o cabeçalho da declaração.
+  if Iniciar then Preset := 65535 else Preset := -1;
+  // fPasso: é a forma que a referência usa para mover, e a da captura.
+  Result := OpPtzJson(Comando, Passo, Canal, Preset, SessionHex, fPasso);
+end;
+
+function DvripPresetJson(Preset, Canal: Integer; const SessionHex: string;
+  const Comando: string): string;
+begin
+  if Preset < 0 then Preset := 0;
+  // fStart: é a forma que a implementação de referência usa para preset, e a
+  // nossa estava mandando o número na forma de mover.
+  //
+  // Passo 5, o mesmo da captura: para ir a um preset ele não governa nada, mas
+  // a mensagem tem o campo e mandá-lo fora da faixa seria pedir problema.
+  Result := OpPtzJson(Comando, 5, Canal, Preset, SessionHex, fStart);
+end;
+
+function ComandoDvripDe(Pan, Tilt, Zoom: Double): string;
+const
+  MORTO = 0.15;   // abaixo disto o eixo nao conta: dedo torto nao vira diagonal
+begin
+  Result := '';
+  if Abs(Zoom) > MORTO then
+  begin
+    if Zoom > 0 then Exit(DVRIP_PTZ_ZOOM_MAIS);
+    Exit(DVRIP_PTZ_ZOOM_MENOS);
+  end;
+  if (Tilt > MORTO) and (Pan < -MORTO) then Exit(DVRIP_PTZ_CIMA_ESQ);
+  if (Tilt > MORTO) and (Pan > MORTO) then Exit(DVRIP_PTZ_CIMA_DIR);
+  if (Tilt < -MORTO) and (Pan < -MORTO) then Exit(DVRIP_PTZ_BAIXO_ESQ);
+  if (Tilt < -MORTO) and (Pan > MORTO) then Exit(DVRIP_PTZ_BAIXO_DIR);
+  if Tilt > MORTO then Exit(DVRIP_PTZ_CIMA);
+  if Tilt < -MORTO then Exit(DVRIP_PTZ_BAIXO);
+  if Pan < -MORTO then Exit(DVRIP_PTZ_ESQUERDA);
+  if Pan > MORTO then Exit(DVRIP_PTZ_DIREITA);
+end;
+
+function PassoDvripDe(Pan, Tilt, Zoom: Double): Integer;
+var
+  V: Double;
+begin
+  V := Abs(Pan);
+  if Abs(Tilt) > V then V := Abs(Tilt);
+  if Abs(Zoom) > V then V := Abs(Zoom);
+  Result := Round(V * 8);
+  if Result < 1 then Result := 1;
 end;
 
 end.
