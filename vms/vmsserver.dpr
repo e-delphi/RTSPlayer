@@ -458,6 +458,10 @@ begin
           while GStopEvent.WaitFor(500) <> wrSignaled do
           begin
             if Api = nil then Continue;
+            // Sessoes de comando de PTZ: abre o que o cadastro pede e fecha o
+            // que ele nao pede mais. Ela mesma se limita no tempo, entao pode
+            // ser chamada a cada volta.
+            Api.ManterControlesPtz;
             Pendentes := Api.TomarCamerasPendentes;
             if Length(Pendentes) = 0 then Continue;
 

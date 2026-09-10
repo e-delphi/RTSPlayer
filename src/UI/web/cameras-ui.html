@@ -108,15 +108,18 @@
   <label class="chk"><input type="checkbox" id="f-audio" checked> gravar &aacute;udio</label>
 
   <label class="campo"><input id="f-ptz" placeholder=" ">
-    <span>PTZ por ONVIF</span></label>
+    <span>endere&ccedil;o do PTZ</span></label>
   <div class="acoes">
     <button class="b" id="procurar">Procurar</button>
   </div>
   <div class="ajuda">
     192.168.0.10:5000 &nbsp;&mdash;&nbsp; onde a c&acirc;mera atende ONVIF.
-    Deixe vazio se ela n&atilde;o se move, ou se a PTZ dela vai pela
-    pr&oacute;pria conex&atilde;o de v&iacute;deo (dvrip).
-    <b>Procurar</b> testa as portas comuns a partir do servidor.
+    Ou dvrip://192.168.0.10:34567, e a&iacute; o servidor abre uma conex&atilde;o
+    s&oacute; para o comando &mdash; &eacute; o que d&aacute; PTZ a uma
+    c&acirc;mera que grava por RTSP.
+    Deixe vazio se ela n&atilde;o se move, ou se ela j&aacute; grava por dvrip:
+    nesse caso o comando vai pela pr&oacute;pria conex&atilde;o de v&iacute;deo.
+    <b>Procurar</b> testa as portas comuns de ONVIF a partir do servidor.
   </div>
 
   <div class="divisor"></div>

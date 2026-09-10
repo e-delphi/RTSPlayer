@@ -68,6 +68,10 @@ uses
   VMS.Domain.Logging,
   VMS.Domain.Ptz,
   VMS.Dvrip.Protocol,
+  VMS.Dvrip.Session,
+  VMS.Domain.Session,
+  VMS.Domain.Clock,
+  VMS.App.Clock,
   VMS.Rec.Format,
   VMS.Rec.Writer,
   Vms.Onvif.Client,
@@ -103,6 +107,15 @@ const
   LIVE_CURSOR_TAG = 'L';
   // De quanto em quanto auth.* e relido do banco.
   AUTH_RELEITURA_MS = 5000;
+  // De quanto em quanto se confere se as sessoes de comando de PTZ ainda
+  // batem com o cadastro. O laco principal chama isso duas vezes por segundo;
+  // o trabalho de verdade so acontece nesse ritmo.
+  PTZ_CONTROLE_TICK_MS = 15000;
+  // Quanto a rota de PTZ espera pela sessao de comando que acabou de mandar
+  // abrir. Login nessas cameras ja levou 11 segundos, entao esperar ate o fim
+  // prenderia a thread do HTTP por tempo demais; melhor responder "abrindo" e
+  // deixar o proximo clique achar a sessao pronta.
+  PTZ_CONTROLE_ESPERA_MS = 3000;
   API_DEFAULT_MAX_BLOCKS = 32;
   // Colagem: dois arquivos separados por menos que isto viram uma faixa só. Uma
   // reconexão de câmera custa centenas de ms; 5 s cobre com folga sem esconder
@@ -150,6 +163,32 @@ type
     class function Error(AStatus: Integer; const Msg: string): TApiResponse; static;
   end;
 
+  // Mantem viva uma sessao DVRIP que existe SO para comandar a camera.
+  //
+  // Estas cameras aceitam PTZ pela conexao DVRIP autenticada, e ela so existia
+  // quando a camera era GRAVADA por DVRIP. Quem grava por RTSP ficava sem PTZ
+  // nenhum. Aqui o video continua vindo pelo caminho que funciona melhor e o
+  // comando vem por uma conexao propria, que nao pede video e por isso quase
+  // nao custa banda.
+  //
+  // Uma thread por camera, reconectando sozinha: a sessao cai quando a camera
+  // reinicia ou a rede pisca, e sem reconexao o PTZ sumiria ate alguem
+  // reiniciar o servidor.
+  TPtzControleDvrip = class
+  strict private
+    FThread: TThread;
+    FParar: TEvent;
+    FConfig: TCameraSessionConfig;
+    FLogger: ILogger;
+    FTag: string;
+  public
+    constructor Create(const AConfig: TCameraSessionConfig; const ALogger: ILogger);
+    destructor Destroy; override;
+    // O endereco que esta sessao serve. Guardado para saber, na conferencia
+    // periodica, se o cadastro mudou embaixo dela.
+    function Endereco: string;
+  end;
+
   TApiRouter = class
   strict private
     FConfig: TApiConfig;
@@ -170,6 +209,11 @@ type
     // que estava andando; sem guardar, nao haveria o que repetir.
     FUltimoPtz: TDictionary<string, string>;
     FOnvifLock: TCriticalSection;
+    // Uma sessao de comando por camera cujo campo PTZ e um endereco dvrip://.
+    // Ver TPtzControleDvrip.
+    FControles: TObjectDictionary<string, TPtzControleDvrip>;
+    FControlesLock: TCriticalSection;
+    FControlesTickMs: UInt64;
     FCache: TVmsIndexCache;
     FMedia: TMediaBuilder;
     FAuth: TAutenticador;
@@ -240,6 +284,12 @@ type
     function CamerasAgora: TArray<string>;
     function HandleCamerasUi: TApiResponse;
     function ClienteOnvif(const Camera: string): TOnvifClient;
+    // O que esta gravado no campo PTZ da camera, sem interpretacao.
+    function EnderecoPtzDe(const Camera: string): string;
+    // A configuracao de uma sessao de comando para esta camera, com o usuario
+    // e a senha do endpoint que ja grava. False = nao ha o que abrir.
+    function ConfigDeControle(const Camera, Endereco: string;
+                              out Cfg: TCameraSessionConfig): Boolean;
   public
     // O cache e a fonte de miniaturas vêm de fora, e o roteador não é dono de
     // nenhum dos dois: quem os cria é a composição, que é o único lugar que
@@ -266,6 +316,13 @@ type
     // operacao so e o que evita perder um pedido que chegue entre a leitura e
     // a limpeza. Nomes repetidos entram uma vez so: salvar tres vezes seguidas
     // da um trabalho, nao tres.
+    // Abre, fecha e conserta as sessoes de comando de PTZ conforme o cadastro.
+    //
+    // Chamada pelo laco principal, e barata quando nao ha nada a fazer: so
+    // pensa de PTZ_CONTROLE_TICK_MS em PTZ_CONTROLE_TICK_MS. Fica aqui, e nao
+    // na composicao, porque quem precisa da sessao e a rota de PTZ -- do mesmo
+    // jeito que o cliente ONVIF, que tambem nasce e morre nesta classe.
+    procedure ManterControlesPtz;
     function TomarCamerasPendentes: TArray<string>;
     // A lista de cameras que a API reconhece. Trocada quando uma camera nova
     // passa a existir -- sem isto ela gravaria, mas o /api/cameras nao a
@@ -463,6 +520,62 @@ begin
   Result.Status := AStatus;
 end;
 
+{ TPtzControleDvrip }
+
+constructor TPtzControleDvrip.Create(const AConfig: TCameraSessionConfig;
+  const ALogger: ILogger);
+begin
+  inherited Create;
+  FConfig := AConfig;
+  FLogger := ALogger;
+  FTag := 'ptz.' + AConfig.Name;
+  FParar := TEvent.Create(nil, True, False, '');
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      Sessao: TDvripSession;
+    begin
+      while FParar.WaitFor(0) <> wrSignaled do
+      begin
+        Sessao := TDvripSession.Create(FConfig, FLogger, TSystemClock.Create,
+                                       FParar, nil);
+        try
+          try
+            Sessao.RunControl; // volta quando FParar dispara ou a conexao cai
+          except
+            on E: Exception do
+              if FLogger <> nil then
+                FLogger.Warn(FTag, 'sessao de comando caiu: ' + E.Message);
+          end;
+        finally
+          Sessao.Free;
+        end;
+        // Espera antes de tentar de novo, e a espera E o ponto de parada:
+        // camera fora do ar faria isto girar sem folga.
+        if FParar.WaitFor(5000) = wrSignaled then Break;
+      end;
+    end);
+  FThread.FreeOnTerminate := False;
+  FThread.Start;
+end;
+
+destructor TPtzControleDvrip.Destroy;
+begin
+  FParar.SetEvent;
+  if FThread <> nil then
+  begin
+    FThread.WaitFor;
+    FThread.Free;
+  end;
+  FParar.Free;
+  inherited;
+end;
+
+function TPtzControleDvrip.Endereco: string;
+begin
+  Result := FConfig.Url;
+end;
+
 { TApiRouter }
 
 constructor TApiRouter.Create(const AConfig: TApiConfig;
@@ -491,6 +604,8 @@ begin
   FOnvif := TObjectDictionary<string, TOnvifClient>.Create([doOwnsValues]);
   FUltimoPtz := TDictionary<string, string>.Create;
   FOnvifLock := TCriticalSection.Create;
+  FControles := TObjectDictionary<string, TPtzControleDvrip>.Create([doOwnsValues]);
+  FControlesLock := TCriticalSection.Create;
   RecarregarAuth;
   // A interface E a pasta: faltando ela, ou um arquivo dela, não há tela
   // nenhuma. Dizer isso na subida evita descobrir pelo navegador, com uma
@@ -516,6 +631,10 @@ begin
   FOnvif.Free;
   FUltimoPtz.Free;
   FOnvifLock.Free;
+  // Antes do lock: cada sessao para a thread dela no destrutor, e a thread
+  // ainda pode estar entrando aqui para se desanunciar.
+  FControles.Free;
+  FControlesLock.Free;
   FPendentes.Free;
   FCamerasLock.Free;
   inherited;
@@ -1645,6 +1764,19 @@ var
               IntToStr(Cursor.Epoch) + '-' + IntToStr(Ord(Cursor.WaitKeyframe));
   end;
 
+  // Ninguem publicando. 204 com a marca, e nao o historico: cair para o
+  // arquivo mostrava um trecho de minutos atras com a tela dizendo "ao vivo",
+  // e nada distinguia um do outro. Quem olha um portao precisa saber que esta
+  // vendo o passado.
+  function SemAoVivo: TApiResponse;
+  begin
+    Result := Default(TApiResponse);
+    Result.Status := 204;
+    Result.ContentType := 'application/x-vms';
+    Result.Body := nil;
+    Result.Extra := TArray<string>.Create('X-Vms-Live: 0');
+  end;
+
   function NadaNovo: TApiResponse;
   begin
     Result := Default(TApiResponse);
@@ -1663,9 +1795,8 @@ begin
 
   Stream := nil;
   if FHub <> nil then Stream := FHub.Find(Camera);
-  // Nada publicando agora: o histórico responde por isto, exatamente como antes.
   if (Stream = nil) or (not Stream.IsPublishing) then
-    Exit(HandleMedia(Query, True));
+    Exit(SemAoVivo);
 
   CursorTexto := Trim(QueryValue(Query, 'cursor'));
   Descontinuo := False;
@@ -1816,6 +1947,11 @@ begin
   // Quem tem ONVIF na 80 escreve "<ip>" na chave e segue igual; o botao
   // Procurar da tela de cameras preenche isso sozinho.
   if Trim(XAddr) = '' then Exit;
+  // dvrip:// no campo nao e endereco de ONVIF: e o pedido de uma sessao de
+  // comando, que TPtzControleDvrip abre e a rota acha no registro. Tentar SOAP
+  // na porta do DVRIP so gastaria o tempo de espera de uma porta que nunca vai
+  // responder isso.
+  if StartsText('dvrip://', XAddr) then Exit;
   // EnderecoOnvif aceita as mesmas tres formas que o campo do app: so o host,
   // host com porta, ou a URL inteira.
   XAddr := EnderecoOnvif(XAddr, Url);
@@ -1838,6 +1974,120 @@ begin
   end;
 end;
 
+function TApiRouter.EnderecoPtzDe(const Camera: string): string;
+var
+  Valor: string;
+begin
+  Result := '';
+  if (FDb = nil) or (not FDb.IsOpen) then Exit;
+  Valor := '';
+  FDb.Read('SELECT value FROM setting WHERE key = ?',
+           ['ptz.' + LowerCase(Camera) + '.xaddr'],
+    procedure(const Row: IDbRow)
+    begin
+      Valor := Trim(Row.AsString('value'));
+    end);
+  Result := Valor;
+end;
+
+function TApiRouter.ConfigDeControle(const Camera, Endereco: string;
+  out Cfg: TCameraSessionConfig): Boolean;
+var
+  Usuario, Senha: string;
+  Achou: Boolean;
+begin
+  Result := False;
+  Cfg := Default(TCameraSessionConfig);
+  if (FDb = nil) or (not FDb.IsOpen) then Exit;
+
+  // Usuario e senha do endpoint que ja grava: e a MESMA camera, e pedir para
+  // cadastrar de novo so criaria uma segunda copia da senha para envelhecer.
+  Achou := False;
+  FDb.Read('SELECT e.user_name, e.password FROM camera_endpoint e ' +
+           'JOIN camera c ON c.id = e.camera_id ' +
+           'WHERE c.name = ? ORDER BY e.ord LIMIT 1', [Camera],
+    procedure(const Row: IDbRow)
+    begin
+      Usuario := Row.AsString('user_name');
+      Senha := Row.AsString('password');
+      Achou := True;
+    end);
+  if not Achou then Exit;
+
+  Cfg.Name := Camera;
+  Cfg.Url := Endereco;
+  Cfg.User := Usuario;
+  Cfg.Password := Senha;
+  Cfg.ConnectTimeoutMs := 8000;
+  Cfg.RtspTimeoutMs := 8000;
+  Cfg.RecordEnabled := False;
+  Result := True;
+end;
+
+procedure TApiRouter.ManterControlesPtz;
+var
+  Nomes: TArray<string>;
+  Nome, Endereco: string;
+  Cfg: TCameraSessionConfig;
+  Ctrl: TPtzControleDvrip;
+  Sobrando: TArray<string>;
+  I: Integer;
+begin
+  if TThread.GetTickCount64 - FControlesTickMs < PTZ_CONTROLE_TICK_MS then Exit;
+  FControlesTickMs := TThread.GetTickCount64;
+  if (FDb = nil) or (not FDb.IsOpen) then Exit;
+
+  Nomes := CamerasAgora;
+  for Nome in Nomes do
+  begin
+    Endereco := EnderecoPtzDe(Nome);
+    // So dvrip:// abre sessao. Endereco ONVIF continua indo pelo caminho de
+    // sempre, e campo vazio nao abre nada.
+    if not StartsText('dvrip://', Endereco) then Continue;
+    // Camera que ja tem sessao viva nao ganha outra: se ela e GRAVADA por
+    // DVRIP, o comando ja anda pela conexao da gravacao, e duas sessoes com o
+    // mesmo nome brigariam pelo registro.
+    if TPtzRegistry.Achar(Nome) <> nil then Continue;
+
+    FControlesLock.Enter;
+    try
+      if FControles.TryGetValue(LowerCase(Nome), Ctrl) then
+      begin
+        // O cadastro mudou de endereco embaixo da sessao: derruba e refaz.
+        if SameText(Ctrl.Endereco, Endereco) then Continue;
+        FControles.Remove(LowerCase(Nome));
+      end;
+      if not ConfigDeControle(Nome, Endereco, Cfg) then Continue;
+      FControles.Add(LowerCase(Nome),
+                     TPtzControleDvrip.Create(Cfg, FLogger));
+      if FLogger <> nil then
+        FLogger.Info('ptz.' + Nome, 'abrindo sessao de comando em ' + Endereco);
+    finally
+      FControlesLock.Leave;
+    end;
+  end;
+
+  // Camera que perdeu o endereco, ou sumiu do cadastro, perde a sessao.
+  Sobrando := nil;
+  FControlesLock.Enter;
+  try
+    for Nome in FControles.Keys do
+      if not StartsText('dvrip://', EnderecoPtzDe(Nome)) then
+      begin
+        SetLength(Sobrando, Length(Sobrando) + 1);
+        Sobrando[High(Sobrando)] := Nome;
+      end;
+    for I := 0 to High(Sobrando) do
+    begin
+      FControles.Remove(Sobrando[I]);
+      if FLogger <> nil then
+        FLogger.Info('ptz.' + Sobrando[I], 'sessao de comando encerrada');
+    end;
+  finally
+    FControlesLock.Leave;
+  end;
+end;
+
 function TApiRouter.HandlePtz(const Query: string): TApiResponse;
 var
   Camera, Acao, Comando: string;
@@ -1851,6 +2101,7 @@ var
   Presets: TArray<TOnvifPreset>;
   I: Integer;
   Ok: Boolean;
+  Espera: UInt64;
 
   function Num(const Nome: string): Double;
   var
@@ -1874,6 +2125,23 @@ begin
   // Estas cameras nao respondem ONVIF (medido: a porta 80 delas recusa
   // conexao), entao para elas este e o unico caminho.
   Sessao := TPtzRegistry.Achar(Camera);
+  // Sem sessao viva e com dvrip:// no cadastro: manda abrir uma so de comando
+  // e espera um pouco por ela. Quem grava por RTSP cai sempre aqui no primeiro
+  // clique depois de subir o servidor.
+  if (Sessao = nil) and StartsText('dvrip://', EnderecoPtzDe(Camera)) then
+  begin
+    FControlesTickMs := 0; // nao espera o proximo tick do laco principal
+    ManterControlesPtz;
+    Espera := TThread.GetTickCount64 + PTZ_CONTROLE_ESPERA_MS;
+    while (Sessao = nil) and (TThread.GetTickCount64 < Espera) do
+    begin
+      Sleep(100);
+      Sessao := TPtzRegistry.Achar(Camera);
+    end;
+    if Sessao = nil then
+      Exit(TApiResponse.Error(503,
+        'abrindo a sessao de comando desta camera; tente de novo em instantes'));
+  end;
   if Sessao <> nil then
   begin
     Comando := '';
@@ -1882,7 +2150,7 @@ begin
     // porque nem toda camera concorda com isso e descobrir qual e a certa e
     // trabalho de tentativa, nao de leitura.
     Canal := StrToIntDef(Trim(QueryValue(Query, 'canal')), 0);
-        if Acao = 'mover' then
+    if Acao = 'mover' then
     begin
       Comando := ComandoDvripDe(Num('pan'), Num('tilt'), Num('zoom'));
       Passo := PassoDvripDe(Num('pan'), Num('tilt'), Num('zoom'));
@@ -2288,8 +2556,9 @@ begin
                 Ord(EpObj.GetValue<Boolean>('tailscale', False))]);
     end;
 
-    // O endereco de ONVIF mora em `setting`, e nao numa coluna da camera,
-    // porque e o mesmo lugar de onde o /api/ptz ja o le hoje.
+    // O endereco do PTZ mora em `setting`, e nao numa coluna da camera,
+    // porque e o mesmo lugar de onde o /api/ptz ja o le hoje. Vale para as
+    // duas formas: host de ONVIF ou dvrip://host:porta.
     if Ptz <> '' then
       FDb.Exec('INSERT INTO setting (key, value, updated_at_ms) ' +
                'VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET ' +

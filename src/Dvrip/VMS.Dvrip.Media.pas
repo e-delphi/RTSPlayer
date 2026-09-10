@@ -39,6 +39,10 @@ type
     FTag: string;
     FLoggedType: array[Byte] of Boolean; // rate-limit: 1 log por tipo desconhecido
     FResyncs: Integer;
+    // A mesma conta, mas da janela de estatisticas. Existe separada porque
+    // FResyncs so serve para calar o log depois de 20 linhas, e um contador que
+    // para de contar nao responde "esta acontecendo AGORA?".
+    FResyncWin: Integer;
     // Contabilidade por marcador, INCLUSIVE dos que são descartados. É a única
     // forma de responder "a câmera não manda áudio" x "o áudio vem num frame
     // que estamos jogando fora" sem uma captura de rede.
@@ -114,6 +118,7 @@ begin
   FLen := 0;
   FCodecKnown := False;
   FResyncs := 0;
+  FResyncWin := 0;
   FillChar(FLoggedType, SizeOf(FLoggedType), 0);
   FillChar(FTypeFrames, SizeOf(FTypeFrames), 0);
   FillChar(FTypeBytes, SizeOf(FTypeBytes), 0);
@@ -134,6 +139,10 @@ begin
   // (menos os headers). Se não bater, há byte sumindo antes dos contadores.
   Result := Format('in=%dB', [FFedBytes]);
   FFedBytes := 0;
+  // So aparece quando houve: numa camera saudavel esta linha nao ganha ruido.
+  if FResyncWin > 0 then
+    Result := Result + Format(' ressync=%d', [FResyncWin]);
+  FResyncWin := 0;
   for I := 0 to 255 do
     if FTypeFrames[I] > 0 then
     begin
@@ -190,7 +199,7 @@ begin
     begin
       Q := FindMarker(P + 1);
       if Q < 0 then Break;
-      Inc(FResyncs);
+      Inc(FResyncs); Inc(FResyncWin);
       if (FLogger <> nil) and (FResyncs <= 20) then
         FLogger.Warn(FTag, Format('ressincronizou (pulou %d bytes de lixo)', [Q - P]));
       P := Q;
@@ -206,7 +215,7 @@ begin
           begin
             if (FLogger <> nil) and (FResyncs <= 20) then
               FLogger.Warn(FTag, Format('I-frame com length insano (%d) -> ressync', [Len]));
-            Inc(FResyncs);
+            Inc(FResyncs); Inc(FResyncWin);
             Q := FindMarker(P + 1);
             if Q < 0 then Break;
             P := Q; Continue;
@@ -223,7 +232,7 @@ begin
           begin
             if (FLogger <> nil) and (FResyncs <= 20) then
               FLogger.Warn(FTag, Format('P-frame com length insano (%d) -> ressync (header FD errado?)', [Len]));
-            Inc(FResyncs);
+            Inc(FResyncs); Inc(FResyncWin);
             Q := FindMarker(P + 1);
             if Q < 0 then Break;
             P := Q; Continue;
@@ -261,6 +270,7 @@ begin
     else
       // Tipo de frame não mapeado — loga 1x por tipo (revela formato novo
       // numa câmera/rede diferente) e tenta ressincronizar no próximo marcador.
+      Inc(FResyncWin);
       CountFrame(FrameType, 0);
       if (FLogger <> nil) and (not FLoggedType[FrameType]) then
       begin

@@ -570,6 +570,7 @@
         <option value="16">16x</option>
       </select>
       <button class="b on" id="som">Som</button>
+      <button class="b tonal" id="hist">Hist&oacute;rico</button>
       <button class="b tonal" id="evs">Eventos</button>
       <span id="estado"></span>
     </div>
@@ -805,9 +806,17 @@ function telaAtual() {
 
 var listaDeOrigem = "t-home";
 
+// A lista de dias foi aberta de DENTRO do ao vivo. Muda so para onde o voltar
+// dela leva: para a camera que estava na tela, e nao para a lista.
+//
+// Vale uma vez so, e quem a consome e abrirPlayer: depois de escolher um dia, o
+// voltar do player ja devolve para os dias, e dali a lista e o destino certo.
+var diasVeioDoAoVivo = false;
+
 function abrirCameraDe(escopo, nome, historico) {
   servAtual = escopo;
   listaDeOrigem = telaAtual();
+  diasVeioDoAoVivo = false;
   if (historico) abrirDias(nome);
   else aoVivo(nome);
 }
@@ -1079,6 +1088,10 @@ function ajustarBotoesDoPlayer() {
   // retomar nem o que acelerar: o agora acontece uma vez, em tempo real. Os
   // dois voltam quando se abre uma gravacao.
   var gravacao = !!dia;
+  // Historico so no AO VIVO, e so onde ha servidor. Dentro de uma gravacao ele
+  // levaria de volta a lista de dias de onde se acabou de sair, e camera deste
+  // aparelho nao tem gravacao para listar.
+  $("hist").style.display = (comServidor() && !gravacao) ? "" : "none";
   $("tocar").style.display = gravacao ? "" : "none";
   $("vel").style.display = gravacao ? "" : "none";
   if (!gravacao) {
@@ -1133,6 +1146,9 @@ function garantirTocador() {
       // Sobre o video, e nao na barra: e um recado passageiro sobre o que esta
       // acontecendo agora, e some no primeiro quadro que aparecer.
       if (tipo === "aviso") $("aviso").textContent = msg;
+      // Camera fora do ar: o recado fica ate chegar imagem, e nao some sozinho
+      // como os outros avisos, porque a ausencia de video E o estado.
+      if (tipo === "semsinal") $("aviso").textContent = msg;
       if (tipo === "reancorado")
         $("estado").textContent += "   |   abriu em " + hhmmss(msg);
     },
@@ -1151,6 +1167,7 @@ function garantirTocador() {
 
 function abrirPlayer(camera, d, msInicial) {
   dia = d;
+  diasVeioDoAoVivo = false;
   camAtual = camera;
   tocavaAoSair = false;
   vista = janelaInicial(d, msInicial);
@@ -2895,10 +2912,22 @@ function resetarZoom() { zoom = 1; panX = 0; panY = 0; aplicarZoom(); }
   palco.addEventListener("pointercancel", soltar);
 })();
 
-$("v-dias").onclick = function () { mostrar(listaDeOrigem); };
+// Um lugar so para o voltar dos dias: o botao da tela e o do aparelho tem de
+// concordar, e ja divergiram antes.
+function voltarDosDias() {
+  mostrar(diasVeioDoAoVivo ? "t-play" : listaDeOrigem);
+}
+
+$("v-dias").onclick = voltarDosDias;
 // Do ao vivo se volta para a lista: nao houve dia nenhum no caminho, e mandar
 // para os dias deixava a tela presa em "carregando" um historico que a camera do
 // aparelho nao tem.
+$("hist").onclick = function () {
+  if (!camAtual) return;
+  diasVeioDoAoVivo = true;
+  abrirDias(camAtual);
+};
+
 $("v-play").onclick = function () {
   mostrar(dia ? "t-dias" : listaDeOrigem);
 };
@@ -2925,7 +2954,7 @@ window.vmsVoltar = function () {
   // Do ao vivo se volta para a lista de onde se veio: nao houve dia nenhum no
   // caminho.
   if (qual === "t-play") { mostrar(dia ? "t-dias" : listaDeOrigem); return true; }
-  if (qual === "t-dias") { mostrar(listaDeOrigem); return true; }
+  if (qual === "t-dias") { voltarDosDias(); return true; }
   if (qual === "t-edit") { voltarParaLista(); return true; }
   if (qual === "t-mov") { mostrar("t-cams"); return true; }
   if (qual === "t-srvcam") { mostrar("t-cams"); return true; }

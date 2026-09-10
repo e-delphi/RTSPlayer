@@ -1017,6 +1017,21 @@ var Player = (function () {
     this.pedirAoVivo().then(function () { self.laco(); });
   };
 
+  // A camera parou de publicar: apaga o que estava desenhado e avisa.
+  //
+  // Apagar e o ponto. Deixar o ultimo quadro na tela seria a mesma mentira que
+  // mostrar a gravacao: uma imagem parada que parece o agora. Uma vez so, e nao
+  // a cada resposta, senao o aviso pisca a cada meio segundo.
+  Player.prototype.semSinalAoVivo = function () {
+    if (this.semSinal) return;
+    this.semSinal = true;
+    this.pendentes = [];
+    this.baseMs = 0;
+    if (this.ctx && this.canvas)
+      this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    this.aoEstado("semsinal", "camera fora do ar");
+  };
+
   Player.prototype.pedirAoVivo = function () {
     var self = this, ger = this.geracao;
     if (this.buscando) return Promise.resolve();
@@ -1032,7 +1047,11 @@ var Player = (function () {
         // Meio segundo: o bloco leva alguns segundos para fechar, entao voltar
         // antes disso e so gastar viagem.
         self.esperaAte = self.relogio() + 0.5;
-        return { vazio: true, cursor: cur };
+        // A camera nao esta publicando. Diferente de "nada novo": ali ha
+        // sinal e o proximo bloco vem; aqui nao ha o que esperar, e o que
+        // estiver na tela e passado.
+        return { vazio: true, cursor: cur,
+                 semSinal: r.headers.get("X-Vms-Live") === "0" };
       }
       if (!r.ok) throw new Error("live " + r.status);
       // O ao vivo do servidor troca de arquivo quando a gravacao troca, e ai o
@@ -1047,7 +1066,9 @@ var Player = (function () {
       if (ger !== self.geracao) return;
       if (res.cursor !== null && res.cursor !== undefined)
         self.cursorLive = res.cursor;
+      if (res.semSinal) self.semSinalAoVivo();
       if (res.vazio || !res.buf || !res.buf.byteLength) return;
+      self.semSinal = false;
 
       // Cada resposta do ao vivo traz o cabecalho de novo. Reconfigurar o
       // decodificador a cada uma seria jogar fora o estado dele; so a primeira

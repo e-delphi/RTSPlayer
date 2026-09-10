@@ -225,6 +225,10 @@ const
   // Prazo TOTAL para juntar o payload de UMA mensagem. Uma mensagem DVRIP é um
   // quadro; em qualquer bitrate real ela chega em muito menos que isto.
   MAX_PAYLOAD_MS = 5000;
+  // Prazo para engolir o resto de um payload que nao completou. Maior que o de
+  // montar a mensagem de proposito: aqui nao ha nada a ganhar desistindo -- sair
+  // no meio custa o enquadramento do fluxo inteiro.
+  DRENO_MS = 10000;
 
 // Lê Size bytes com prazo TOTAL, e não por chamada.
 //
@@ -235,13 +239,18 @@ const
 // gravação não avança, e quem está assistindo pelo servidor congela e cai por
 // timeout. Com prazo total, um tamanho impossível falha em segundos e o
 // chamador reancora no próximo header.
+//
+// Lidos devolve quantos bytes chegaram ANTES de falhar. E o que permite ao
+// chamador consumir o resto e nao deixar o fluxo no meio de uma mensagem --
+// ver DescartarBytes logo abaixo.
 function RecvExactWithin(const Stream: ITcpStream; var Buf: TBytes; Size: Integer;
-  TimeoutMs, TotalMs: Cardinal): Boolean;
+  TimeoutMs, TotalMs: Cardinal; out Lidos: Integer): Boolean;
 var
   Chunk: TBytes;
   Got, Want, N: Integer;
   Deadline: UInt64;
 begin
+  Lidos := 0;
   if Size <= 0 then Exit(True);
   if Length(Buf) < Size then SetLength(Buf, Size);
   SetLength(Chunk, 64 * 1024);
@@ -256,6 +265,38 @@ begin
     if N <= 0 then Exit(False);
     Move(Chunk[0], Buf[Got], N);
     Inc(Got, N);
+    Lidos := Got;
+  end;
+  Result := True;
+end;
+
+// Consome e joga fora Quantos bytes, para o fluxo voltar ao inicio da proxima
+// mensagem.
+//
+// Existe porque desistir de um payload no meio deixava o resto dele no socket,
+// e a leitura seguinte tomava bytes de video por cabecalho. Aqui nao ha
+// adivinhacao: o DataLen ja disse quanto falta. Chegar atrasado ainda e melhor
+// que perder o enquadramento, e quem chamou ja desistiu do conteudo -- por isso
+// o prazo proprio, e nao o que acabou de estourar.
+function DescartarBytes(const Stream: ITcpStream; Quantos: Integer;
+  TimeoutMs, TotalMs: Cardinal): Boolean;
+var
+  Chunk: TBytes;
+  Falta, Want, N: Integer;
+  Deadline: UInt64;
+begin
+  if Quantos <= 0 then Exit(True);
+  SetLength(Chunk, 64 * 1024);
+  Deadline := UInt64(TThread.GetTickCount64) + TotalMs;
+  Falta := Quantos;
+  while Falta > 0 do
+  begin
+    if UInt64(TThread.GetTickCount64) > Deadline then Exit(False);
+    Want := Falta;
+    if Want > Length(Chunk) then Want := Length(Chunk);
+    N := Stream.Recv(Chunk, Want, TimeoutMs);
+    if N <= 0 then Exit(False);
+    Dec(Falta, N);
   end;
   Result := True;
 end;
@@ -330,6 +371,7 @@ function DvripRecv(const Stream: ITcpStream; out Hdr: TDvripHeader;
   out Payload: TBytes; TimeoutMs: Cardinal; out FailReason: string): Boolean;
 var
   HBuf: TBytes;
+  Lidos: Integer;
 begin
   Result := False;
   FailReason := '';
@@ -361,10 +403,18 @@ begin
   if Hdr.DataLen > 0 then
   begin
     SetLength(Payload, Hdr.DataLen);
-    if not RecvExactWithin(Stream, Payload, Integer(Hdr.DataLen), TimeoutMs, MAX_PAYLOAD_MS) then
+    if not RecvExactWithin(Stream, Payload, Integer(Hdr.DataLen), TimeoutMs,
+                           MAX_PAYLOAD_MS, Lidos) then
     begin
-      FailReason := Format('payload incompleto (%u bytes) MsgID=%d',
-        [Hdr.DataLen, Hdr.MsgID]);
+      // Quem chama esta versao segue em frente depois do erro (a consulta de
+      // config, o Claim do monitor), entao o resto do payload TEM que sair do
+      // socket -- senao a proxima leitura comeca no meio dele.
+      if DescartarBytes(Stream, Integer(Hdr.DataLen) - Lidos, TimeoutMs, DRENO_MS) then
+        FailReason := Format('payload incompleto (%u bytes) MsgID=%d; resto descartado',
+          [Hdr.DataLen, Hdr.MsgID])
+      else
+        FailReason := Format('payload incompleto (%u bytes) MsgID=%d; fluxo desenquadrado',
+          [Hdr.DataLen, Hdr.MsgID]);
       Exit;
     end;
   end;
@@ -440,6 +490,7 @@ var
   HBuf, OneByte: TBytes;
   MsgID: Word;
   DataLen: Cardinal;
+  Lidos: Integer;
 begin
   Result := False;
   SkippedBytes := 0;
@@ -492,9 +543,17 @@ begin
   if DataLen > 0 then
   begin
     SetLength(Payload, DataLen);
-    if not RecvExactWithin(Stream, Payload, Integer(DataLen), TimeoutMs, MAX_PAYLOAD_MS) then
+    if not RecvExactWithin(Stream, Payload, Integer(DataLen), TimeoutMs,
+                           MAX_PAYLOAD_MS, Lidos) then
     begin
-      FailReason := Format('payload incompleto (%u bytes) MsgID=%d', [DataLen, MsgID]);
+      // Pelo mesmo motivo da outra versao. Aqui o laco de recepcao derruba a
+      // sessao logo em seguida, mas nao e este codigo que garante isso.
+      if DescartarBytes(Stream, Integer(DataLen) - Lidos, TimeoutMs, DRENO_MS) then
+        FailReason := Format('payload incompleto (%u bytes) MsgID=%d; resto descartado',
+          [DataLen, MsgID])
+      else
+        FailReason := Format('payload incompleto (%u bytes) MsgID=%d; fluxo desenquadrado',
+          [DataLen, MsgID]);
       Exit;
     end;
   end;

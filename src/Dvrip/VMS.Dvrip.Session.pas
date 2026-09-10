@@ -52,6 +52,7 @@ type
     FMediaMsgID: Word;         // MsgID que esta câmera usa para mídia
     FMediaMsgIDKnown: Boolean;
     FFramingResyncs: Integer;  // quantas vezes o enquadramento saiu de sincronia
+    FFramingWin: Integer;      // a mesma conta na janela de estatisticas
     FWarnedMsgIDs: array[0..7] of Word; // rate-limit: 1 aviso por MsgID duvidoso
     FWarnedCount: Integer;
     // Escrever no socket deixou de ser coisa de uma thread so quando a PTZ
@@ -66,6 +67,7 @@ type
     function QueryEncodeConfig: Boolean;
     procedure StartMonitor;
     procedure ReceiveLoop;
+    procedure ControlLoop;
     procedure DispatchMessage(MsgID: Word; const Payload: TBytes);
     procedure FeedMedia(MsgID: Word; const Payload: TBytes);
     function WarnOnceFor(MsgID: Word): Boolean;
@@ -80,6 +82,9 @@ type
                        const AMediaSink: IMediaSink);
     destructor Destroy; override;
     procedure Run;
+    // Conecta e fica viva SO para comandar: login, keepalive, nada de video.
+    // Ver o corpo. Bloqueia ate o evento de parada, como Run.
+    procedure RunControl;
     function CurrentOutputPath: string;
     // True se chegou a notificar mídia (stream funcionou de fato).
     function StreamedOk: Boolean;
@@ -347,6 +352,47 @@ begin
   FLastKeepAliveMs := FClock.MonotonicMs;
 end;
 
+// Laco da sessao de comando.
+//
+// Sem OPMonitor nao ha fluxo, entao o normal e o socket ficar calado entre um
+// keepalive e outro. Silencio aqui nao e defeito, e por isso o tempo esgotado
+// volta para o topo do laco -- ao contrario do laco de midia, onde ele quer
+// dizer que a camera parou de mandar video e a sessao tem que cair.
+//
+// O que chega e resposta de comando: vai para o log e nada mais. Guardar para
+// devolver ao chamador exigiria casar resposta com pedido, e a rota de PTZ nao
+// espera resposta de proposito -- ver o comentario de MoverPtz.
+procedure TDvripSession.ControlLoop;
+var
+  Hdr: TDvripHeader;
+  Payload: TBytes;
+  FailReason, RejectInfo: string;
+  Skipped: Integer;
+  Recebeu: Boolean;
+begin
+  FLastKeepAliveMs := FClock.MonotonicMs;
+  while not StopRequested do
+  begin
+    Recebeu := False;
+    FailReason := '';
+    try
+      Recebeu := DvripRecvResync(FTcp, Hdr, Payload, 2000, FSessionID, Skipped,
+                                 RejectInfo, FailReason);
+    except
+      // Tempo esgotado sem nada chegar: e o estado esperado desta sessao.
+      on EVmsTimeoutError do ;
+    end;
+    if Recebeu then
+    begin
+      if Length(Payload) > 0 then
+        FLogger.Debug(FTag, 'ctrl: ' + TEncoding.UTF8.GetString(Payload));
+    end
+    else if FailReason <> '' then
+      raise EVmsIoError.Create('DVRIP controle: ' + FailReason);
+    CheckKeepAlive;
+  end;
+end;
+
 procedure TDvripSession.ReceiveLoop;
 var
   Hdr: TDvripHeader;
@@ -367,6 +413,7 @@ begin
       // Múltiplo exato do tamanho de uma mensagem = mensagem legítima recusada,
       // não lixo — o RejectInfo diz qual campo não passou.
       Inc(FFramingResyncs);
+      Inc(FFramingWin);
       if (FLogger <> nil) and (FFramingResyncs <= 20) then
         FLogger.Warn(FTag, Format('enquadramento: pulou %d bytes ate o proximo header (MsgID=%d, %d ocorrencia(s)) recusado: %s',
           [Skipped, Hdr.MsgID, FFramingResyncs, RejectInfo]));
@@ -613,7 +660,7 @@ var
   NowMs: Int64;
   ElapsedMs: Int64;
   Kbps: Integer;
-  Frames: string;
+  Frames, Enquadra: string;
 begin
   NowMs := FClock.MonotonicMs;
   if FStatsTickMs = 0 then
@@ -627,17 +674,61 @@ begin
   // que virou mídia é tudo que veio no fluxo. Se faltar áudio, é aqui que se vê
   // se ele chegou em algum marcador que estamos ignorando.
   Frames := FParser.TakeFrameStats;
+  // Perda de enquadramento na janela. O aviso proprio dela cala depois de 20
+  // linhas; aqui o numero continua saindo, que e o que distingue um tropeco na
+  // conexao de uma sessao que passa o dia se recuperando.
+  Enquadra := '';
+  if FFramingWin > 0 then
+    Enquadra := Format(' | enquadramento=%d', [FFramingWin]);
+  FFramingWin := 0;
   if (FWinI or FWinP or FWinAud) <> 0 then
   begin
     Kbps := Integer((FWinVidBytes * 8) div (ElapsedMs)); // bytes*8/ms = kbps
-    FLogger.Info(FTag, Format('stats %ds: vid I=%d P=%d (%d kbps) | audio=%d frames | parser: %s',
-      [ElapsedMs div 1000, FWinI, FWinP, Kbps, FWinAud, Frames]));
+    FLogger.Info(FTag, Format('stats %ds: vid I=%d P=%d (%d kbps) | audio=%d frames | parser: %s%s',
+      [ElapsedMs div 1000, FWinI, FWinP, Kbps, FWinAud, Frames, Enquadra]));
   end
   else
-    FLogger.Warn(FTag, Format('stats %ds: SEM mídia nessa janela', [ElapsedMs div 1000]));
+    FLogger.Warn(FTag, Format('stats %ds: SEM mídia nessa janela%s',
+      [ElapsedMs div 1000, Enquadra]));
   FWinI := 0; FWinP := 0; FWinAud := 0;
   FWinVidBytes := 0; FWinAudBytes := 0;
   FStatsTickMs := NowMs;
+end;
+
+procedure TDvripSession.RunControl;
+var
+  Host: string;
+  Port: Word;
+begin
+  FSeq := 0;
+  FCombinMode := 'NONE';
+  if not ParseHostPort(Host, Port) then
+    raise EVmsConfigError.Create('URL DVRIP invalida: ' + FConfig.Url);
+  if FConfig.UsesTailscale then
+    EnsureTailnetUp(Host, Port, FLogger, FStopEvent);
+
+  FTcp := TIndyTcpStream.Create;
+  try
+    FTcp.Connect(Host, Port, FConfig.ConnectTimeoutMs);
+    FLogger.Info(FTag, Format('controle conectado %s:%d', [Host, Port]));
+    if not Login then
+      raise EVmsAuthError.Create('Login DVRIP falhou (usuario/senha?)');
+    FLogger.Info(FTag, Format('controle pronto (SessionID=0x%x, alive=%ds)',
+      [FSessionID, FAliveInterval]));
+    // A partir daqui a rota de PTZ acha esta sessao pelo nome da camera, do
+    // mesmo jeito que acharia a de gravacao. Sai do registro no finally: uma
+    // sessao morta anunciada faria a rota escrever num socket fechado em vez
+    // de dizer que a camera caiu.
+    TPtzRegistry.Anunciar(FConfig.Name, Self);
+    ControlLoop;
+  finally
+    TPtzRegistry.Apagar(FConfig.Name);
+    try
+      if FTcp <> nil then FTcp.Disconnect;
+    except
+    end;
+    FTcp := nil;
+  end;
 end;
 
 procedure TDvripSession.Run;

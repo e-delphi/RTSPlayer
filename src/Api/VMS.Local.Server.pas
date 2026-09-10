@@ -774,8 +774,14 @@ begin
   begin
     // 204: nada novo AINDA. O cursor volta mesmo assim, porque ele pode ter
     // sido reposicionado (o leitor ficou para tras e o anel ja descartou).
+    //
+    // Aqui o anel e do proprio aparelho e nao ha historico para onde cair: se
+    // nao ha ao vivo, nao ha nada. A marca vai junto pelo mesmo motivo do
+    // vmsserver -- a tela precisa poder dizer que a camera esta fora do ar em
+    // vez de ficar num "conectando" eterno.
     AResponseInfo.ResponseNo := 204;
     AResponseInfo.CustomHeaders.AddValue('X-Vms-Cursor', UIntToStr(Prox));
+    AResponseInfo.CustomHeaders.AddValue('X-Vms-Live', '0');
     AResponseInfo.ContentText := '';
     Exit;
   end;

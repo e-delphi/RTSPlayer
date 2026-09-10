@@ -170,6 +170,10 @@ svg.ico { width:24px; height:24px; display:block; flex:0 0 auto;
 .ajuda { color:var(--sobre-sup-var);
          font:400 12px/16px Roboto, system-ui, sans-serif;
          padding:4px 16px 0; margin:-8px 0 12px; }
+/* O -8px acima existe para encostar a ajuda no campo, que tem 20px embaixo.
+   Depois de uma linha de botoes, que nao tem margem embaixo nenhuma, ele
+   virava sobreposicao: medido, o texto entrava 8px dentro do botao Procurar. */
+.acoes + .ajuda { margin-top:8px; }
 .divisor { height:1px; background:var(--contorno-var); margin:8px 0; }
 
 /* ------------------------------------------------------ campos de texto
