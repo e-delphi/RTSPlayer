@@ -88,6 +88,30 @@ function MakeCamera(const Name, Url, User, Pass: string;
 function CamerasToJson(const Cams: TArray<TCameraConfigEntry>): string;
 function CamerasFromJson(const S: string; out Cams: TArray<TCameraConfigEntry>): Boolean;
 
+// O MESMO cadastro, sem as senhas -- e o que sai pela rota /api/app/cameras.
+// No lugar de cada senha vai um `temSenha`, que e tudo o que a tela precisa
+// mostrar. Senha que nao sai daqui nao vaza pelo cache do WebView, pelo
+// historico nem por uma captura de tela.
+//
+// Este NAO e o formato do arquivo: o cameras.json em disco continua saindo do
+// CamerasToJson, com as senhas, porque e dele que o app reconecta a camera.
+function CamerasToJsonSemSenha(const Cams: TArray<TCameraConfigEntry>): string;
+
+// Repoe, no cadastro que volta da tela, as senhas que nunca foram ate la.
+//
+// Campo de senha vazio quer dizer "mantenha a que ja esta la": a tela recebeu
+// `temSenha` e nao a senha, entao ela nao teria como devolve-la, e sem isto
+// salvar qualquer outro campo -- ou ate excluir OUTRA camera, que reenvia a
+// lista inteira -- apagaria a senha de todo mundo.
+//
+// A camera se reconhece pelo nome. Quando ele mudou (a tela deixa renomear) e
+// as duas listas tem o mesmo tamanho, vale a posicao: a tela troca o item no
+// lugar, entao renomear nao move ninguem. Tamanho diferente e camera criada ou
+// excluida, e ai a posicao nao diz mais nada -- a criada fica sem senha, que e
+// o certo.
+procedure MesclarSenhas(var Novas: TArray<TCameraConfigEntry>;
+  const Atuais: TArray<TCameraConfigEntry>);
+
 implementation
 
 function JsonStr(O: TJSONObject; const Name: string): string;
@@ -280,7 +304,11 @@ begin
   Result.Ptz := '';
 end;
 
-function CamerasToJson(const Cams: TArray<TCameraConfigEntry>): string;
+// O corpo dos dois serializadores. So a senha muda de forma: com ComSenha vai o
+// valor (o arquivo em disco precisa dele para reconectar), sem ComSenha vai so
+// o fato de existir uma.
+function CamerasToJsonImpl(const Cams: TArray<TCameraConfigEntry>;
+  ComSenha: Boolean): string;
 var
   Arr, Eps: TJSONArray;
   O, Ep: TJSONObject;
@@ -305,7 +333,11 @@ begin
           Ep.AddPair('name', Cams[I].Endpoints[J].Name);
           Ep.AddPair('url', Cams[I].Endpoints[J].Url);
           Ep.AddPair('user', Cams[I].Endpoints[J].User);
-          Ep.AddPair('password', Cams[I].Endpoints[J].Password);
+          if ComSenha then
+            Ep.AddPair('password', Cams[I].Endpoints[J].Password)
+          else
+            Ep.AddPair('temSenha',
+              TJSONBool.Create(Cams[I].Endpoints[J].Password <> ''));
           Ep.AddPair('transport', TransportsToStr(Cams[I].Endpoints[J].Transports));
           Ep.AddPair('tailscale', TJSONBool.Create(Cams[I].Endpoints[J].UsesTailscale));
           Eps.AddElement(Ep);
@@ -316,7 +348,10 @@ begin
       // entende o formato antigo (e é o que vale se 'endpoints' não existir).
       O.AddPair('url', Cams[I].Url);
       O.AddPair('user', Cams[I].User);
-      O.AddPair('password', Cams[I].Password);
+      if ComSenha then
+        O.AddPair('password', Cams[I].Password)
+      else
+        O.AddPair('temSenha', TJSONBool.Create(Cams[I].Password <> ''));
       O.AddPair('transport', TransportsToStr(Cams[I].Transports));
       O.AddPair('maxRetries', TJSONNumber.Create(Cams[I].MaxReconnectAttempts));
       O.AddPair('audioDelayMs', TJSONNumber.Create(Cams[I].AudioDelayMs));
@@ -337,6 +372,54 @@ begin
     Result := Arr.Format(2);
   finally
     Arr.Free;
+  end;
+end;
+
+function CamerasToJson(const Cams: TArray<TCameraConfigEntry>): string;
+begin
+  Result := CamerasToJsonImpl(Cams, True);
+end;
+
+function CamerasToJsonSemSenha(const Cams: TArray<TCameraConfigEntry>): string;
+begin
+  Result := CamerasToJsonImpl(Cams, False);
+end;
+
+procedure MesclarSenhas(var Novas: TArray<TCameraConfigEntry>;
+  const Atuais: TArray<TCameraConfigEntry>);
+var
+  I, J, K: Integer;
+  MesmoTamanho: Boolean;
+begin
+  MesmoTamanho := Length(Novas) = Length(Atuais);
+  for I := 0 to High(Novas) do
+  begin
+    J := -1;
+    for K := 0 to High(Atuais) do
+      if SameText(Atuais[K].Name, Novas[I].Name) then
+      begin
+        J := K;
+        Break;
+      end;
+    // O nome nao esta mais la: se nada foi criado nem excluido, e a MESMA
+    // camera renomeada, e ela continua na posicao em que estava.
+    if (J < 0) and MesmoTamanho then J := I;
+    if J < 0 then Continue;
+
+    if Novas[I].Password = '' then
+      Novas[I].Password := Atuais[J].Password;
+    // Os caminhos alternativos casam por posicao, como no vmsserver: a tela
+    // nao os reordena, so devolve o que leu.
+    for K := 0 to High(Novas[I].Endpoints) do
+      if (Novas[I].Endpoints[K].Password = '') and
+         (K <= High(Atuais[J].Endpoints)) then
+        Novas[I].Endpoints[K].Password := Atuais[J].Endpoints[K].Password;
+
+    // O espelho do primeiro caminho tem de acompanhar: e dele que o app tira a
+    // senha ao conectar, e o CamerasFromJson acabou de copiar para ca o vazio
+    // que veio da tela.
+    if Length(Novas[I].Endpoints) > 0 then
+      Novas[I].Password := Novas[I].Endpoints[0].Password;
   end;
 end;
 

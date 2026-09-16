@@ -82,6 +82,19 @@ type
     // nesta porta" de "ha camera aqui, mas ela nao se move" -- duas respostas
     // diferentes para quem esta procurando.
     FRespondeu: Boolean;
+    // Operacoes que ESTA camera recusou uma vez. Nao e cache de resultado: e a
+    // memoria de que perguntar de novo so gasta o tempo de espera.
+    //
+    // Medido na Ayla: Stop e GetPresets fecham a conexao sem resposta HTTP, em
+    // 220 ms cada. No solta do botao esses 220 ms saem na frente do movimento
+    // de velocidade zero que de fato para a camera, e ela gira sozinha esse
+    // tanto depois que o dedo saiu.
+    //
+    // Vale enquanto este objeto viver -- ate o cadastro da camera mudar ou o
+    // servidor reiniciar. Firmware novo volta a ser tentado ali, e nao ha
+    // ganho em ser mais esperto que isso.
+    FSemStop: Boolean;
+    FSemPresets: Boolean;
 
     function Post(const Url, Corpo: string; out Resposta: string): Boolean;
     function Chamar(const Url, Acao, CorpoInterno: string;
@@ -105,6 +118,12 @@ type
     function Parar: Boolean;
     function LerPresets(out Lista: TArray<TOnvifPreset>): Boolean;
     function IrParaPreset(const Token: string): Boolean;
+    // Guarda a posicao de AGORA. Token vazio cria uma posicao nova; token
+    // preenchido sobrescreve aquela. TokenSalvo volta com o que a camera
+    // usou, que e o unico jeito de saber o nome da recem-criada.
+    function GuardarPreset(const Token, Nome: string;
+                           out TokenSalvo: string): Boolean;
+    function ApagarPreset(const Token: string): Boolean;
 
     // Por que a ultima chamada falhou. Vale ate a proxima.
     property Motivo: string read FMotivo;
@@ -710,18 +729,24 @@ begin
   if not Preparar then Exit(False);
   // Os dois eixos de uma vez: parar so o PanTilt deixa o zoom correndo, e quem
   // soltou o botao espera que TUDO pare.
-  Result := Chamar(FPtzUrl, 'Stop',
-    '<Stop xmlns="' + NS_PTZ + '">' +
-    '<ProfileToken>' + EscaparXml(FPerfil) + '</ProfileToken>' +
-    '<PanTilt>true</PanTilt><Zoom>true</Zoom></Stop>', Resp);
-  if Result then Exit;
+  if not FSemStop then
+  begin
+    Result := Chamar(FPtzUrl, 'Stop',
+      '<Stop xmlns="' + NS_PTZ + '">' +
+      '<ProfileToken>' + EscaparXml(FPerfil) + '</ProfileToken>' +
+      '<PanTilt>true</PanTilt><Zoom>true</Zoom></Stop>', Resp);
+    if Result then Exit;
+    // Falhou uma vez, nao se pergunta mais: ver FSemStop.
+    FSemStop := True;
+    if FLogger <> nil then
+      FLogger.Info(FTag, 'Stop nao respondeu; daqui em diante paro com ' +
+                         'velocidade zero direto');
+  end;
 
   // Camera que nao implementa Stop existe, e cala em vez de recusar. A Ayla e
   // uma: Stop nao devolve nada, e ela para com um movimento de velocidade
   // zero. Aqui, e nao em MoverContinuo, porque MoverContinuo manda velocidade
   // zero para CA -- fazer o contrario fecharia um ciclo entre os dois.
-  if FLogger <> nil then
-    FLogger.Info(FTag, 'Stop nao respondeu; parando com velocidade zero');
   Result := Chamar(FPtzUrl, 'ContinuousMove',
     '<ContinuousMove xmlns="' + NS_PTZ + '">' +
     '<ProfileToken>' + EscaparXml(FPerfil) + '</ProfileToken><Velocity>' +
@@ -731,6 +756,48 @@ begin
     '</Velocity></ContinuousMove>', Resp);
 end;
 
+function TOnvifClient.GuardarPreset(const Token, Nome: string;
+  out TokenSalvo: string): Boolean;
+var
+  Resp, Corpo: string;
+begin
+  TokenSalvo := '';
+  if not Preparar then Exit(False);
+  Corpo := '<SetPreset xmlns="' + NS_PTZ + '">' +
+           '<ProfileToken>' + EscaparXml(FPerfil) + '</ProfileToken>';
+  // O nome vem antes do token na ordem do esquema, e ha firmware que so le
+  // nessa ordem.
+  if Trim(Nome) <> '' then
+    Corpo := Corpo + '<PresetName>' + EscaparXml(Nome) + '</PresetName>';
+  if Trim(Token) <> '' then
+    Corpo := Corpo + '<PresetToken>' + EscaparXml(Token) + '</PresetToken>';
+  Result := Chamar(FPtzUrl, 'SetPreset', Corpo + '</SetPreset>', Resp);
+  if not Result then Exit;
+  // Sobrescrita devolve o mesmo token; criacao devolve um novo. Camera que
+  // nao devolve nada nao e erro: o token que mandamos continua valendo.
+  TokenSalvo := Trim(ValorDaTag(Resp, 'PresetToken'));
+  if TokenSalvo = '' then TokenSalvo := Trim(Token);
+end;
+
+function TOnvifClient.ApagarPreset(const Token: string): Boolean;
+var
+  Resp: string;
+begin
+  if not Preparar then Exit(False);
+  if Trim(Token) = '' then
+  begin
+    FMotivo := 'sem o token da posicao a apagar';
+    Exit(False);
+  end;
+  Result := Chamar(FPtzUrl, 'RemovePreset',
+    '<RemovePreset xmlns="' + NS_PTZ + '">' +
+    '<ProfileToken>' + EscaparXml(FPerfil) + '</ProfileToken>' +
+    '<PresetToken>' + EscaparXml(Token) + '</PresetToken></RemovePreset>',
+    Resp);
+  // Lista guardada em memoria nao existe aqui: quem lista pergunta de novo a
+  // cada abertura, entao apagar nao deixa rastro para limpar.
+end;
+
 function TOnvifClient.LerPresets(out Lista: TArray<TOnvifPreset>): Boolean;
 var
   Resp, Bloco: string;
@@ -738,10 +805,18 @@ var
 begin
   Lista := nil;
   if not Preparar then Exit(False);
+  // Camera que nao lista presets nao passa a listar. A tela pergunta a cada
+  // abertura do ao vivo, e sem esta guarda o log ganhava uma linha de erro por
+  // abertura, dias a fio, por uma resposta que nunca vem. Ver FSemPresets.
+  if FSemPresets then Exit(False);
   Result := Chamar(FPtzUrl, 'GetPresets',
     '<GetPresets xmlns="' + NS_PTZ + '">' +
     '<ProfileToken>' + EscaparXml(FPerfil) + '</ProfileToken></GetPresets>', Resp);
-  if not Result then Exit;
+  if not Result then
+  begin
+    FSemPresets := True;
+    Exit;
+  end;
   N := 0;
   I := 1;
   while True do

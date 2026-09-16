@@ -2101,6 +2101,7 @@ var
   Presets: TArray<TOnvifPreset>;
   I: Integer;
   Ok: Boolean;
+  Alvo, TokenSalvo: string;
   Espera: UInt64;
 
   function Num(const Nome: string): Double;
@@ -2245,18 +2246,29 @@ begin
   else if Acao = 'mover' then
     Ok := Cli.MoverContinuo(TOnvifMove.Criar(Num('pan'), Num('tilt'), Num('zoom')))
   else if (Acao = 'ir') or (Acao = 'preset') then
+  begin
     // Dois nomes para a mesma coisa: `ir` e o que esta rota ja aceitava, e
     // `preset` e o que a tela manda, igual ao DVRIP. O valor vem em `preset`
     // ou em `n`, o que estiver preenchido.
-    Ok := Cli.IrParaPreset(Trim(QueryValue(Query, 'preset')) +
-                           Trim(QueryValue(Query, 'n')))
+    Alvo := Trim(QueryValue(Query, 'preset')) + Trim(QueryValue(Query, 'n'));
+    // Mesmo vocabulario do DVRIP, para a tela nao precisar saber o protocolo.
+    // Ir e o padrao: e o que se faz o tempo todo.
+    Dir := LowerCase(Trim(QueryValue(Query, 'op')));
+    if Dir = 'gravar' then
+      // Alvo vazio cria posicao nova; preenchido sobrescreve aquela.
+      Ok := Cli.GuardarPreset(Alvo, Trim(QueryValue(Query, 'nome')), TokenSalvo)
+    else if Dir = 'apagar' then
+      Ok := Cli.ApagarPreset(Alvo)
+    else
+      Ok := Cli.IrParaPreset(Alvo);
+  end
   else if Acao = 'presets' then
     Ok := Cli.LerPresets(Presets)
   else if Acao = 'testar' then
     Ok := Cli.Preparar
   else
     Exit(TApiResponse.Error(400, 'acao invalida: use mover, parar, presets, ' +
-                                 'ir ou testar'));
+                                 'preset, ir ou testar'));
 
   Root := TJSONObject.Create;
   Root.AddPair('camera', Camera);
@@ -2267,6 +2279,9 @@ begin
   // camera nao tem PTZ, se recusou a senha ou se nem respondeu, e sem ele a
   // tela so teria "nao funcionou".
   if not Ok then Root.AddPair('motivo', Cli.Motivo);
+  // O token de quem acabou de ser guardado. So a camera sabe qual e, quando a
+  // posicao e nova, e sem ele a tela nao teria como se referir a ela depois.
+  if TokenSalvo <> '' then Root.AddPair('token', TokenSalvo);
   if Acao = 'testar' then
   begin
     Root.AddPair('ptz', TJSONBool.Create(Cli.TemPtz));

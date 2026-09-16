@@ -64,10 +64,13 @@ type
   // precisar conhecer a configuração do app nem o formulário.
   TCameraListFunc = function: TArray<string> of object;
 
-  // O cadastro, nos dois sentidos, em JSON -- o MESMO texto que o app grava em
-  // disco e que a exportação manda para outro aparelho (ver CamerasToJson).
-  // Trocar texto, e não registro, mantém o servidor sem saber o que é uma
-  // câmera: ele só transporta.
+  // O cadastro, nos dois sentidos, em JSON. Trocar texto, e não registro,
+  // mantém o servidor sem saber o que é uma câmera: ele só transporta.
+  //
+  // O formato é o do cameras.json com UMA diferença, e ela é de propósito: a
+  // leitura não traz as senhas, e sim um `temSenha` por câmera (ver
+  // CamerasToJsonSemSenha). Na volta, senha vazia quer dizer "mantenha a que já
+  // está lá" — é o mesmo contrato do /api/config/cameras do vmsserver.
   TConfigLerFunc = function: string of object;
   TConfigGravarFunc = function(const Json: string): string of object;
 
@@ -451,6 +454,11 @@ end;
 
 // O cadastro deste aparelho, como texto JSON. Não passa pelo vmsserver: são as
 // câmeras que ESTE app conhece, guardadas no arquivo dele.
+//
+// SEM as senhas: no lugar de cada uma vai um `temSenha`, que é o que a tela
+// precisa mostrar. O que não sai daqui não vaza pelo cache do WebView, pelo
+// histórico nem por uma captura de tela — e esta resposta atravessa a rede
+// local, onde o app também atende de fora do aparelho.
 procedure TLocalServer.ServirConfig(AResponseInfo: TIdHTTPResponseInfo);
 begin
   if not Assigned(FOnLerConfig) then
@@ -471,6 +479,10 @@ end;
 //
 // Devolve o erro de validação do app quando há um, para a página mostrar o
 // motivo em vez de um 400 mudo.
+//
+// Câmera que chega com a senha vazia fica com a que já estava gravada: a tela
+// nunca recebeu a senha (ver ServirConfig), então não teria como devolvê-la.
+// Quem repõe é o MesclarSenhas, do outro lado do OnGravarConfig.
 procedure TLocalServer.GravarConfig(ARequestInfo: TIdHTTPRequestInfo;
   AResponseInfo: TIdHTTPResponseInfo);
 var
@@ -826,7 +838,8 @@ var
   Arr: TJSONArray;
   Achados: TArray<TOnvifAchado>;
   I: Integer;
-  Melhor: string;
+  Melhor, Camera, Usuario, Senha: string;
+  XAddrCad, UsuarioCad, SenhaCad: string;
 begin
   Corpo := '';
   if ARequestInfo.PostStream <> nil then
@@ -856,8 +869,24 @@ begin
       ResponderErro(AResponseInfo, 400, 'a url nao tem host');
       Exit;
     end;
-    Achados := ProcurarOnvif(Host, Obj.GetValue<string>('user', ''),
-                             Obj.GetValue<string>('password', ''), FLogger);
+    Usuario := Obj.GetValue<string>('user', '');
+    Senha := Obj.GetValue<string>('password', '');
+    Camera := Trim(Obj.GetValue<string>('camera', ''));
+    // Senha vazia, com o nome de uma câmera junto, quer dizer a que já está no
+    // cadastro -- o formulário nunca a recebe de volta (ver ServirConfig),
+    // então o campo nasce vazio para câmera já cadastrada. E procurar sem
+    // credencial é o mesmo que procurar com a errada: câmera com senha
+    // responde 401 e sai da lista de achados.
+    if (Senha = '') and (Camera <> '') and Assigned(FOnOnvifCam) then
+      if FOnOnvifCam(Camera, XAddrCad, UsuarioCad, SenhaCad) then
+      begin
+        Senha := SenhaCad;
+        // O usuário do cadastro só entra se o campo estiver vazio: quem
+        // escreveu um usuário está trocando de usuário, e sobrescrevê-lo aqui
+        // procuraria com um par que a pessoa não pediu.
+        if Trim(Usuario) = '' then Usuario := UsuarioCad;
+      end;
+    Achados := ProcurarOnvif(Host, Usuario, Senha, FLogger);
   finally
     Pedido.Free;
   end;

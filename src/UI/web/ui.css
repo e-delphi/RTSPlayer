@@ -56,6 +56,7 @@
   --contorno-var:#3f4447;      /* divisorias e bordas */
 
   --erro:#ffb4ab;
+  --sobre-erro:#690005;        /* o que se escreve EM CIMA do erro */
   --ok:#7ee2a8;
   --alerta:#f2c14e;
 

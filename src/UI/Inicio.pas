@@ -331,9 +331,14 @@ begin
   SetLength(Result, N);
 end;
 
+// O cadastro como a TELA o ve: sem as senhas, com um `temSenha` no lugar de
+// cada uma. Mesmo contrato do /api/config/cameras do vmsserver.
+//
+// O CamerasToJson -- com as senhas -- continua valendo para o cameras.json em
+// disco, que e de onde o app reconecta a camera.
 function TForm1.LerConfigCameras: string;
 begin
-  Result := CamerasToJson(FCameras);
+  Result := CamerasToJsonSemSenha(FCameras);
 end;
 
 // ------------------------------------------------------------- servidores
@@ -495,6 +500,12 @@ begin
         Exit;
       end;
       try
+        // A tela nunca recebeu as senhas: campo vazio quer dizer "mantenha a
+        // que ja esta la". Aqui dentro, e nao antes do Synchronize, porque
+        // FCameras e da thread principal -- quem chama isto e uma thread do
+        // Indy. Sem esta linha, salvar uma camera (a tela reenvia a lista
+        // INTEIRA) apagaria a senha de todas.
+        MesclarSenhas(Novas, FCameras);
         FCameras := Novas;
         SaveCameras;
         // O endereco de ONVIF pode ter mudado nesta gravacao.

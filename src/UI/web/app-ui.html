@@ -187,6 +187,45 @@
   #ptz { position:absolute; right:12px; bottom:12px; z-index:4;
          display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
   #ptz[hidden] { display:none; }
+  /* O lapis no fim da tira: leva ao dialogo de manutencao. Cor primaria para
+     nao se confundir com as posicoes, que sao todas iguais entre si. */
+  #ptz-presets .pv.editar { color:var(--p); }
+
+  /* ------------------------------------------ dialogo das posicoes
+
+     Vive dentro do #palco, sobre o video, porque e ali que a pessoa esta
+     olhando quando decide guardar uma posicao. Sair para outra tela custaria
+     perder de vista exatamente o enquadramento que se quer guardar. */
+  #pos-dialogo { position:absolute; inset:0; z-index:30; display:none;
+                 align-items:center; justify-content:center;
+                 background:rgba(0,0,0,.6); }
+  #pos-dialogo.on { display:flex; }
+  #pos-caixa { background:var(--sup3); border-radius:var(--r-l);
+               box-shadow:0 8px 24px rgba(0,0,0,.6);
+               box-sizing:border-box;
+               width:min(340px, calc(100% - 32px));
+               max-height:calc(100% - 32px); overflow:auto;
+               padding:16px; }
+  #pos-caixa h2 { margin:0 0 4px; color:var(--sobre-sup);
+                  font:500 16px/24px Roboto, system-ui, sans-serif; }
+  #pos-caixa .ajuda { padding:0; margin:0 0 12px; }
+  #pos-lista { display:flex; flex-direction:column; gap:8px; }
+  .pos-linha { display:flex; align-items:center; gap:8px;
+               background:var(--sup2); border-radius:var(--r-s);
+               padding:8px 8px 8px 12px; }
+  .pos-nome { flex:1 1 auto; color:var(--sobre-sup); overflow:hidden;
+              text-overflow:ellipsis; white-space:nowrap;
+              font:400 14px/20px Roboto, system-ui, sans-serif; }
+  .pos-linha button { border:0; border-radius:var(--r-s); cursor:pointer;
+                      padding:8px 12px; background:var(--sec-cont);
+                      color:var(--sobre-sec-cont);
+                      font:500 12px/16px Roboto, system-ui, sans-serif; }
+  .pos-linha button.risco { background:none; color:var(--erro); }
+  /* Armado para apagar: o segundo toque e que apaga. */
+  .pos-linha button.risco.armado { background:var(--erro);
+                                   color:var(--sobre-erro); }
+  #pos-acoes { display:flex; gap:8px; justify-content:flex-end;
+               margin-top:16px; flex-wrap:wrap; }
   /* O teclado propriamente dito. O botao que o abre fica FORA dele, para
      continuar alcancavel quando ele esta fechado. */
   #ptz-corpo { display:flex; flex-direction:column; align-items:flex-end;
@@ -485,6 +524,8 @@
       <span>Usu&aacute;rio</span></label>
     <label class="campo"><input id="f-senha" type="password" autocomplete="off"
       placeholder=" "><span>Senha</span></label>
+    <div class="ajuda" id="f-senha-ajuda">deixe vazio se a c&acirc;mera n&atilde;o
+      pede</div>
     <label class="campo"><input id="f-ptz" placeholder=" ">
       <span>PTZ por ONVIF</span></label>
     <div class="acoes" id="f-ptz-acoes">
@@ -526,6 +567,19 @@
     <canvas id="tela2d"></canvas>
     <img id="previa" alt="">
     <div id="aviso"></div>
+    <!-- Manutencao das posicoes guardadas. Sobre o video de proposito: e o
+         enquadramento que se esta vendo que vai ser guardado. -->
+    <div id="pos-dialogo">
+      <div id="pos-caixa">
+        <h2>Posi&ccedil;&otilde;es guardadas</h2>
+        <div class="ajuda" id="pos-ajuda"></div>
+        <div id="pos-lista"></div>
+        <div id="pos-acoes">
+          <button class="b" id="pos-nova" hidden>Guardar posi&ccedil;&atilde;o atual</button>
+          <button class="b on" id="pos-fechar">Fechar</button>
+        </div>
+      </div>
+    </div>
     <!-- A PTZ. Escondida ate o servidor dizer que esta camera se move. -->
     <div id="ptz" hidden>
       <div id="ptz-corpo" hidden>
@@ -663,6 +717,9 @@ function mostrar(qual) {
   // haver player: trocar de tela com o botao ainda apertado deixaria a camera
   // girando ate o teto de tempo, e ninguem estaria olhando para ela.
   ptzParar();
+  // Sair da reproducao leva o dialogo junto: ele vive sobre o video, e um
+  // video que nao esta mais na tela nao tem posicao para guardar.
+  fecharPosicoes();
   if (!tocador) return;
   if (qual !== "t-play") {
     // Sair da reproducao encerra o player: decodificador de hardware e recurso
@@ -1470,8 +1527,26 @@ $("previa").addEventListener("error", esconderPrevia);
 // resolve isso e a rota e a mesma. Aqui so se diz para onde ir.
 
 var TETO_PTZ_MS = 8000;
+// Pausa entre uma repeticao e a proxima, em camera que anda em passo. Some-se
+// a ela os ~235 ms que a camera leva para responder, dando uns 285 ms entre
+// passos.
+//
+// Medido: a 640 ms o movimento sai picotado, com o passo visivel um a um. A
+// 285 ms ele passa a parecer continuo, e o tempo de resposta nao piora --
+// mediana de 235 ms nos 35 comandos de um aperto de 10 s, sem nenhuma resposta
+// mais lenta que as outras. Ou seja, ela aproveita comando bem antes do que
+// parecia, e o que limitava era a nossa pausa.
+var PTZ_REPETE_MS = 50;
+// O teto de quem anda em passo. Maior que os 8 s porque la o movimento acontece
+// enquanto se segura, e em 8 s saem uns doze passos so -- pouco para chegar
+// onde se quer. Continua existindo pelo mesmo motivo de sempre: se o soltar do
+// botao se perder, alguem tem de parar a camera.
+var TETO_PTZ_PASSO_MS = 20000;
 var ptzAndando = false;
 var ptzRelogio = null;
+// O teto ja foi esticado neste aperto. Uma vez, e nao a cada repeticao: teto
+// que se renova sozinho deixa de ser teto.
+var ptzEsticou = false;
 
 function ptzPedir(params) {
   if (!camAtual) return Promise.resolve({});
@@ -1485,18 +1560,50 @@ function ptzPedir(params) {
 
 function ptzParar() {
   if (ptzRelogio) { clearTimeout(ptzRelogio); ptzRelogio = null; }
+  ptzEsticou = false;
   if (!ptzAndando) return;
   ptzAndando = false;
   ptzPedir("&acao=parar");
 }
 
+// Camera ONVIF que anda em PASSO, e nao enquanto o comando vale.
+//
+// Medido na Ayla, um teste por vez: velocidade 0,7 por 3 s, velocidade 100 por
+// 3 s e velocidade 1 por DOZE segundos andam todos o mesmo tiquinho. Vinte
+// comandos seguidos, esses sim, andaram seis passos. A firmware nao le
+// velocidade nem duracao nesse eixo, e o <Timeout> que mandamos nao muda nada.
+//
+// Por isso segurar o botao manda de novo. O proximo so sai depois que o
+// anterior volta: cada um leva ~240 ms, e empilhar pedido nao faria a camera
+// andar mais -- ela aceita um passo a cada ~800 ms e engole o resto.
+//
+// So ONVIF. No DVRIP um comando anda ate chegar a parada, e repetir ali seria
+// reiniciar o movimento a cada volta.
+function ptzRepetir(resposta, params) {
+  if (!ptzAndando) return;
+  if (!resposta || resposta.via !== "onvif") return;
+  // Descobrimos AGORA que esta camera anda em passo -- no aperto ainda nao
+  // sabiamos por onde o comando iria. Ver TETO_PTZ_PASSO_MS.
+  if (!ptzEsticou) {
+    ptzEsticou = true;
+    if (ptzRelogio) clearTimeout(ptzRelogio);
+    ptzRelogio = setTimeout(ptzParar, TETO_PTZ_PASSO_MS);
+  }
+  setTimeout(function () {
+    if (!ptzAndando) return;
+    ptzPedir(params).then(function (r) { ptzRepetir(r, params); });
+  }, PTZ_REPETE_MS);
+}
+
 function ptzAndar(pan, tilt, zoom) {
   if (ptzAndando) return;
   ptzAndando = true;
+  ptzEsticou = false;
   // Milesimos, e nao decimal: sem ponto nem virgula para errar na query.
-  ptzPedir("&acao=mover&pan=" + Math.round(pan * 1000) +
-           "&tilt=" + Math.round(tilt * 1000) +
-           "&zoom=" + Math.round(zoom * 1000));
+  var params = "&acao=mover&pan=" + Math.round(pan * 1000) +
+               "&tilt=" + Math.round(tilt * 1000) +
+               "&zoom=" + Math.round(zoom * 1000);
+  ptzPedir(params).then(function (r) { ptzRepetir(r, params); });
   if (ptzRelogio) clearTimeout(ptzRelogio);
   ptzRelogio = setTimeout(ptzParar, TETO_PTZ_MS);
 }
@@ -1511,24 +1618,57 @@ function ptzAndar(pan, tilt, zoom) {
 // camera. Quatro deles, que e o que cabe na largura do teclado.
 var PRESETS_DVRIP = 4;
 
+// De qual protocolo vieram as posicoes que estao na tira. Muda o que "guardar"
+// pode fazer: no ONVIF a camera cria posicao nova e batiza sozinha, no DVRIP as
+// posicoes sao numeros fixos e guardar so sobrescreve um deles.
+var presetVia = "";
+
+// Qual montagem da tira e a atual.
+//
+// A tira e limpa na hora e preenchida quando a resposta volta, entao duas
+// montagens em voo ao mesmo tempo despejavam as duas listas na mesma tira e os
+// botoes apareciam dobrados. Medido: abrir o ao vivo e guardar uma posicao
+// logo em seguida bastava. Quem chegar atrasado descobre por este numero que
+// nao e mais o dono da tira, e desiste.
+var presetMontagem = 0;
+
 function montarPresets(via) {
   var alvo = $("ptz-presets");
+  var minha = ++presetMontagem;
+  presetVia = via;
   alvo.innerHTML = "";
   alvo.hidden = true;
   if (via === "onvif") {
     ptzPedir("&acao=presets").then(function (j) {
-      var lista = (j && j.presets) || [];
+      if (minha !== presetMontagem) return;
+      // Camera que nao sabe LISTAR nao sabe guardar nem apagar. Medido na
+      // ayla em 12/09/2026: GetPresets, GotoPreset, SetPreset e RemovePreset
+      // derrubam a conexao sem resposta HTTP; das operacoes de PTZ so o
+      // movimento responde. Sem tira e sem lapis -- oferecer manutencao que a
+      // camera nao faz e pior do que nao oferecer nada.
+      if (!(j && j.ok)) {
+        $("ptz-p").hidden = true;
+        $("ptz-presets").hidden = true;
+        fecharPosicoes();
+        return;
+      }
+      var lista = j.presets || [];
       lista.forEach(function (p) {
         alvo.appendChild(botaoPreset(p.token, p.nome || p.token));
       });
-      // Camera ONVIF sem preset guardado nao ganha tira nenhuma: um botao que
-      // nao leva a lugar nenhum e pior do que a ausencia dele.
-      $("ptz-p").hidden = lista.length === 0;
+      // O lapis fecha a tira, e com ele ela nunca fica vazia -- entao o P
+      // sempre serve. Antes ela sumia quando a camera nao tinha posicao
+      // nenhuma, e nao havia por onde guardar a primeira.
+      alvo.appendChild(botaoEditarPosicoes());
+      $("ptz-p").hidden = false;
+      // O dialogo aberto mostra a mesma lista, e ela acabou de mudar.
+      if (dialogoAberto()) pintarPosicoes(lista);
     });
     return;
   }
   for (var i = 1; i <= PRESETS_DVRIP; i++)
     alvo.appendChild(botaoPreset(String(i), String(i)));
+  alvo.appendChild(botaoEditarPosicoes());
   $("ptz-p").hidden = false;
 }
 
@@ -1546,6 +1686,132 @@ function botaoPreset(valor, rotulo) {
     });
   });
   return b;
+}
+
+function botaoEditarPosicoes() {
+  var b = document.createElement("button");
+  b.className = "pv editar";
+  b.style.width = "44px";
+  b.textContent = "\u270e";
+  b.title = "Guardar e apagar posicoes";
+  b.addEventListener("click", abrirPosicoes);
+  return b;
+}
+
+// ------------------------------------------- o dialogo das posicoes
+//
+// Guardar e apagar viviam dentro do teclado, num seletor de modo: os mesmos
+// botoes de 44 px passavam a significar tres coisas conforme o modo armado.
+// Funcionava e era pequeno demais para uma operacao que apaga coisa.
+//
+// Aqui cada posicao tem uma linha, com o nome inteiro e dois botoes de tamanho
+// normal. E com espaco cabe a confirmacao que la nao cabia: apagar pede um
+// segundo toque.
+
+function dialogoAberto() {
+  return $("pos-dialogo").classList.contains("on");
+}
+
+function abrirPosicoes() {
+  $("pos-dialogo").classList.add("on");
+  // Criar posicao nova so existe no ONVIF: la a camera escolhe o token, e por
+  // isso nao ha numero livre para tocar antes de ela existir. No DVRIP as
+  // quatro posicoes ja estao todas na lista, vazias ou nao.
+  $("pos-nova").hidden = presetVia !== "onvif";
+  $("pos-ajuda").textContent = presetVia === "onvif"
+    ? "Guardar grava o enquadramento que esta na tela agora."
+    : "Sao quatro posicoes fixas. Guardar grava o enquadramento que esta na "
+      + "tela agora por cima da que voce escolher.";
+  // Sem lista em maos, monta a tira: e ela que sabe pedir ao servidor, e o
+  // dialogo se pinta sozinho quando a resposta chegar.
+  if (presetVia === "onvif") montarPresets(presetVia);
+  else pintarPosicoes(null);
+}
+
+function fecharPosicoes() {
+  $("pos-dialogo").classList.remove("on");
+}
+
+// `lista` so vem no ONVIF; no DVRIP as posicoes sao os numeros de sempre.
+function pintarPosicoes(lista) {
+  var alvo = $("pos-lista");
+  alvo.innerHTML = "";
+  var itens = [];
+  if (presetVia === "onvif")
+    (lista || []).forEach(function (p) {
+      itens.push({ valor: p.token, nome: p.nome || p.token });
+    });
+  else
+    for (var i = 1; i <= PRESETS_DVRIP; i++)
+      itens.push({ valor: String(i), nome: "posicao " + i });
+
+  if (!itens.length) {
+    var vazio = document.createElement("div");
+    vazio.className = "ajuda";
+    vazio.textContent = "Nenhuma posicao guardada ainda.";
+    alvo.appendChild(vazio);
+    return;
+  }
+  itens.forEach(function (it) { alvo.appendChild(linhaPosicao(it)); });
+}
+
+function linhaPosicao(it) {
+  var linha = document.createElement("div");
+  linha.className = "pos-linha";
+
+  var nome = document.createElement("div");
+  nome.className = "pos-nome";
+  nome.textContent = it.nome;
+  linha.appendChild(nome);
+
+  var guardar = document.createElement("button");
+  guardar.textContent = "guardar aqui";
+  guardar.addEventListener("click", function () {
+    mexerNaPosicao("gravar", it.valor, it.nome);
+  });
+  linha.appendChild(guardar);
+
+  var apagar = document.createElement("button");
+  apagar.className = "risco";
+  apagar.textContent = "apagar";
+  // Dois toques, e o primeiro so arma. Nada de confirm() do navegador: no
+  // WebView do Android ele nem sempre existe, e quando existe e feio.
+  var relogio = null;
+  apagar.addEventListener("click", function () {
+    if (apagar.classList.contains("armado")) {
+      clearTimeout(relogio);
+      mexerNaPosicao("apagar", it.valor, it.nome);
+      return;
+    }
+    apagar.classList.add("armado");
+    apagar.textContent = "confirmar";
+    // Desarma sozinho: botao vermelho esquecido na tela e uma armadilha para o
+    // proximo toque.
+    relogio = setTimeout(function () {
+      apagar.classList.remove("armado");
+      apagar.textContent = "apagar";
+    }, 4000);
+  });
+  linha.appendChild(apagar);
+  return linha;
+}
+
+function mexerNaPosicao(op, valor, nome) {
+  var params = "&acao=preset&op=" + op;
+  if (valor) params += "&n=" + encodeURIComponent(valor);
+  ptzPedir(params).then(function (j) {
+    if (!(j && j.ok)) {
+      $("pos-ajuda").textContent = "nao deu certo: " +
+        ((j && (j.error || j.motivo)) || "sem resposta");
+      console.info("[ptz] " + op + " " + nome + ": " +
+                   ((j && (j.error || j.motivo)) || "sem resposta"));
+      return;
+    }
+    // No ONVIF a lista e da camera e acabou de mudar; montarPresets a le de
+    // novo e repinta o dialogo. No DVRIP os numeros sao os mesmos quatro, e
+    // so o que esta guardado dentro deles mudou -- nada para repintar.
+    if (presetVia === "onvif") montarPresets(presetVia);
+  });
 }
 
 // Pergunta ao servidor se ESTA camera se move, e so entao mostra os controles.
@@ -1568,7 +1834,7 @@ var ESPERAS_PTZ_MS = [0, 1000, 2000, 4000, 8000, 16000, 30000];
 function alternarPtz(abrir) {
   var corpo = $("ptz-corpo");
   var mostrar = (abrir === undefined) ? corpo.hidden : abrir;
-  if (!mostrar) ptzParar();
+  if (!mostrar) { ptzParar(); fecharPosicoes(); }
   corpo.hidden = !mostrar;
   $("ptz-abrir").classList.toggle("on", mostrar);
 }
@@ -1580,6 +1846,9 @@ function verSeTemPtz() {
   alternarPtz(false);
   $("ptz-presets").hidden = true;
   $("ptz-p").hidden = true;
+  // Trocar de camera com o dialogo aberto o deixaria listando as posicoes da
+  // camera anterior.
+  fecharPosicoes();
   // Sem exigir servidor: quem conecta direto na camera e justamente quem tem a
   // sessao viva capaz de mover, e o proprio app responde esta rota.
   if (!camAtual) return;
@@ -1658,6 +1927,25 @@ function lembrarVelocidade() {
   });
 
   $("ptz-abrir").addEventListener("click", function () { alternarPtz(); });
+
+  $("pos-fechar").addEventListener("click", fecharPosicoes);
+  $("pos-nova").addEventListener("click", function () {
+    // Sem `n`: e o que diz a camera para criar em vez de sobrescrever. Sem nome
+    // tambem, e a camera batiza -- pedir um aqui exigiria uma caixa de texto
+    // que o WebView do Android nem sempre entrega.
+    mexerNaPosicao("gravar", "", "posicao nova");
+  });
+  // Tocar fora da caixa fecha, como em qualquer dialogo. Dentro, nao: o alvo
+  // seria a propria caixa ou um botao dela.
+  $("pos-dialogo").addEventListener("click", function (ev) {
+    if (ev.target === $("pos-dialogo")) fecharPosicoes();
+  });
+  // A mesma barreira do teclado, pelo mesmo motivo: o palco embaixo pede
+  // setPointerCapture e roubaria o pointerup que gera o clique.
+  ["pointerdown", "pointerup", "pointercancel", "pointermove",
+   "dblclick", "wheel"].forEach(function (n) {
+    $("pos-dialogo").addEventListener(n, function (ev) { ev.stopPropagation(); });
+  });
 
   // O botao que abre e fecha a tira de presets. Fica na linha da velocidade
   // porque as duas sao escolhas, e nao comandos que se seguram.
@@ -2375,6 +2663,14 @@ function carregarCadastro() {
   });
 }
 
+// Ha senha guardada para esta camera? A resposta muda o que se espera do campo
+// vazio: "nao pede senha" ou "esta guardada, escreva so para trocar".
+function dicaDaSenhaCam(c) {
+  $("f-senha-ajuda").textContent = (c && c.temSenha)
+    ? "guardada \u2014 escreva para trocar"
+    : "deixe vazio se a c\u00e2mera n\u00e3o pede";
+}
+
 function editar(nome) {
   if (!temCadastro()) return;
   editando = -1;
@@ -2385,7 +2681,11 @@ function editar(nome) {
   $("f-nome").value = c ? (c.name || "") : "";
   $("f-url").value = c ? (c.url || "") : "";
   $("f-user").value = c ? (c.user || "") : "";
-  $("f-senha").value = c ? (c.password || "") : "";
+  // A senha NAO volta do cadastro (a rota manda `temSenha`, e nao ela): o campo
+  // nasce vazio, e vazio quer dizer "mantem a que ja esta la". Trocar exige
+  // digitar. O mesmo contrato do formulario de servidor aqui em cima.
+  $("f-senha").value = "";
+  dicaDaSenhaCam(c);
   $("f-ptz").value = c ? (c.ptz || "") : "";
   $("f-ativa").checked = c ? (c.enabled !== false) : true;
   $("f-erro").className = "err";
@@ -2420,6 +2720,11 @@ $("v-edit").onclick = voltarParaLista;
 //
 // Vai por POST porque leva a senha da camera, e senha nao entra em URL: ela
 // ficaria no historico e em qualquer log de acesso pelo caminho.
+//
+// Manda tambem o NOME: o campo de senha nasce vazio para camera ja cadastrada,
+// e sem o nome a procura iria sem credencial nenhuma -- que e o mesmo que
+// procurar com a senha errada, porque camera com senha responde 401 e sai da
+// lista de achados.
 $("f-procurar").onclick = function () {
   var url = $("f-url").value.trim();
   if (!url) {
@@ -2433,7 +2738,8 @@ $("f-procurar").onclick = function () {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url: url, user: $("f-user").value,
-                           password: $("f-senha").value })
+                           password: $("f-senha").value,
+                           camera: $("f-nome").value.trim() })
   }).then(function (r) {
     return r.json().then(function (j) {
       if (!r.ok) throw new Error(j.error || ("erro " + r.status));
@@ -2477,7 +2783,20 @@ $("f-salvar").onclick = function () {
   c.name = nome;
   c.url = url;
   c.user = $("f-user").value;
+  // Vazio = mantem a gravada; o Delphi repoe do cadastro que ja esta em memoria
+  // (ver MesclarSenhas). Por isso a lista inteira pode ir a cada gravacao sem
+  // apagar a senha de ninguem -- nenhuma delas veio para ca.
   c.password = $("f-senha").value;
+  // A lista em memoria segue valendo depois de gravar: sem isto, reabrir a
+  // camera logo em seguida diria "deixe vazio se nao pede" para uma que acabou
+  // de ganhar senha.
+  if (c.password) c.temSenha = true;
+  // Camera com caminhos alternativos: o principal E o primeiro deles, e e dele
+  // que o Delphi espelha url/user/password ao ler. Sem escrever aqui, a senha
+  // nova seria lida do endpoint[0] -- que continua vazio --, e "escreva para
+  // trocar" nao trocaria nada.
+  if (c.password && c.endpoints && c.endpoints.length)
+    c.endpoints[0].password = c.password;
   c.enabled = $("f-ativa").checked;
   c.ptz = $("f-ptz").value.trim();
   // Vazio sai do objeto em vez de virar "": e assim que o Delphi entende
@@ -2939,6 +3258,9 @@ window.vmsVoltar = function () {
   // de cada vez, e a coisa mais recente e ele.
   var aberto = document.querySelector(".menu.on");
   if (aberto) { aberto.classList.remove("on"); return true; }
+  // O dialogo das posicoes fecha antes de a tela mudar, pela mesma regra: o
+  // voltar desfaz uma coisa de cada vez, e a mais recente e ele.
+  if (dialogoAberto()) { fecharPosicoes(); return true; }
 
   var qual = telaAtual();
   if (qual === "t-servs") { irParaInicio(); return true; }

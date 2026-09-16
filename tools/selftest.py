@@ -2040,6 +2040,79 @@ def teste_cadastro_de_cameras(_pasta):
     check('e o app tambem, para mostra-la por dentro',
           "'cameras-ui.html'" in local)
 
+    # ------------------------------- o cadastro do APARELHO, mesmo contrato
+    #
+    # A tela de cameras deste aparelho (app-ui.html, /api/app/cameras) segue o
+    # mesmo trato do /api/config/cameras do servidor: a senha nao sai, e campo
+    # vazio na volta quer dizer "mantenha a que ja esta la". A resposta atravessa
+    # a rede local -- o servidor do app tambem atende de fora do aparelho --,
+    # entao aqui vale pelo mesmo motivo.
+    comum = io.open(os.path.join(raiz, 'src', 'UI', 'UI.Common.pas'),
+                    encoding='utf-8-sig').read()
+    # Da implementation em diante: os mesmos nomes aparecem antes, na
+    # interface, e uma fatia contada dali sairia ao contrario.
+    corpo = comum[comum.index('\nimplementation'):]
+    impl = corpo[corpo.index('function CamerasToJsonImpl'):
+                 corpo.index('function CamerasToJson(')]
+    # Os dois lugares onde a senha aparece -- o caminho principal e cada
+    # caminho alternativo -- estao os dois atras do ComSenha.
+    check('a senha so sai do serializador quando pedida pelo nome',
+          impl.count("AddPair('password'") == 2 and
+          impl.count('if ComSenha then') == 2 and
+          impl.count("AddPair('temSenha'") == 2)
+    check('e sem ela vai o fato de existir uma',
+          'function CamerasToJsonSemSenha' in comum and
+          'CamerasToJsonImpl(Cams, False)' in comum)
+    # O arquivo em disco continua com as senhas: e de la que o app reconecta a
+    # camera. Trocar os dois seria arrancar a credencial do cadastro inteiro.
+    check('o cameras.json em disco segue com as senhas',
+          'CamerasToJsonImpl(Cams, True)' in comum and
+          'CamerasToJson(FCameras), TEncoding.UTF8' in inicio)
+    check('a rota do aparelho e que devolve sem elas',
+          'Result := CamerasToJsonSemSenha(FCameras)' in inicio)
+
+    # Campo vazio = mantenha. Sem isto, gravar UMA camera apagaria a senha de
+    # todas: a tela reenvia a lista inteira, e nenhuma das senhas foi ate la.
+    grav = inicio[inicio.index('function TForm1.GravarConfigCameras'):
+                  inicio.index('procedure TForm1.PararAoVivo')]
+    check('campo de senha vazio mantem a que ja esta gravada',
+          'MesclarSenhas(Novas, FCameras)' in grav)
+    check('e a reposicao acontece antes de o cadastro ser trocado',
+          grav.index('MesclarSenhas(Novas, FCameras)') <
+          grav.index('FCameras := Novas'))
+    # FCameras e da thread principal, e quem chama isto e uma thread do Indy.
+    check('dentro do Synchronize, que e onde FCameras pode ser lida',
+          grav.index('TThread.Synchronize') >
+          grav.index('MesclarSenhas(Novas, FCameras)'))
+    mescla = corpo[corpo.index('procedure MesclarSenhas('):
+                   corpo.index('function CamerasFromJson(')]
+    check('casa a camera pelo nome', 'SameText(Atuais[K].Name' in mescla)
+    # Renomear e o unico caso em que o nome nao acha: a tela troca o item no
+    # lugar, entao a posicao ainda serve. Lista de outro tamanho e camera criada
+    # ou excluida, e ai a posicao nao diz mais nada.
+    check('e pela posicao so quando ninguem foi criado nem excluido',
+          'MesmoTamanho' in mescla)
+    check('os caminhos alternativos tambem', 'Endpoints[K].Password' in mescla)
+
+    app_ui = io.open(os.path.join(raiz, 'src', 'UI', 'web', 'app-ui.html'),
+                     encoding='utf-8').read()
+    script_app = app_ui[app_ui.index('<script>'):]
+    check('a tela do aparelho e ASCII puro, como as outras',
+          all(ord(c) < 127 for c in app_ui))
+    check('o campo de senha nasce vazio, e nao com o valor',
+          '$("f-senha").value = "";' in script_app and
+          'c.password || ""' not in script_app)
+    check('e a tela diz que ha uma guardada',
+          'temSenha' in script_app and 'f-senha-ajuda' in app_ui)
+    # A procura de ONVIF sai do MESMO formulario, e o campo de senha dele agora
+    # nasce vazio: sem o nome junto, ela iria sem credencial -- que da no mesmo
+    # que ir com a errada, porque camera com senha responde 401 e some da lista.
+    check('a procura de ONVIF leva o nome da camera',
+          'camera: $("f-nome").value.trim()' in script_app)
+    check('e a rota completa com a senha do cadastro',
+          "Obj.GetValue<string>('camera', '')" in local and
+          'FOnOnvifCam(Camera, XAddrCad, UsuarioCad, SenhaCad)' in local)
+
 
 def main():
     pasta = tempfile.mkdtemp(prefix='vms_selftest_')
