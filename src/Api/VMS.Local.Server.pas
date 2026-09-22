@@ -99,6 +99,11 @@ type
   TServidorDiagFunc = function: string of object;
   // "o voltar chegou na pagina ja na raiz": e para o app fechar.
   TSairProc = procedure of object;
+  // Sempre a frente. Pedido: '' so pergunta, '1' liga, '0' desliga. Ligado
+  // volta com o estado depois do pedido. False = esta plataforma nao sabe
+  // fazer isso, e a pagina esconde o botao.
+  TFrenteFunc = function(const Pedido: string; out Ligado: Boolean): Boolean
+                of object;
 
   // Onde falar ONVIF com uma camera DESTE aparelho, e com que credencial.
   // False = a camera nao esta no cadastro. Endereco vazio nao e erro: e camera
@@ -142,6 +147,7 @@ type
     FOnServidorCredencial: TServidorCredFunc;
     FOnServidorDiag: TServidorDiagFunc;
     FOnSair: TSairProc;
+    FOnFrente: TFrenteFunc;
     FOnDecodeAlimentar: TDecodeAlimentarFunc;
     FOnDecodeQuadro: TDecodeQuadroFunc;
     FOnDecodeReiniciar: TDecodeReiniciarProc;
@@ -178,6 +184,8 @@ type
     procedure ServirSonda(ARequestInfo: TIdHTTPRequestInfo;
                           AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirSair(AResponseInfo: TIdHTTPResponseInfo);
+    procedure ServirFrente(ARequestInfo: TIdHTTPRequestInfo;
+                           AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirPtz(ARequestInfo: TIdHTTPRequestInfo;
                         AResponseInfo: TIdHTTPResponseInfo);
     function ClienteOnvif(const Camera: string): TOnvifClient;
@@ -236,6 +244,9 @@ type
                                                      write FOnServidorCredencial;
     // Como a pagina pede para o app fechar. Ver ServirSair.
     property OnSair: TSairProc read FOnSair write FOnSair;
+    // Sempre a frente. Sem isto a rota diz que nao ha, e a pagina nao mostra
+    // o botao nem liga o atalho.
+    property OnFrente: TFrenteFunc read FOnFrente write FOnFrente;
     // A decodificacao nativa. Sem elas, /api/decode responde 503 e a pagina
     // sabe que este caminho nao existe aqui.
     property OnDecodeAlimentar: TDecodeAlimentarFunc read FOnDecodeAlimentar
@@ -586,6 +597,29 @@ begin
   FOnSair();
   AResponseInfo.ResponseNo := 204;
   AResponseInfo.ContentText := '';
+end;
+
+// Sempre a frente. GET so pergunta; POST com ?ligar=1 ou ?ligar=0 muda.
+//
+// Responde sempre com o estado, e `disponivel` diz se esta plataforma sabe
+// fazer isso. A pagina e a mesma no Windows, no Android e servida pelo
+// vmsserver num navegador comum -- e so aqui, no app do Windows, que o botao
+// deve aparecer.
+procedure TLocalServer.ServirFrente(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo);
+var
+  Pedido: string;
+  Ligado, Pode: Boolean;
+begin
+  Ligado := False;
+  Pedido := '';
+  if SameText(ARequestInfo.Command, 'POST') then
+    Pedido := Trim(ARequestInfo.Params.Values['ligar']);
+  Pode := Assigned(FOnFrente) and FOnFrente(Pedido, Ligado);
+  AResponseInfo.ResponseNo := 200;
+  AResponseInfo.ContentType := 'application/json';
+  AResponseInfo.ContentText := Format('{"disponivel":%s,"ligado":%s}',
+    [LowerCase(BoolToStr(Pode, True)), LowerCase(BoolToStr(Pode and Ligado, True))]);
 end;
 
 // A pagina entrega um fragmento .vms para o lado nativo decodificar.
@@ -1486,6 +1520,8 @@ begin
       ServirSonda(ARequestInfo, AResponseInfo)
     else if Caminho = '/api/app/sair' then
       ServirSair(AResponseInfo)
+    else if Caminho = '/api/app/frente' then
+      ServirFrente(ARequestInfo, AResponseInfo)
     // O log deste app. Nao existe versao "do servidor" desta rota: o que se
     // quer aqui e o que ESTE processo registrou.
     else if Caminho = '/api/app/log' then

@@ -48,6 +48,18 @@ function MotorPreferido: TWindowsEngine;
 // Uma faixa clara em volta de uma interface escura era o que restava.
 procedure EscurecerJanela(const Janela: TCommonCustomForm);
 
+// Deixa a janela acima de todas as outras, ou devolve ao normal.
+//
+// Pelo Windows direto, e nao pelo FormStyle do FMX: trocar o FormStyle em tempo
+// de execucao recria a janela nativa (TCommonCustomForm.SetFormStyle chama
+// Recreate), e o WebView2 que mora dentro dela seria destruido junto. O
+// SetWindowPos so muda a janela de faixa na pilha, sem tocar no que ha dentro.
+//
+// Fora do Windows nao faz nada, e PodeFicarNaFrente responde False para a tela
+// nem oferecer o botao.
+function PodeFicarNaFrente: Boolean;
+procedure FicarNaFrente(const Janela: TCommonCustomForm; Ligar: Boolean);
+
 implementation
 
 uses
@@ -98,6 +110,38 @@ begin
   except
     // Moldura clara e um defeito de aparencia; derrubar o app por causa dela
     // seria trocar um incomodo por uma falha.
+  end;
+{$ENDIF}
+end;
+
+function PodeFicarNaFrente: Boolean;
+begin
+{$IFDEF MSWINDOWS}
+  Result := True;
+{$ELSE}
+  Result := False;
+{$ENDIF}
+end;
+
+procedure FicarNaFrente(const Janela: TCommonCustomForm; Ligar: Boolean);
+{$IFDEF MSWINDOWS}
+var
+  H: HWND;
+  Faixa: HWND;
+{$ENDIF}
+begin
+{$IFDEF MSWINDOWS}
+  if Janela = nil then Exit;
+  try
+    H := FormToHWND(Janela);
+    if H = 0 then Exit;
+    if Ligar then Faixa := HWND_TOPMOST else Faixa := HWND_NOTOPMOST;
+    // NOACTIVATE: fixar nao e motivo para roubar o foco de quem esta
+    // digitando em outro programa.
+    SetWindowPos(H, Faixa, 0, 0, 0, 0,
+                 SWP_NOMOVE or SWP_NOSIZE or SWP_NOACTIVATE);
+  except
+    // Mesma regra da moldura escura: e conforto, e nao vale derrubar o app.
   end;
 {$ENDIF}
 end;

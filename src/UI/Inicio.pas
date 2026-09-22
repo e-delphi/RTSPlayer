@@ -67,6 +67,8 @@ type
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure SairPelaPagina;
+    // Sempre a frente, pedido pela pagina. Ver TFrenteFunc.
+    function PedidoFrente(const Pedido: string; out Ligado: Boolean): Boolean;
     // A ponte entre o servidor local e a decodificacao nativa.
     function DecodeAlimentar(const Camera: string;
                              const Dados: TBytes): Integer;
@@ -87,6 +89,9 @@ type
     // ao resto é a tela, e assim acrescentar um campo não mexe aqui.
     FServidoresJson: string;
     FClosing: Boolean;
+    // Se a janela esta fixada acima das outras. Quem guarda entre aberturas e
+    // a pagina; aqui e so o estado desta execucao.
+    FNaFrente: Boolean;
 
     FLocal: TLocalServer;
     // Quem sabe por onde falar com cada servidor cadastrado. Fica aqui, e nao
@@ -200,6 +205,7 @@ begin
   FLocal.OnSondarServidor := SondarServidor;
   FLocal.OnServidorDiag := DiagServidores;
   FLocal.OnSair := SairPelaPagina;
+  FLocal.OnFrente := PedidoFrente;
   FLocal.OnLerLog := LerLogDoApp;
   FLocal.OnOnvifCam := OnvifDaCamera;
   // Só existe no Android; no Windows o WebView2 decodifica o que precisamos, e
@@ -701,6 +707,30 @@ begin
     procedure
     begin
       if not FClosing then ShellSair(nil);
+    end);
+end;
+
+// Chega numa thread do Indy. O estado muda na hora, para a resposta ja sair
+// com ele, e a janela e mexida na thread principal -- que e dona dela.
+//
+// Queue, e nao Synchronize: a resposta nao depende de a janela ja ter mudado,
+// e segurar uma thread do servidor esperando a principal e o tipo de espera
+// que um dia vira trava.
+function TForm1.PedidoFrente(const Pedido: string; out Ligado: Boolean): Boolean;
+var
+  Novo: Boolean;
+begin
+  Result := PodeFicarNaFrente;
+  Ligado := FNaFrente;
+  if not Result then Exit;
+  if (Pedido <> '1') and (Pedido <> '0') then Exit;
+  Novo := Pedido = '1';
+  FNaFrente := Novo;
+  Ligado := Novo;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not FClosing then FicarNaFrente(Self, Novo);
     end);
 end;
 

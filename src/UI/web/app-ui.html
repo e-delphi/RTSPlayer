@@ -187,6 +187,8 @@
   #ptz { position:absolute; right:12px; bottom:12px; z-index:4;
          display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
   #ptz[hidden] { display:none; }
+  /* Fixado acima das outras janelas: o alfinete acende na cor primaria. */
+  #fixar.on { color:var(--p); }
   /* O lapis no fim da tira: leva ao dialogo de manutencao. Cor primaria para
      nao se confundir com as posicoes, que sao todas iguais entre si. */
   #ptz-presets .pv.editar { color:var(--p); }
@@ -370,6 +372,7 @@
   <symbol id="i-eventos" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M8 3v4M16 3v4M3.5 10h17"/></symbol>
   <symbol id="i-camera" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="12" rx="2.5"/><path d="M15 10l6-3v10l-6-3z"/></symbol>
   <symbol id="i-atualizar" viewBox="0 0 24 24"><path d="M20.4 12a8.4 8.4 0 1 1-2.5-6"/><path d="M21 4.5v4h-4"/></symbol>
+  <symbol id="i-fixar" viewBox="0 0 24 24"><path d="M9 3.5h6l-1 5.5 3.5 3.5V14h-11v-1.5L10 9z"/><path d="M12 14v6.5"/></symbol>
   <symbol id="i-lixeira" viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13"/></symbol>
 </svg>
 
@@ -562,6 +565,9 @@
       <svg class="ico"><use href="#i-voltar"/></svg></button>
     <h1 id="h-play">&mdash;</h1>
     <span class="rot" id="hora">--:--:--</span>
+    <!-- Sempre a frente. So no app do Windows; ver ligarSempreAFrente. -->
+    <button class="icone" id="fixar" title="Sempre &agrave; frente (Ctrl+T)" hidden>
+      <svg class="ico"><use href="#i-fixar"/></svg></button>
   </header>
   <div id="palco">
     <canvas id="tela2d"></canvas>
@@ -3238,6 +3244,70 @@ function voltarDosDias() {
 }
 
 $("v-dias").onclick = voltarDosDias;
+
+// ------------------------------------------------------- sempre a frente
+//
+// Mantem a janela do app acima das outras, para deixar uma camera num canto da
+// tela enquanto se usa outro programa. So existe no app do Windows: a rota diz
+// se ha, e sem ela o botao nao aparece e o atalho nao faz nada.
+//
+// Quem lembra entre uma abertura e outra e esta pagina, pelo localStorage, do
+// mesmo jeito que a velocidade da PTZ. O app so executa o que ela pede.
+var FRENTE_CHAVE = "vms.sempreAFrente";
+var frenteExiste = false;
+
+function pintarFrente(ligado) {
+  $("fixar").classList.toggle("on", ligado);
+  $("fixar").title = (ligado ? "Deixar de ficar " : "Sempre ") +
+                     "\u00e0 frente (Ctrl+T)";
+}
+
+function pedirFrente(ligar) {
+  return fetch("/api/app/frente" + (ligar === undefined ? "" :
+                                     "?ligar=" + (ligar ? "1" : "0")),
+               { method: ligar === undefined ? "GET" : "POST" })
+    .then(function (r) { return r.ok ? r.json() : {}; })
+    .catch(function () { return {}; });
+}
+
+function alternarFrente() {
+  if (!frenteExiste) return;
+  var ligar = !$("fixar").classList.contains("on");
+  pedirFrente(ligar).then(function (j) {
+    if (!j.disponivel) return;
+    pintarFrente(!!j.ligado);
+    try { localStorage.setItem(FRENTE_CHAVE, j.ligado ? "1" : "0"); }
+    catch (e) {}
+  });
+}
+
+(function ligarSempreAFrente() {
+  pedirFrente().then(function (j) {
+    if (!j.disponivel) return;
+    frenteExiste = true;
+    $("fixar").hidden = false;
+    var lembrado = false;
+    try { lembrado = localStorage.getItem(FRENTE_CHAVE) === "1"; }
+    catch (e) {}
+    // A janela nasce normal a cada abertura; se da ultima vez ficou fixada,
+    // e aqui que ela volta a ficar.
+    if (lembrado && !j.ligado)
+      pedirFrente(true).then(function (k) { pintarFrente(!!k.ligado); });
+    else
+      pintarFrente(!!j.ligado);
+  });
+  $("fixar").addEventListener("click", alternarFrente);
+  // Ctrl+T em qualquer tela, e nao so no player: e quando se esta em outra
+  // coisa que se lembra de soltar a janela. O T e de topo. O WebView2 nao usa
+  // essa combinacao para nada -- ele nao tem abas.
+  document.addEventListener("keydown", function (ev) {
+    if (!ev.ctrlKey || ev.altKey || ev.shiftKey || ev.metaKey) return;
+    if ((ev.key || "").toLowerCase() !== "t") return;
+    if (!frenteExiste) return;
+    ev.preventDefault();
+    alternarFrente();
+  });
+})();
 // Do ao vivo se volta para a lista: nao houve dia nenhum no caminho, e mandar
 // para os dias deixava a tela presa em "carregando" um historico que a camera do
 // aparelho nao tem.
