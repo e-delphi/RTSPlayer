@@ -12,6 +12,8 @@
 //   GET /api/media?camera=X&cursor=…      a continuação, sem busca
 //   GET /api/live?camera=X&cursor=…       o ao vivo, direto do anel
 //   GET /api/ptz?camera=X&acao=…          move a camera por ONVIF
+//   POST /api/fala?camera=X&acao=enviar   audio para o alto-falante (DVRIP)
+//   GET /api/interacoes?camera=X&fromMs=… quando alguem mexeu (PTZ, fala)
 //   GET /api/recordings?camera=X&...      a lista crua, arquivo por arquivo
 //   GET /api/index?file=…                 o índice de blocos, cru
 //                                         (as duas últimas são diagnóstico)
@@ -83,7 +85,8 @@ uses
   Vms.Db.Intf,
   Vms.Server.UiFiles,
   Vms.Server.Auth,
-  Vms.Server.Media;
+  Vms.Server.Media,
+  Vms.Server.Interactions;
 
 const
   API_PREFIX = '/api/';
@@ -214,6 +217,9 @@ type
     FControles: TObjectDictionary<string, TPtzControleDvrip>;
     FControlesLock: TCriticalSection;
     FControlesTickMs: UInt64;
+    // Quem mexeu na camera (PTZ e fala), para a regua pintar. Ver
+    // Vms.Server.Interactions.
+    FInteracoes: TInteractionLog;
     FCache: TVmsIndexCache;
     FMedia: TMediaBuilder;
     FAuth: TAutenticador;
@@ -278,6 +284,8 @@ type
     function HandleCss(const NomeArquivo: string): TApiResponse;
     function HandleLive(const Query: string): TApiResponse;
     function HandlePtz(const Query: string): TApiResponse;
+    function HandleFala(const Query: string; const Body: TBytes): TApiResponse;
+    function HandleInteracoes(const Query: string): TApiResponse;
     function HandleConfigCamerasGet: TApiResponse;
     function HandleConfigCamerasPost(const Body: TBytes): TApiResponse;
     function HandleProcurarPtz(const Body: TBytes): TApiResponse;
@@ -606,6 +614,7 @@ begin
   FOnvifLock := TCriticalSection.Create;
   FControles := TObjectDictionary<string, TPtzControleDvrip>.Create([doOwnsValues]);
   FControlesLock := TCriticalSection.Create;
+  FInteracoes := TInteractionLog.Create(FDb, TSystemClock.Create, ALogger);
   RecarregarAuth;
   // A interface E a pasta: faltando ela, ou um arquivo dela, não há tela
   // nenhuma. Dizer isso na subida evita descobrir pelo navegador, com uma
@@ -635,6 +644,9 @@ begin
   // ainda pode estar entrando aqui para se desanunciar.
   FControles.Free;
   FControlesLock.Free;
+  // Grava o trecho que estiver aberto; o banco ainda esta de pe, porque quem
+  // o fecha e o .dpr, depois de liberar a API.
+  FInteracoes.Free;
   FPendentes.Free;
   FCamerasLock.Free;
   inherited;
@@ -843,6 +855,7 @@ var
   Method: string;
   Body: TBytes;
   Acesso: TAcesso;
+  Nome, Camera: string;
 begin
   Method := Req.Method;
   Body := Req.Body;
@@ -940,6 +953,14 @@ begin
         Exit(TApiResponse.Error(405, 'use POST'));
       Exit(HandleProcurarPtz(Body));
     end;
+    // A fala para o alto-falante da camera. POST porque o audio vai no corpo;
+    // GET serve para `testar` e `fechar`, que nao levam nada.
+    if SameText(Path, API_PREFIX + 'fala') then
+    begin
+      if not (SameText(Method, 'GET') or SameText(Method, 'POST')) then
+        Exit(TApiResponse.Error(405, 'use GET ou POST'));
+      Exit(HandleFala(Query, Body));
+    end;
     if SameText(Path, API_PREFIX + 'config/cameras') then
     begin
       if SameText(Method, 'POST') then
@@ -964,7 +985,20 @@ begin
     else if SameText(Path, API_PREFIX + 'live') then
       Result := HandleLive(Query)
     else if SameText(Path, API_PREFIX + 'ptz') then
-      Result := HandlePtz(Query)
+    begin
+      Result := HandlePtz(Query);
+      // O registro fica aqui, e nao dentro do HandlePtz: la ha dois caminhos
+      // (DVRIP e ONVIF) e varias saidas, e o que interessa e o mesmo nos dois
+      // -- o comando foi aceito. Consultas (testar, presets, config) nao sao
+      // interacao: nao mexem na camera.
+      Nome := LowerCase(Trim(QueryValue(Query, 'acao')));
+      if (Result.Status = 200) and
+         MatchText(Nome, ['mover', 'parar', 'foco', 'iris', 'ronda', 'preset', 'ir']) and
+         KnownCamera(QueryValue(Query, 'camera'), Camera) then
+        FInteracoes.Registrar(Camera, INTERACAO_PTZ, Nome);
+    end
+    else if SameText(Path, API_PREFIX + 'interacoes') then
+      Result := HandleInteracoes(Query)
     else if SameText(Path, API_PREFIX + 'recordings') then
       Result := HandleRecordings(Query)
     else if SameText(Path, API_PREFIX + 'index') then
@@ -2033,6 +2067,9 @@ var
   Sobrando: TArray<string>;
   I: Integer;
 begin
+  // Antes do limite de tempo abaixo: fechar trecho de interacao tem o ritmo
+  // dele, e e barato.
+  FInteracoes.Varrer;
   if TThread.GetTickCount64 - FControlesTickMs < PTZ_CONTROLE_TICK_MS then Exit;
   FControlesTickMs := TThread.GetTickCount64;
   if (FDb = nil) or (not FDb.IsOpen) then Exit;
@@ -2086,6 +2123,90 @@ begin
   finally
     FControlesLock.Leave;
   end;
+end;
+
+//   GET  /api/fala?camera=X&acao=testar
+//   POST /api/fala?camera=X&acao=enviar     corpo: PCM 16 bits, 8 kHz, mono
+//   GET  /api/fala?camera=X&acao=fechar
+//
+// A fala sai por uma conexao propria (VMS.Dvrip.Talk), mas quem sabe abrir e a
+// sessao viva da camera -- a que grava, ou a de comando da PTZ. Por isso a
+// mesma espera do HandlePtz: camera gravada por RTSP so tem sessao DVRIP
+// depois que alguem pede.
+function TApiRouter.HandleFala(const Query: string;
+  const Body: TBytes): TApiResponse;
+var
+  Camera, Json: string;
+  Status: Integer;
+  Espera: UInt64;
+begin
+  if not KnownCamera(QueryValue(Query, 'camera'), Camera) then
+    Exit(TApiResponse.Error(404, 'camera desconhecida'));
+  if (TPtzRegistry.Achar(Camera) = nil) and
+     StartsText('dvrip://', EnderecoPtzDe(Camera)) then
+  begin
+    FControlesTickMs := 0;
+    ManterControlesPtz;
+    Espera := TThread.GetTickCount64 + PTZ_CONTROLE_ESPERA_MS;
+    while (TPtzRegistry.Achar(Camera) = nil) and
+          (TThread.GetTickCount64 < Espera) do
+      Sleep(100);
+  end;
+  Json := TFalaRegistry.Atender(Camera,
+            LowerCase(Trim(QueryValue(Query, 'acao'))), Body, Status);
+  // So o audio que a camera aceitou conta como interacao. A resposta ja e o
+  // JSON do TJSONObject, que escreve o booleano sem espaco.
+  if (Status = 200) and SameText(Trim(QueryValue(Query, 'acao')), 'enviar') and
+     (Pos('"ok":true', Json) > 0) then
+    FInteracoes.Registrar(Camera, INTERACAO_FALA, '');
+  Result.Status := Status;
+  Result.ContentType := 'application/json; charset=utf-8';
+  Result.Body := TEncoding.UTF8.GetBytes(Json);
+  Result.Extra := nil;
+end;
+
+// Os trechos em que alguem mexeu na camera, para a regua.
+//
+//   GET /api/interacoes?camera=X&fromMs=…&toMs=…
+//
+// Mesma janela e mesmo teto de 7 dias do /api/events, que e a rota vizinha na
+// regua. Nao depende da analise de imagem: responde mesmo com ela desligada.
+function TApiRouter.HandleInteracoes(const Query: string): TApiResponse;
+var
+  Camera: string;
+  FromMs, ToMs: Int64;
+  Lista: TInteracaoArray;
+  Root, Item: TJSONObject;
+  Arr: TJSONArray;
+  I: Integer;
+begin
+  if not KnownCamera(QueryValue(Query, 'camera'), Camera) then
+    Exit(TApiResponse.Error(404, 'camera desconhecida'));
+  FromMs := QueryInt(Query, 'fromMs', 0);
+  ToMs := QueryInt(Query, 'toMs', 0);
+  if (FromMs <= 0) or (ToMs <= FromMs) then
+    Exit(TApiResponse.Error(400, 'informe fromMs e toMs'));
+  if (ToMs - FromMs) > (7 * MS_PER_DAY) then
+    Exit(TApiResponse.Error(400, 'janela maior que 7 dias'));
+
+  Lista := FInteracoes.Consultar(Camera, FromMs, ToMs);
+  Root := TJSONObject.Create;
+  Arr := TJSONArray.Create;
+  Root.AddPair('camera', Camera);
+  Root.AddPair('fromMs', TJSONNumber.Create(FromMs));
+  Root.AddPair('toMs', TJSONNumber.Create(ToMs));
+  Root.AddPair('count', TJSONNumber.Create(Length(Lista)));
+  Root.AddPair('interactions', Arr);
+  for I := 0 to High(Lista) do
+  begin
+    Item := TJSONObject.Create;
+    Item.AddPair('startMs', TJSONNumber.Create(Lista[I].StartMs));
+    Item.AddPair('endMs', TJSONNumber.Create(Lista[I].EndMs));
+    Item.AddPair('kind', Lista[I].Kind);
+    Item.AddPair('detail', Lista[I].Detail);
+    Arr.AddElement(Item);
+  end;
+  Result := TApiResponse.FromJson(Root);
 end;
 
 function TApiRouter.HandlePtz(const Query: string): TApiResponse;

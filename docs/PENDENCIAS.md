@@ -181,7 +181,7 @@ Ordenados por valor para quem usa, com a dependência técnica quando existe.
 ### Câmera e protocolo
 
 - **PTZ** — mover, zoom e presets. DVRIP tem `OPPTZControl`; nas RTSP/ONVIF exige o serviço PTZ (SOAP), que o projeto ainda não fala.
-- **Áudio bidirecional (falar pela câmera)** — DVRIP `OPTalk`. Precisa de captura de microfone e encoder G711 no app, que hoje só decodifica.
+- ~~**Áudio bidirecional (falar pela câmera)**~~ — **implementado** para DVRIP (`OPTalk`, `VMS.Dvrip.Talk`): botão Falar no ao vivo, rota `/api/fala`. Falta validar em câmera real e liberar o microfone no WebView do Android (hoje só o Windows/navegador pede permissão).
 - **Eventos e alarmes** — detecção de movimento e alarme da câmera (mensagens de alarme DVRIP, eventos ONVIF), para notificar e disparar gravação.
 - **Descoberta automática** — WS-Discovery (ONVIF) e broadcast DVRIP, para achar câmera na rede em vez de digitar IP.
 - **ONVIF de verdade** — hoje a URL RTSP é fixa na config; o serviço Media daria perfis, resoluções e URIs sem chute.

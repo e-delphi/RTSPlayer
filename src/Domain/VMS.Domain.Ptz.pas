@@ -27,6 +27,26 @@ uses
   System.Generics.Collections;
 
 type
+  // Uma conversa aberta com o alto-falante da camera.
+  //
+  // Conexao PROPRIA, e nao a do video: a camera abre um canal duplex e passa a
+  // mandar o microfone dela por ali, e isso no meio do fluxo de video seria
+  // audio a mais misturado no parser. Quem a abre e a sessao viva, que sabe o
+  // endereco e a senha; quem a guarda e o TFalaRegistry, abaixo.
+  IFalaSession = interface
+    ['{0B7E2D4A-5C61-4F8E-A3B2-9D1C7E6F5A48}']
+    // PCM 16 bits little-endian, 8 kHz, mono. Converter e dar o ritmo e com
+    // ela: a pagina manda aos pedacos, na hora que o HTTP deixa, e a camera
+    // quer um quadro a cada 40 ms. False = a conversa ja acabou.
+    function Enviar(const Pcm: TBytes): Boolean;
+    // Encerra e espera as threads dela. Chamar duas vezes nao faz mal.
+    procedure Fechar;
+    // False depois de Fechar, de a conexao cair, ou de ficar calada por
+    // alguns segundos -- ela se encerra sozinha para nao prender o
+    // alto-falante da camera se a pagina sumir sem dizer tchau.
+    function Viva: Boolean;
+  end;
+
   // O que uma sessao capaz de PTZ oferece.
   //
   // Iniciar=False e a PARADA do mesmo comando: o protocolo das cameras DVRIP
@@ -50,6 +70,9 @@ type
     // para o log, como as outras mensagens de controle. Serve para descobrir
     // o que uma camera especifica sabe fazer, sem capturar rede.
     function PerguntarConfig(const Nome: string): Boolean;
+    // Abre a fala: conecta, loga e reserva o alto-falante. Bloqueia ate a
+    // camera responder. nil = nao deu, e Motivo diz por que.
+    function AbrirFala(out Motivo: string): IFalaSession;
   end;
 
 type
@@ -69,7 +92,35 @@ type
     class function Achar(const Camera: string): IPtzSession;
   end;
 
+  // As falas abertas, uma por camera.
+  //
+  // A pagina manda o audio em varios POSTs seguidos, e abrir uma conexao por
+  // POST seria um login a cada 160 ms. A primeira abre e as seguintes acham a
+  // mesma aqui.
+  //
+  // O atendimento da rota mora aqui, e nao em cada servidor, pelo mesmo motivo
+  // do ComandoDvripDe: o app e o vmsserver respondem /api/fala, e duas copias
+  // seriam duas chances de divergir.
+  TFalaRegistry = class
+  strict private
+    class var FLock: TCriticalSection;
+    class var FPor: TDictionary<string, IFalaSession>;
+    class function Enviar(const Camera: string; const Pcm: TBytes;
+                          out Motivo: string): Boolean;
+    class procedure Fechar(const Camera: string);
+  public
+    class constructor Create;
+    class destructor Destroy;
+    // /api/fala?camera=X&acao=testar|enviar|fechar. Pcm e o corpo do POST de
+    // `enviar`. Devolve o JSON da resposta e o status HTTP.
+    class function Atender(const Camera, Acao: string; const Pcm: TBytes;
+                           out Status: Integer): string;
+  end;
+
 implementation
+
+uses
+  System.JSON;
 
 class constructor TPtzRegistry.Create;
 begin
@@ -113,6 +164,145 @@ begin
     FPor.TryGetValue(LowerCase(Trim(Camera)), Result);
   finally
     FLock.Leave;
+  end;
+end;
+
+{ TFalaRegistry }
+
+class constructor TFalaRegistry.Create;
+begin
+  FLock := TCriticalSection.Create;
+  FPor := TDictionary<string, IFalaSession>.Create;
+end;
+
+class destructor TFalaRegistry.Destroy;
+begin
+  // Com fala aberta, a tabela fica sem liberar, de proposito. Liberar solta a
+  // ultima referencia, e a fala fecha o socket dela -- mas esta unit nao usa o
+  // Indy, entao nada garante que ele ainda nao foi finalizado a esta altura.
+  // O processo esta acabando e o sistema fecha o socket de qualquer jeito.
+  if FPor.Count = 0 then
+  begin
+    FPor.Free;
+    FLock.Free;
+  end;
+end;
+
+class function TFalaRegistry.Enviar(const Camera: string; const Pcm: TBytes;
+  out Motivo: string): Boolean;
+var
+  Chave: string;
+  Fala: IFalaSession;
+  Sessao: IPtzSession;
+  Tentativa: Integer;
+begin
+  Result := False;
+  Motivo := '';
+  Chave := LowerCase(Trim(Camera));
+  // Duas voltas: a fala pode se encerrar por silencio entre o achar e o
+  // enviar, e ai a segunda volta abre outra em vez de devolver erro por uma
+  // corrida que a pagina nao tem como entender.
+  for Tentativa := 1 to 2 do
+  begin
+    // A trava fica presa durante a abertura, que conecta e loga. De proposito:
+    // dois POSTs chegando juntos no comeco abririam duas conversas, e a
+    // camera so tem um alto-falante. O preco e que uma camera lenta para
+    // responder segura a primeira fala das outras -- raro, e so no comeco.
+    FLock.Enter;
+    try
+      if FPor.TryGetValue(Chave, Fala) and not Fala.Viva then
+      begin
+        FPor.Remove(Chave);
+        Fala := nil;
+      end;
+      if Fala = nil then
+      begin
+        Sessao := TPtzRegistry.Achar(Camera);
+        if Sessao = nil then
+        begin
+          Motivo := 'sem sessao DVRIP viva para ' + Camera;
+          Exit;
+        end;
+        Fala := Sessao.AbrirFala(Motivo);
+        if Fala = nil then Exit;
+        FPor.Add(Chave, Fala);
+      end;
+    finally
+      FLock.Leave;
+    end;
+    if Fala.Enviar(Pcm) then Exit(True);
+    Fala := nil;
+  end;
+  Motivo := 'a conversa com a camera caiu';
+end;
+
+class procedure TFalaRegistry.Fechar(const Camera: string);
+var
+  Fala: IFalaSession;
+begin
+  Fala := nil;
+  FLock.Enter;
+  try
+    if FPor.TryGetValue(LowerCase(Trim(Camera)), Fala) then
+      FPor.Remove(LowerCase(Trim(Camera)));
+  finally
+    FLock.Leave;
+  end;
+  // Fora da trava: fechar espera as threads da fala, e isso nao pode segurar
+  // quem esta falando com outra camera.
+  if Fala <> nil then
+    Fala.Fechar;
+end;
+
+class function TFalaRegistry.Atender(const Camera, Acao: string;
+  const Pcm: TBytes; out Status: Integer): string;
+var
+  Ok: Boolean;
+  Motivo: string;
+  Obj: TJSONObject;
+begin
+  Status := 200;
+  Motivo := '';
+  if Acao = 'testar' then
+  begin
+    // So diz se ha por onde tentar. Se a camera tem alto-falante, so o Claim
+    // responde -- e ele prende o alto-falante, entao nao e coisa de sondar.
+    Ok := TPtzRegistry.Achar(Camera) <> nil;
+    if not Ok then Motivo := 'sem sessao DVRIP viva para ' + Camera;
+  end
+  else if Acao = 'enviar' then
+  begin
+    if Length(Pcm) = 0 then
+    begin
+      Status := 400;
+      Motivo := 'corpo vazio: mande PCM 16 bits, 8 kHz, mono';
+      Ok := False;
+    end
+    else
+      Ok := Enviar(Camera, Pcm, Motivo);
+  end
+  else if Acao = 'fechar' then
+  begin
+    Fechar(Camera);
+    Ok := True;
+  end
+  else
+  begin
+    Status := 400;
+    Motivo := Acao + ' nao existe: use testar, enviar ou fechar';
+    Ok := False;
+  end;
+
+  Obj := TJSONObject.Create;
+  try
+    Obj.AddPair('camera', Camera);
+    Obj.AddPair('acao', Acao);
+    Obj.AddPair('via', 'dvrip');
+    Obj.AddPair('ok', TJSONBool.Create(Ok));
+    if Motivo <> '' then Obj.AddPair('motivo', Motivo);
+    Result := Obj.ToJSON;
+  finally
+    Obj.Free;
   end;
 end;
 

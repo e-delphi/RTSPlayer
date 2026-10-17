@@ -57,6 +57,9 @@ uses
   // estar sendo vista de um celular. Na interface, e nao na implementacao,
   // porque o tipo dele aparece na declaracao da classe.
   Vms.Onvif.Client,
+  // O microfone nativo do Android. Na interface pelo mesmo motivo: o tipo
+  // aparece na propriedade.
+  VMS.Android.Microfone,
   VMS.Domain.Logging;
 
 type
@@ -163,6 +166,18 @@ type
     // que estava andando; sem guardar, nao haveria o que repetir.
     FUltimoPtz: TDictionary<string, string>;
     FLock: TCriticalSection;
+    // A fala pelo microfone nativo (Android). Ver ServirFalaNativa.
+    FMicrofone: IMicrofone;
+    FFalaLock: TCriticalSection;
+    FFalaCam: string;       // '' = nenhuma fala nativa ligada
+    FFalaBase: string;      // '' = camera deste aparelho; senao, o servidor
+    FFalaAuth: string;      // o Authorization para o servidor
+    FFalaErro: string;      // escrito pela thread do microfone
+    FFalaCli: THTTPClient;  // usado so pela thread do microfone
+    procedure ServirFalaNativa(ARequestInfo: TIdHTTPRequestInfo;
+                               AResponseInfo: TIdHTTPResponseInfo);
+    procedure EnviarFalaNativa(const Pcm: TBytes);
+    procedure PararFalaNativa;
     procedure Comando(AContext: TIdContext; ARequestInfo: TIdHTTPRequestInfo;
                       AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirDaPasta(AResponseInfo: TIdHTTPResponseInfo;
@@ -191,6 +206,8 @@ type
     function ClienteOnvif(const Camera: string): TOnvifClient;
     procedure ProcurarPtz(ARequestInfo: TIdHTTPRequestInfo;
                           AResponseInfo: TIdHTTPResponseInfo);
+    procedure ServirFala(ARequestInfo: TIdHTTPRequestInfo;
+                         AResponseInfo: TIdHTTPResponseInfo);
     procedure ServirPtzOnvif(ARequestInfo: TIdHTTPRequestInfo;
                              AResponseInfo: TIdHTTPResponseInfo;
                              const Camera, Acao: string);
@@ -262,6 +279,9 @@ type
     property OnLerLog: TLogLerFunc read FOnLerLog write FOnLerLog;
     // O endereco de ONVIF de cada camera. Sem isto, so o caminho DVRIP existe.
     property OnOnvifCam: TOnvifCamFunc read FOnOnvifCam write FOnOnvifCam;
+    // O microfone do aparelho. Sem ele (Windows), /api/app/fala diz que nao ha
+    // e a pagina grava pelo navegador.
+    property Microfone: IMicrofone read FMicrofone write FMicrofone;
     // Joga fora os clientes ONVIF guardados. Chamar quando o cadastro muda:
     // sem isto, corrigir o endereco de uma camera nao teria efeito nenhum ate
     // fechar o app, e a impressao seria de que a correcao nao serviu.
@@ -315,6 +335,7 @@ begin
   inherited Create;
   FLogger := ALogger;
   FLock := TCriticalSection.Create;
+  FFalaLock := TCriticalSection.Create;
   FUltimoPtz := TDictionary<string, string>.Create;
   FOnvif := TObjectDictionary<string, TOnvifClient>.Create([doOwnsValues]);
 end;
@@ -322,6 +343,14 @@ end;
 destructor TLocalServer.Destroy;
 begin
   Stop;
+  // Depois do Stop: nenhum pedido novo chega para religar o microfone.
+  FFalaLock.Enter;
+  try
+    PararFalaNativa;
+  finally
+    FFalaLock.Leave;
+  end;
+  FFalaLock.Free;
   FUltimoPtz.Free;
   FOnvif.Free;
   FLock.Free;
@@ -1148,6 +1177,266 @@ begin
   end;
 end;
 
+// A fala para o alto-falante das cameras DESTE aparelho. Pelo mesmo motivo do
+// /api/ptz nao e encaminhada: a sessao que sabe o endereco e a senha esta aqui.
+//
+// POST com o corpo em PCM 16 bits, 8 kHz, mono -- ver TFalaRegistry.Atender.
+// camera vem da QUERY: no POST o Indy pode tomar o corpo por formulario.
+procedure TLocalServer.ServirFala(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo);
+var
+  Camera: string;
+  Pcm: TBytes;
+  Status: Integer;
+  Json: string;
+begin
+  Camera := ParamDaQuery(ARequestInfo, 'camera');
+  if Trim(Camera) = '' then
+  begin
+    ResponderErro(AResponseInfo, 400, 'informe camera');
+    Exit;
+  end;
+  Pcm := nil;
+  if ARequestInfo.PostStream <> nil then
+  begin
+    ARequestInfo.PostStream.Position := 0;
+    SetLength(Pcm, ARequestInfo.PostStream.Size);
+    if Length(Pcm) > 0 then
+      ARequestInfo.PostStream.ReadBuffer(Pcm[0], Length(Pcm));
+  end;
+  Json := TFalaRegistry.Atender(Trim(Camera),
+            LowerCase(Trim(ParamDaQuery(ARequestInfo, 'acao'))), Pcm, Status);
+  AResponseInfo.ResponseNo := Status;
+  AResponseInfo.ContentType := 'application/json; charset=utf-8';
+  AResponseInfo.CharSet := 'utf-8';
+  AResponseInfo.ContentText := Json;
+end;
+
+// A fala com o microfone NATIVO -- o caminho do Android, onde o WebView nega o
+// microfone a pagina (ver VMS.Android.Microfone). A pagina so diz o que fazer:
+//
+//   /api/app/fala?acao=testar                    {"nativo":true|false}
+//   /api/app/fala?acao=ligar&camera=X[&server=S] liga e comeca a mandar
+//   /api/app/fala?acao=desligar
+//   /api/app/fala?acao=estado                    se continua, e por que nao
+//
+// O audio vai para o MESMO lugar que o do navegador iria: camera deste
+// aparelho direto para o TFalaRegistry; camera de servidor por POST no
+// /api/fala dele, com a credencial que o Encaminhar usa.
+//
+// Erro no meio da fala nao tem a quem ser devolvido -- quem manda e a thread
+// do microfone. Ele fica em FFalaErro, e a pagina pergunta pelo `estado`.
+procedure TLocalServer.ServirFalaNativa(ARequestInfo: TIdHTTPRequestInfo;
+  AResponseInfo: TIdHTTPResponseInfo);
+var
+  Acao, Camera, Servidor, Motivo, Usuario, Senha: string;
+  Ok, Ativo: Boolean;
+  Obj: TJSONObject;
+begin
+  Acao := LowerCase(Trim(ParamDaQuery(ARequestInfo, 'acao')));
+  if Acao = 'testar' then
+  begin
+    AResponseInfo.ResponseNo := 200;
+    AResponseInfo.ContentType := 'application/json';
+    AResponseInfo.ContentText := Format('{"nativo":%s}',
+      [LowerCase(BoolToStr(FMicrofone <> nil, True))]);
+    Exit;
+  end;
+  if FMicrofone = nil then
+  begin
+    ResponderErro(AResponseInfo, 503, 'sem microfone nativo aqui');
+    Exit;
+  end;
+
+  Ok := True;
+  Ativo := False;
+  Motivo := '';
+  FFalaLock.Enter;
+  try
+    if Acao = 'ligar' then
+    begin
+      Camera := Trim(ParamDaQuery(ARequestInfo, 'camera'));
+      Servidor := Trim(ParamDaQuery(ARequestInfo, 'server'));
+      if Camera = '' then
+      begin
+        ResponderErro(AResponseInfo, 400, 'informe camera');
+        Exit;
+      end;
+      PararFalaNativa;
+      FFalaErro := '';
+      FFalaBase := '';
+      FFalaAuth := '';
+      if Servidor <> '' then
+      begin
+        if Assigned(FOnServidorUrl) then
+          FFalaBase := FOnServidorUrl(Servidor).TrimRight(['/']);
+        if FFalaBase = '' then
+        begin
+          ResponderErro(AResponseInfo, 503,
+                        Format('nao achei o servidor "%s"', [Servidor]));
+          Exit;
+        end;
+        if Assigned(FOnServidorCredencial) and
+           FOnServidorCredencial(Servidor, Usuario, Senha) then
+          FFalaAuth := 'Basic ' + Base64Simples(Usuario + ':' + Senha);
+      end;
+      FFalaCam := Camera;
+      Ok := FMicrofone.Iniciar(
+        procedure(const Pcm: TBytes)
+        begin
+          EnviarFalaNativa(Pcm);
+        end, Motivo);
+      if not Ok then
+        FFalaCam := '';
+      Ativo := Ok;
+    end
+    else if Acao = 'desligar' then
+      PararFalaNativa
+    else if Acao = 'estado' then
+    begin
+      Motivo := FFalaErro;
+      Ativo := (FFalaCam <> '') and FMicrofone.Gravando and (Motivo = '');
+      if (FFalaCam <> '') and (Motivo = '') and not Ativo then
+        Motivo := 'o microfone parou';
+    end
+    else
+    begin
+      ResponderErro(AResponseInfo, 400,
+                    Acao + ' nao existe: use testar, ligar, desligar ou estado');
+      Exit;
+    end;
+  finally
+    FFalaLock.Leave;
+  end;
+
+  AResponseInfo.ResponseNo := 200;
+  AResponseInfo.ContentType := 'application/json; charset=utf-8';
+  AResponseInfo.CharSet := 'utf-8';
+  Obj := TJSONObject.Create;
+  try
+    Obj.AddPair('ok', TJSONBool.Create(Ok));
+    Obj.AddPair('ativo', TJSONBool.Create(Ativo));
+    if Motivo <> '' then Obj.AddPair('motivo', Motivo);
+    AResponseInfo.ContentText := Obj.ToJSON;
+  finally
+    Obj.Free;
+  end;
+end;
+
+// O `motivo` de uma resposta do /api/fala, ou o `error` de um 4xx/5xx.
+function MotivoDaFala(const Json: string): string;
+var
+  V: TJSONValue;
+begin
+  Result := '';
+  V := TJSONObject.ParseJSONValue(Json);
+  try
+    if V is TJSONObject then
+      if not TJSONObject(V).TryGetValue<string>('motivo', Result) then
+        TJSONObject(V).TryGetValue<string>('error', Result);
+  finally
+    V.Free;
+  end;
+  if Result = '' then Result := 'a camera nao aceitou o audio';
+end;
+
+// Na thread do microfone. Um pedaco de ~160 ms por chamada.
+procedure TLocalServer.EnviarFalaNativa(const Pcm: TBytes);
+var
+  Json, Url: string;
+  Status: Integer;
+  Corpo: TBytesStream;
+  Resp: IHTTPResponse;
+begin
+  // Depois do primeiro erro, o resto do audio nao tem para onde ir. A pagina
+  // le o erro pelo `estado` e desliga.
+  if FFalaErro <> '' then Exit;
+  try
+    if FFalaBase = '' then
+    begin
+      Json := TFalaRegistry.Atender(FFalaCam, 'enviar', Pcm, Status);
+      if (Status <> 200) or (Pos('"ok":true', Json) = 0) then
+        FFalaErro := MotivoDaFala(Json);
+    end
+    else
+    begin
+      // Um cliente para a fala inteira: um POST a cada 160 ms abrindo conexao
+      // nova seria um aperto de maos TCP por pedaco de audio.
+      if FFalaCli = nil then
+      begin
+        FFalaCli := THTTPClient.Create;
+        FFalaCli.ConnectionTimeout := 5000;
+        // Folgado: o primeiro envio espera o login na camera.
+        FFalaCli.ResponseTimeout := 15000;
+      end;
+      Url := FFalaBase + '/api/fala?acao=enviar&camera=' +
+             TNetEncoding.URL.Encode(FFalaCam);
+      Corpo := TBytesStream.Create(Pcm);
+      try
+        FFalaCli.ContentType := 'application/octet-stream';
+        if FFalaAuth <> '' then
+          Resp := FFalaCli.Post(Url, Corpo, nil,
+                    [TNetHeader.Create('Authorization', FFalaAuth)])
+        else
+          Resp := FFalaCli.Post(Url, Corpo);
+      finally
+        Corpo.Free;
+      end;
+      Json := Resp.ContentAsString(TEncoding.UTF8);
+      if (Resp.StatusCode <> 200) or (Pos('"ok":true', Json) = 0) then
+        FFalaErro := MotivoDaFala(Json);
+    end;
+  except
+    on E: Exception do
+      FFalaErro := 'fala: ' + E.Message;
+  end;
+  if (FFalaErro <> '') and (FLogger <> nil) then
+    FLogger.Warn('local', 'fala nativa: ' + FFalaErro);
+end;
+
+// Com FFalaLock tomado. Para o microfone ANTES de mandar o fechar: com a
+// thread dele ainda viva, um envio atrasado poderia chegar depois do fechar e
+// reabrir a conversa.
+procedure TLocalServer.PararFalaNativa;
+var
+  Status: Integer;
+  Url: string;
+  Cli: THTTPClient;
+begin
+  if FMicrofone <> nil then
+    FMicrofone.Parar;
+  if FFalaCam <> '' then
+  begin
+    try
+      if FFalaBase = '' then
+        TFalaRegistry.Atender(FFalaCam, 'fechar', nil, Status)
+      else
+      begin
+        Cli := FFalaCli;
+        FFalaCli := nil;
+        if Cli = nil then Cli := THTTPClient.Create;
+        try
+          Cli.ConnectionTimeout := 3000;
+          Cli.ResponseTimeout := 3000;
+          Url := FFalaBase + '/api/fala?acao=fechar&camera=' +
+                 TNetEncoding.URL.Encode(FFalaCam);
+          if FFalaAuth <> '' then
+            Cli.Get(Url, nil, [TNetHeader.Create('Authorization', FFalaAuth)])
+          else
+            Cli.Get(Url);
+        finally
+          Cli.Free;
+        end;
+      end;
+    except
+      // O servidor fecha sozinho depois de 3 s sem audio; nao vale derrubar
+      // o desligar por isso.
+    end;
+  end;
+  FreeAndNil(FFalaCli);
+  FFalaCam := '';
+end;
+
 // O ramo ONVIF do /api/ptz. Separado do DVRIP porque nao ha nada em comum
 // entre os dois alem do nome da camera: um fala JSON por socket proprio, o
 // outro SOAP por HTTP, e as acoes nem coincidem.
@@ -1535,6 +1824,15 @@ begin
     else if (Caminho = '/api/ptz') and
             (Trim(ARequestInfo.Params.Values['server']) = '') then
       ServirPtz(ARequestInfo, AResponseInfo)
+    // A mesma regra de escopo da PTZ: com `server`, a camera e do servidor e
+    // o pedido segue para la pelo Encaminhar.
+    // A fala pelo microfone do aparelho. Sempre daqui, com ou sem `server`:
+    // o microfone e deste aparelho, e e daqui que o audio sai para o servidor.
+    else if Caminho = '/api/app/fala' then
+      ServirFalaNativa(ARequestInfo, AResponseInfo)
+    else if (Caminho = '/api/fala') and
+            (Trim(ParamDaQuery(ARequestInfo, 'server')) = '') then
+      ServirFala(ARequestInfo, AResponseInfo)
     // O caminho de quem nao consegue decodificar na pagina: ela manda o
     // fragmento e pede quadro por quadro, ja em JPEG.
     else if Caminho = '/api/decode' then

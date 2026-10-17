@@ -58,6 +58,7 @@ uses
   VMS.Live.Ring,
   VMS.Win.Edge,
   VMS.Android.UiAssets,    // a interface do aparelho, igual a do pacote
+  VMS.Android.Microfone,   // CriarMicrofone: a fala no Android
   Vms.Onvif.Client,        // EnderecoOnvif: o endereco escrito no cadastro
   UI.Common,
   UI.Shell;
@@ -208,6 +209,9 @@ begin
   FLocal.OnFrente := PedidoFrente;
   FLocal.OnLerLog := LerLogDoApp;
   FLocal.OnOnvifCam := OnvifDaCamera;
+  // A fala com o microfone do aparelho. So existe no Android, onde o WebView
+  // nega o microfone a pagina; no Windows vem nil e a pagina grava sozinha.
+  FLocal.Microfone := CriarMicrofone;
   // Só existe no Android; no Windows o WebView2 decodifica o que precisamos, e
   // o serviço responde que não está disponível.
   FDecodificacao := TDecodificacaoNativa.Create(FLogger);

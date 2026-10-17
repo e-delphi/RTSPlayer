@@ -101,6 +101,16 @@
 <iframe id="ponte" style="display:none" title=""></iframe>
 
 <script>
+// O menu do toque longo (copiar, selecionar tudo) fica desligado no app todo.
+// No Android ele aparece ao segurar o dedo e cancela o gesto que estava em
+// curso -- e segurar e como se usam o Falar e as setas da PTZ. Os campos de
+// digitar ficam com o deles: e por ali que se cola um endereco. Ver o mesmo
+// assunto no ui.css.
+document.addEventListener("contextmenu", function (ev) {
+  var t = ev.target;
+  if (t && t.closest && t.closest("input, textarea, [contenteditable='true']")) return;
+  ev.preventDefault();
+});
 "use strict";
 
 var q = new URLSearchParams(location.search);

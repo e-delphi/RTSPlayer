@@ -20,7 +20,8 @@ uses
   VMS.Domain.Session,
   VMS.Domain.Ptz,
   VMS.Dvrip.Protocol,
-  VMS.Dvrip.Media;
+  VMS.Dvrip.Media,
+  VMS.Dvrip.Talk;
 
 type
   TDvripSession = class(TInterfacedObject, IPtzSession)
@@ -104,6 +105,7 @@ type
     function IrParaPreset(Preset, Canal: Integer;
                           const Comando: string = ''): Boolean;
     function PerguntarConfig(const Nome: string): Boolean;
+    function AbrirFala(out Motivo: string): IFalaSession;
   end;
 
 implementation
@@ -232,33 +234,11 @@ end;
 
 function TDvripSession.Login: Boolean;
 var
-  Json, Resp, Sid: string;
-  Hdr: TDvripHeader;
-  Payload: TBytes;
-  Attempt: Integer;
+  Resp: string;
 begin
-  Result := False;
-  Json := '{ "CommunicateKey" : "", "EncryptType" : "MD5", "LoginType" : "DVRIP-Web", ' +
-          '"PassWord" : "' + SofiaHash(FConfig.Password) + '", "UserName" : "' + FConfig.User + '" }';
-  DvripSendCmd(FTcp, 0, 0, DVRIP_LOGIN, Json);
-  // Lê até achar a mensagem com SessionID (algumas câmeras mandam um
-  // "LoginEncryptionType" antes da resposta real do login).
-  for Attempt := 1 to 4 do
-  begin
-    if not DvripRecv(FTcp, Hdr, Payload, FConfig.RtspTimeoutMs) then Exit;
-    Resp := TEncoding.UTF8.GetString(Payload);
-    FLogger.Debug(FTag, 'login resp: ' + Resp);
-    Sid := JsonGetStr(Resp, 'SessionID');
-    if Sid = '' then Continue; // mensagem pré-login; lê a próxima
-    if JsonGetInt(Resp, 'Ret', 0) <> 100 then Exit;
-    if Sid.StartsWith('0x') then
-      FSessionID := Cardinal(StrToInt64Def('$' + Copy(Sid, 3, MaxInt), 0))
-    else
-      FSessionID := Cardinal(StrToInt64Def(Sid, 0));
-    FAliveInterval := JsonGetInt(Resp, 'AliveInterval', 30);
-    if FAliveInterval <= 0 then FAliveInterval := 30;
-    Exit(True);
-  end;
+  Result := DvripLogin(FTcp, FConfig.User, FConfig.Password, FConfig.RtspTimeoutMs,
+                       FSessionID, FAliveInterval, Resp);
+  FLogger.Debug(FTag, 'login resp: ' + Resp);
 end;
 
 // Consulta a config de encode ("Simplify.Encode"): loga o JSON cru e o resumo
@@ -847,6 +827,30 @@ begin
   finally
     FEnvio.Leave;
   end;
+end;
+
+// A fala vai por uma conexao PROPRIA, e nao por esta: ver VMS.Dvrip.Talk. Daqui
+// ela so leva o endereco e a senha -- o tunel da tailnet, se houver, ja esta de
+// pe, porque esta sessao esta viva.
+function TDvripSession.AbrirFala(out Motivo: string): IFalaSession;
+var
+  Host: string;
+  Port: Word;
+  Fala: TDvripTalk;
+begin
+  Result := nil;
+  Motivo := '';
+  if not ParseHostPort(Host, Port) then
+  begin
+    Motivo := 'URL DVRIP invalida: ' + FConfig.Url;
+    Exit;
+  end;
+  Fala := TDvripTalk.Create(Host, Port, FConfig.User, FConfig.Password,
+                            FConfig.ConnectTimeoutMs, FLogger, FTag + '.fala');
+  // Pela interface desde ja: se o Abrir falhar, soltar a referencia libera.
+  Result := Fala;
+  if not Fala.Abrir(Motivo) then
+    Result := nil;
 end;
 
 // A mesma trava e o mesmo cuidado do MoverPtz: a conexao pode cair entre o

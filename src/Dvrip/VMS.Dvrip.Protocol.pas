@@ -54,6 +54,18 @@ const
   DVRIP_ALARM_INFO          = 1504; // 0x05e0
   DVRIP_PTZ                 = 1400; // 0x0578
   DVRIP_PTZ_RSP             = 1401; // 0x0579
+  // OPTalk: o áudio que vai PARA a câmera tocar no alto-falante. Mesmo desenho
+  // do OPMonitor -- Claim no ID +4, Start no ID base, dados num terceiro --, e
+  // os números são os da implementação do go2rtc, que fala com estas câmeras.
+  // Não conferidos por captura aqui.
+  DVRIP_OPTALK              = 1430; // 0x0596  Action="Start" (e "Stop")
+  DVRIP_OPTALK_RSP          = 1431; // 0x0597
+  DVRIP_OPTALK_DATA         = 1432; // 0x0598  frames de áudio, nos dois sentidos
+  DVRIP_OPTALK_CLAIM        = 1434; // 0x059A  Action="Claim"
+  DVRIP_OPTALK_CLAIM_RSP    = 1435; // 0x059B
+  // Um frame de fala: 320 bytes de G.711 = 40 ms a 8 kHz. É o tamanho que o
+  // go2rtc manda, e o mesmo que a câmera usa no áudio dela.
+  DVRIP_OPTALK_QUADRO       = 320;
 
   // Os comandos de direção. O NOME aqui é o da imagem, o que o usuário vê; o
   // VALOR é como a câmera chama o mesmo movimento.
@@ -130,6 +142,25 @@ function SofiaHash(const Password: string): string;
 // Envia um comando: header(20) + JSON + #10.
 procedure DvripSendCmd(const Stream: ITcpStream; SessionID, Sequence: Cardinal;
                        MsgID: Word; const Json: string);
+// Envia um payload binário como está: header(20) + Payload, sem o #10 dos JSON.
+// É por aqui que sai o áudio da fala.
+procedure DvripSendBin(const Stream: ITcpStream; SessionID, Sequence: Cardinal;
+                       MsgID: Word; const Payload: TBytes);
+
+// Login MD5 "Sofia". Lê até achar a resposta com SessionID -- algumas câmeras
+// mandam um "LoginEncryptionType" antes da resposta real. Resposta = o último
+// JSON lido, para o log de quem chama. Timeout levanta exceção (RecvExact).
+function DvripLogin(const Stream: ITcpStream; const User, Password: string;
+                    TimeoutMs: Cardinal; out SessionID: Cardinal;
+                    out AliveInterval: Integer; out Resposta: string): Boolean;
+
+// O JSON do OPTalk. Action = "Claim", "Start" ou "Stop". Só A-law: é o formato
+// que o go2rtc manda, e a câmera devolve o áudio dela no mesmo.
+function DvripTalkJson(const Action: string; SessionID: Cardinal): string;
+
+// Um frame de fala: o sub-header de 8 bytes que a câmera usa no áudio dela
+// (00 00 01 FA, codec, taxa, tamanho LE16) seguido das amostras A-law.
+function DvripTalkFrame(const ALaw: TBytes): TBytes;
 
 // Lê uma mensagem completa (header + payload cru). O chamador decide se o
 // payload é JSON (resposta de comando) ou binário (frames de mídia).
@@ -338,11 +369,17 @@ end;
 
 procedure DvripSendCmd(const Stream: ITcpStream; SessionID, Sequence: Cardinal;
   MsgID: Word; const Json: string);
+begin
+  DvripSendBin(Stream, SessionID, Sequence, MsgID,
+               TEncoding.UTF8.GetBytes(Json + #10));
+end;
+
+procedure DvripSendBin(const Stream: ITcpStream; SessionID, Sequence: Cardinal;
+  MsgID: Word; const Payload: TBytes);
 var
-  Payload, Buf: TBytes;
+  Buf: TBytes;
   N: Integer;
 begin
-  Payload := TEncoding.UTF8.GetBytes(Json + #10);
   N := Length(Payload);
   SetLength(Buf, 20 + N);
   FillChar(Buf[0], 20, 0);
@@ -357,6 +394,68 @@ begin
   if N > 0 then
     Move(Payload[0], Buf[20], N);
   Stream.Send(Buf);
+end;
+
+function DvripLogin(const Stream: ITcpStream; const User, Password: string;
+  TimeoutMs: Cardinal; out SessionID: Cardinal; out AliveInterval: Integer;
+  out Resposta: string): Boolean;
+var
+  Json, Sid: string;
+  Hdr: TDvripHeader;
+  Payload: TBytes;
+  Attempt: Integer;
+begin
+  Result := False;
+  SessionID := 0;
+  AliveInterval := 30;
+  Resposta := '';
+  Json := '{ "CommunicateKey" : "", "EncryptType" : "MD5", "LoginType" : "DVRIP-Web", ' +
+          '"PassWord" : "' + SofiaHash(Password) + '", "UserName" : "' + User + '" }';
+  DvripSendCmd(Stream, 0, 0, DVRIP_LOGIN, Json);
+  for Attempt := 1 to 4 do
+  begin
+    if not DvripRecv(Stream, Hdr, Payload, TimeoutMs) then Exit;
+    Resposta := TEncoding.UTF8.GetString(Payload);
+    Sid := JsonGetStr(Resposta, 'SessionID');
+    if Sid = '' then Continue; // mensagem pré-login; lê a próxima
+    if JsonGetInt(Resposta, 'Ret', 0) <> 100 then Exit;
+    if Sid.StartsWith('0x') then
+      SessionID := Cardinal(StrToInt64Def('$' + Copy(Sid, 3, MaxInt), 0))
+    else
+      SessionID := Cardinal(StrToInt64Def(Sid, 0));
+    AliveInterval := JsonGetInt(Resposta, 'AliveInterval', 30);
+    if AliveInterval <= 0 then AliveInterval := 30;
+    Exit(True);
+  end;
+end;
+
+function DvripTalkJson(const Action: string; SessionID: Cardinal): string;
+begin
+  // SampleRate em kHz e BitRate em kbps, como o xm-cam-talk manda. O go2rtc só
+  // manda o EncodeType e também funciona; os campos a mais não atrapalham e
+  // tiram a dúvida de câmera que exija.
+  Result := Format('{ "Name" : "OPTalk", "OPTalk" : { "Action" : "%s", ' +
+    '"AudioFormat" : { "BitRate" : 128, "EncodeType" : "G711_ALAW", ' +
+    '"SampleBit" : 8, "SampleRate" : 8 } }, "SessionID" : "0x%.8x" }',
+    [Action, SessionID]);
+end;
+
+function DvripTalkFrame(const ALaw: TBytes): TBytes;
+var
+  N: Integer;
+begin
+  N := Length(ALaw);
+  SetLength(Result, 8 + N);
+  Result[0] := $00;
+  Result[1] := $00;
+  Result[2] := $01;
+  Result[3] := $FA;  // áudio
+  Result[4] := $0E;  // G.711 A-law -- o mesmo código que o parser lê na volta
+  Result[5] := $02;  // 8000 Hz
+  Result[6] := Byte(N);
+  Result[7] := Byte(N shr 8);
+  if N > 0 then
+    Move(ALaw[0], Result[8], N);
 end;
 
 function DvripRecv(const Stream: ITcpStream; out Hdr: TDvripHeader;
@@ -564,7 +663,9 @@ function DvripClassifyMsg(MsgID: Word): TDvripMsgKind;
 begin
   case MsgID of
     // Único ID de mídia que conhecemos: o canal de dados do OPMonitor.
-    DVRIP_OPMONITOR_DATA:
+    DVRIP_OPMONITOR_DATA,
+    // O áudio do microfone da câmera, que volta pela conexão da fala.
+    DVRIP_OPTALK_DATA:
       Result := mkMedia;
     // Comandos e suas respostas: payload é sempre JSON. Inclui os IDs de
     // request porque algumas câmeras respondem no mesmo ID em que perguntamos.
@@ -579,6 +680,7 @@ begin
     // "MsgID desconhecido" em vez do JSON. Justamente a resposta que se quer
     // ler quando a camera aceita o comando e nao se mexe.
     DVRIP_PTZ, DVRIP_PTZ_RSP,
+    DVRIP_OPTALK_CLAIM, DVRIP_OPTALK_CLAIM_RSP, DVRIP_OPTALK_RSP,
     DVRIP_ALARM_INFO:
       Result := mkControl;
     // DVRIP_OPMONITOR (1410) fica de fora de propósito: é o ID em que mandamos

@@ -180,6 +180,15 @@
            padding:10px 16px; text-align:center; background:rgba(0,0,0,.55);
            border-radius:var(--r-l); max-width:80%; }
   #aviso:empty { display:none; }
+  /* A mensagem da fala. Propria, e nao o #aviso: aquele e do video, e o
+     status do player o sobrescrevia em instantes -- a mensagem de permissao
+     do microfone piscava e sumia antes de dar para ler. */
+  #fala-msg { position:absolute; left:50%; bottom:72px; z-index:6;
+              transform:translateX(-50%); max-width:min(80%, 360px);
+              padding:10px 16px; border-radius:var(--r-l); text-align:center;
+              background:rgba(0,0,0,.8); color:var(--sobre-sup);
+              font-size:13px; line-height:18px; pointer-events:none; }
+  #fala-msg:empty { display:none; }
 
   /* A PTZ, num canto do video. No canto e nao no rodape porque o rodape some
      no modo imerso, e mover a camera e justamente quando se quer a imagem
@@ -237,6 +246,13 @@
      sem procurar. */
   #ptz-abrir { width:auto; padding:7px 14px; font-size:12px;
                letter-spacing:.06em; }
+  /* A fala mora ao lado do botao da PTZ, e nao dentro do teclado: falar nao
+     depende de abrir o teclado, e quem fala quer o botao sempre a mao. */
+  #ptz-botoes { display:flex; gap:6px; }
+  #fala { width:auto; padding:7px 14px; font-size:12px; letter-spacing:.06em; }
+  #fala[hidden] { display:none; }
+  /* Falando: a cor da interacao, a mesma da faixa na regua. */
+  #fala.on { background:var(--interacao); color:#2e0a3f; }
   #ptz-linha { display:flex; align-items:flex-end; gap:8px; }
   #ptz-pad { display:grid; grid-template-columns:repeat(3, 44px);
              grid-auto-rows:44px; gap:2px; }
@@ -573,6 +589,7 @@
     <canvas id="tela2d"></canvas>
     <img id="previa" alt="">
     <div id="aviso"></div>
+    <div id="fala-msg"></div>
     <!-- Manutencao das posicoes guardadas. Sobre o video de proposito: e o
          enquadramento que se esta vendo que vai ser guardado. -->
     <div id="pos-dialogo">
@@ -615,7 +632,11 @@
       </div>
       <div id="ptz-presets" hidden></div>
       </div>
-      <button class="pv" id="ptz-abrir">PTZ</button>
+      <div id="ptz-botoes">
+        <button class="pv" id="fala" hidden
+                title="Falar pelo alto-falante da c&acirc;mera">Falar</button>
+        <button class="pv" id="ptz-abrir">PTZ</button>
+      </div>
     </div>
   </div>
   <div id="rodape">
@@ -683,6 +704,16 @@
 <script src="/ui/vmsreader.js"></script>
 <script src="/ui/player.js"></script>
 <script>
+// O menu do toque longo (copiar, selecionar tudo) fica desligado no app todo.
+// No Android ele aparece ao segurar o dedo e cancela o gesto que estava em
+// curso -- e segurar e como se usam o Falar e as setas da PTZ. Os campos de
+// digitar ficam com o deles: e por ali que se cola um endereco. Ver o mesmo
+// assunto no ui.css.
+document.addEventListener("contextmenu", function (ev) {
+  var t = ev.target;
+  if (t && t.closest && t.closest("input, textarea, [contenteditable='true']")) return;
+  ev.preventDefault();
+});
 "use strict";
 
 function $(id) { return document.getElementById(id); }
@@ -723,6 +754,9 @@ function mostrar(qual) {
   // haver player: trocar de tela com o botao ainda apertado deixaria a camera
   // girando ate o teto de tempo, e ninguem estaria olhando para ela.
   ptzParar();
+  // Pelo mesmo motivo: sair da tela com o microfone aberto deixaria a pessoa
+  // falando para a camera sem saber.
+  falaParar();
   // Sair da reproducao leva o dialogo junto: ele vive sobre o video, e um
   // video que nao esta mais na tela nao tem posicao para guardar.
   fecharPosicoes();
@@ -1236,6 +1270,7 @@ function abrirPlayer(camera, d, msInicial) {
   vista = janelaInicial(d, msInicial);
   seguindo = true;
   eventos = [];
+  interacoes = [];
   resetarZoom();
   ajustarBotoesDoPlayer();
   $("h-play").textContent = camera;
@@ -1262,11 +1297,21 @@ function abrirPlayer(camera, d, msInicial) {
         eventos = j.events || [];
         desenharRegua();
       }).catch(function () {});
+  // As interacoes vem de outra rota: nao dependem da analise de imagem, e
+  // servidor sem analise responde 503 no /api/events mas responde esta.
+  if (comServidor())
+    fetch(api("/api/interacoes?camera=" + encodeURIComponent(camera) +
+          "&fromMs=" + d.startMs + "&toMs=" + d.endMs))
+      .then(function (r) { return r.json(); }).then(function (j) {
+        interacoes = j.interactions || [];
+        desenharRegua();
+      }).catch(function () {});
 
   // No instante pedido, quando houve um; senao no fim do dia gravado, que e
   // onde quase sempre se quer olhar.
   // Gravacao nao mostra PTZ: mover a camera nao muda o que ja foi gravado.
   ptzParar();
+  falaParar();
   $("ptz").hidden = true;
   var alvo = msInicial || (Math.min(d.endMs, Date.now()) - 30000);
   // Abrir um dia e um salto como qualquer outro: a previa cobre a espera pelo
@@ -1288,6 +1333,9 @@ function abrirPlayer(camera, d, msInicial) {
 // a pinca e o arrasto mudam ela.
 
 var vista = null, eventos = [];
+// Os trechos em que alguem mexeu na camera -- PTZ ou fala. Ver
+// /api/interacoes no servidor.
+var interacoes = [];
 
 // A regua segue o indicador -- ou nao, quando quem esta comandando a janela e
 // o usuario.
@@ -1381,6 +1429,16 @@ function desenharRegua() {
     var a = x(e.startMs), b = x(e.endMs || e.startMs);
     if (b < -2 || a > L + 2) return;
     g.fillRect(Math.max(0, a), 6, Math.max(2, Math.min(L, b) - Math.max(0, a)), 6);
+  });
+
+  // Interacoes (PTZ e fala): na faixa fina acima dos eventos, e nao na mesma.
+  // Na mesma, um trecho de PTZ cobriria o movimento que ele proprio causou --
+  // e ver os dois juntos e justamente o que responde "foi gente ou nao?".
+  g.fillStyle = "#d4a4f5";      /* --interacao */
+  interacoes.forEach(function (e) {
+    var a = x(e.startMs), b = x(e.endMs || e.startMs);
+    if (b < -2 || a > L + 2) return;
+    g.fillRect(Math.max(0, a), 1, Math.max(2, Math.min(L, b) - Math.max(0, a)), 4);
   });
 
   // Marcas de hora, alinhadas na meia-noite local para o rotulo cair em numero
@@ -1519,6 +1577,217 @@ $("previa").addEventListener("error", esconderPrevia);
   }
   ciclo(0);
 })();
+
+// ------------------------------------------------------------------- FALA
+//
+// O microfone deste aparelho no alto-falante da camera. Quem fala com a camera
+// e o servidor (ou o app, para camera do aparelho) -- ver VMS.Dvrip.Talk. Daqui
+// sai so o audio cru: PCM de 16 bits, 8 kHz, mono, em POSTs de ~160 ms.
+//
+// A conversao para A-law e o ritmo de 40 ms por quadro ficam do lado de la: o
+// fetch nao e pontual, e a camera toca em tempo real. Quem tem de absorver o
+// atraso de um POST e quem manda para a camera.
+//
+// Um POST de cada vez, e nao um por intervalo: dois no ar podem chegar fora de
+// ordem, e audio fora de ordem e pior que audio atrasado. O que se junta
+// enquanto um esta no ar vai no seguinte.
+
+var FALA_TAXA = 8000;
+var FALA_ENVIO_MS = 160;
+var fala = null;
+
+function falaPedir(f, params, corpo) {
+  var op = {};
+  if (corpo) {
+    op = { method: "POST", body: corpo,
+           // octet-stream, e nao o padrao: com cara de formulario, o Indy leria
+           // o corpo como parametros.
+           headers: { "Content-Type": "application/octet-stream" } };
+  }
+  return fetch(api("/api/fala?camera=" + encodeURIComponent(f.cam) + params), op)
+    .then(function (r) { return r.json(); })
+    .catch(function () { return {}; });
+}
+
+var falaMsgRelogio = null;
+
+function falaAviso(msg) {
+  console.info("[fala] " + msg);
+  $("fala-msg").textContent = msg;
+  // Tempo de ler uma frase inteira. Uma mensagem nova reinicia a conta.
+  if (falaMsgRelogio) clearTimeout(falaMsgRelogio);
+  falaMsgRelogio = setTimeout(function () { $("fala-msg").textContent = ""; }, 6000);
+}
+
+// O microfone nativo do app (Android). Perguntado uma vez na carga: e coisa do
+// aparelho, e nao da camera. Pelo caminho cru, sem api(): quem responde e
+// sempre o servidor local deste aparelho. Aberta num navegador comum, pelo
+// vmsserver, a rota nao existe e fica o getUserMedia.
+var falaNativa = false;
+fetch("/api/app/fala?acao=testar")
+  .then(function (r) { return r.json(); })
+  .then(function (j) { falaNativa = !!(j && j.nativo); })
+  .catch(function () {});
+
+function falaNativaPedir(acao, comEscopo) {
+  var url = "/api/app/fala?acao=" + acao;
+  if (comEscopo) url = api(url + "&camera=" + encodeURIComponent(camAtual));
+  return fetch(url, { method: "POST" })
+    .then(function (r) { return r.json(); })
+    .catch(function () { return {}; });
+}
+
+// O caminho do Android: quem grava e manda e o app. A pagina liga, desliga e
+// pergunta de segundo em segundo se ainda esta indo -- erro no meio da fala
+// (a camera recusou, a conexao caiu) so aparece assim.
+function falaLigarNativa() {
+  var f = { cam: camAtual, nativa: true, fim: false };
+  fala = f;
+  marcarFala(true);
+  // api() leva o `server` junto: e por ele que o app sabe se o audio vai
+  // para a camera direto ou para o servidor.
+  falaNativaPedir("ligar", true).then(function (j) {
+    if (fala !== f) {
+      // Soltou antes de o ligar voltar. O desligar pode ter chegado antes
+      // dele e nao ter achado nada: manda de novo, agora que ligou.
+      if (j && j.ok) falaNativaPedir("desligar");
+      return;
+    }
+    if (!j || !j.ok) {
+      falaParar();
+      falaAviso((j && (j.motivo || j.error)) || "n\u00e3o consegui ligar o microfone");
+      return;
+    }
+    f.relogio = setInterval(function () {
+      falaNativaPedir("estado").then(function (e) {
+        if (fala !== f || !e || e.ativo) return;
+        falaParar();
+        falaAviso(e.motivo || "a fala parou");
+      });
+    }, 1000);
+  });
+}
+
+function marcarFala(on) {
+  $("fala").classList.toggle("on", on);
+  $("fala").textContent = on ? "Falando" : "Falar";
+}
+
+// Pergunta se ha por onde falar com esta camera. So depois da PTZ responder:
+// para as cameras DVRIP, e a mesma sessao viva que atende as duas.
+function verSeTemFala(cam) {
+  falaPedir({ cam: cam }, "&acao=testar").then(function (j) {
+    if (camAtual !== cam) return;
+    $("fala").hidden = !(j && j.ok);
+  });
+}
+
+// Reduz para 8 kHz tirando a media de cada grupo de amostras. A media ja e um
+// passa-baixas, grosseiro mas suficiente para voz -- e o G.711 do outro lado
+// corta tudo acima de 4 kHz de qualquer jeito.
+function falaCaptar(f, dados, taxa) {
+  var passo = taxa / FALA_TAXA;
+  var ent = dados;
+  if (f.resto.length) {
+    ent = new Float32Array(f.resto.length + dados.length);
+    ent.set(f.resto, 0);
+    ent.set(dados, f.resto.length);
+  }
+  var n = Math.floor(ent.length / passo);
+  var saida = new Int16Array(n);
+  for (var k = 0; k < n; k++) {
+    var a = Math.floor(k * passo), b = Math.max(a + 1, Math.floor((k + 1) * passo));
+    var s = 0;
+    for (var i = a; i < b; i++) s += ent[i];
+    var v = Math.max(-1, Math.min(1, s / (b - a)));
+    saida[k] = v < 0 ? v * 0x8000 : v * 0x7fff;
+  }
+  // Copia, e nao referencia: o navegador reaproveita o buffer da captura.
+  f.resto = ent.slice(Math.floor(n * passo));
+  f.pedacos.push(saida);
+  f.amostras += n;
+}
+
+function falaDespachar(f) {
+  if (f.enviando || f.fim || !f.amostras) return;
+  var junto = new Int16Array(f.amostras), p = 0;
+  f.pedacos.forEach(function (c) { junto.set(c, p); p += c.length; });
+  f.pedacos = [];
+  f.amostras = 0;
+  // O primeiro POST abre a conversa, e isso leva o login inteiro. O que se
+  // juntou nesse tempo ja e passado: fica o ultimo segundo, e nao o atraso.
+  if (junto.length > FALA_TAXA) junto = junto.slice(junto.length - FALA_TAXA);
+  f.enviando = true;
+  falaPedir(f, "&acao=enviar", junto.buffer).then(function (j) {
+    f.enviando = false;
+    // Parou enquanto este estava no ar: o fechar sai so agora, senao ele
+    // chegaria antes deste e o envio reabriria a conversa.
+    if (f.fim) { falaPedir(f, "&acao=fechar"); return; }
+    if (!j || !j.ok) {
+      falaParar();
+      falaAviso((j && (j.motivo || j.error)) || "a câmera não aceitou o áudio");
+    }
+  });
+}
+
+function falaLigar() {
+  if (fala || !camAtual) return;
+  if (falaNativa) { falaLigarNativa(); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    falaAviso("sem acesso ao microfone nesta tela");
+    return;
+  }
+  var f = { cam: camAtual, pedacos: [], amostras: 0, resto: new Float32Array(0),
+            enviando: false, fim: false };
+  fala = f;
+  marcarFala(true);
+  navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1,
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+    .then(function (stream) {
+      // Desligou enquanto o navegador perguntava pela permissao.
+      if (fala !== f) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      f.stream = stream;
+      // Na taxa do aparelho, e nao pedindo 8 kHz ao contexto: ligar o
+      // microfone num contexto de outra taxa ja deu erro em navegador, e a
+      // reducao aqui e barata.
+      f.ctx = new Ctx();
+      f.fonte = f.ctx.createMediaStreamSource(stream);
+      f.proc = f.ctx.createScriptProcessor(2048, 1, 1);
+      f.proc.onaudioprocess = function (ev) {
+        falaCaptar(f, ev.inputBuffer.getChannelData(0), f.ctx.sampleRate);
+      };
+      f.fonte.connect(f.proc);
+      // Ligado a saida so porque sem isso o processador nao roda. A saida
+      // dele fica em silencio: ninguem escreve nela.
+      f.proc.connect(f.ctx.destination);
+      f.relogio = setInterval(function () { falaDespachar(f); }, FALA_ENVIO_MS);
+    })
+    .catch(function (e) {
+      if (fala !== f) return;
+      falaParar();
+      falaAviso("microfone: " + ((e && (e.message || e.name)) || e));
+    });
+}
+
+function falaParar() {
+  var f = fala;
+  if (!f) return;
+  fala = null;
+  f.fim = true;
+  marcarFala(false);
+  if (f.relogio) clearInterval(f.relogio);
+  if (f.nativa) { falaNativaPedir("desligar"); return; }
+  try {
+    if (f.proc) { f.proc.onaudioprocess = null; f.proc.disconnect(); }
+    if (f.fonte) f.fonte.disconnect();
+  } catch (e) {}
+  if (f.stream) f.stream.getTracks().forEach(function (t) { t.stop(); });
+  if (f.ctx) f.ctx.close().catch(function () {});
+  // Com um envio no ar, quem manda o fechar e a resposta dele. Ver
+  // falaDespachar.
+  if (!f.enviando) falaPedir(f, "&acao=fechar");
+}
 
 // ------------------------------------------------------------------- PTZ
 //
@@ -1847,6 +2116,8 @@ function alternarPtz(abrir) {
 
 function verSeTemPtz() {
   $("ptz").hidden = true;
+  falaParar();
+  $("fala").hidden = true;
   // Fechado a cada abertura do ao vivo: o estado normal e assistir, e quem
   // quer mover pede.
   alternarPtz(false);
@@ -1871,6 +2142,7 @@ function verSeTemPtz() {
         // O `via` diz qual protocolo atendeu, e e ele que decide se da para
         // listar os presets ou se eles viram numeros.
         montarPresets(j.via);
+        verSeTemFala(cam);
         return;
       }
       var porque = (j && (j.error || j.motivo)) || "sem resposta";
@@ -1933,6 +2205,35 @@ function lembrarVelocidade() {
   });
 
   $("ptz-abrir").addEventListener("click", function () { alternarPtz(); });
+  // Os dois jeitos, decididos pelo tempo do aperto:
+  //   toque curto  -- liga, e fica ligado ate outro toque. E o do computador,
+  //                   onde segurar o botao do mouse enquanto se fala e
+  //                   desconfortavel.
+  //   segurar      -- fala enquanto o dedo estiver no botao; soltar desliga.
+  //                   E o natural no celular, como um radio.
+  // Pelo pointerdown, e nao pelo click: o click so chega no soltar, e ai o
+  // segurar nao existiria. A captura garante o pointerup mesmo que o dedo
+  // escorregue para fora do botao.
+  var FALA_SEGURAR_MS = 400;
+  var falaApertoMs = 0, falaLigouNoAperto = false;
+  $("fala").addEventListener("pointerdown", function (ev) {
+    ev.preventDefault();
+    try { $("fala").setPointerCapture(ev.pointerId); } catch (e) {}
+    falaApertoMs = Date.now();
+    falaLigouNoAperto = !fala;
+    if (!fala) falaLigar();
+  });
+  function soltarFala() {
+    if (!falaApertoMs) return;
+    var segurou = Date.now() - falaApertoMs >= FALA_SEGURAR_MS;
+    falaApertoMs = 0;
+    // Toque curto que ligou: fica ligado. Segurou, ou tocou em quem ja estava
+    // falando: desliga.
+    if (segurou || !falaLigouNoAperto) falaParar();
+  }
+  ["pointerup", "pointercancel"].forEach(function (n) {
+    $("fala").addEventListener(n, soltarFala);
+  });
 
   $("pos-fechar").addEventListener("click", fecharPosicoes);
   $("pos-nova").addEventListener("click", function () {

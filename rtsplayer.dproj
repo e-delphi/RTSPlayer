@@ -5,11 +5,10 @@
         <FrameworkType>FMX</FrameworkType>
         <Base>True</Base>
         <Config Condition="'$(Config)'==''">Release</Config>
-        <Platform Condition="'$(Platform)'==''">Win64</Platform>
+        <Platform Condition="'$(Platform)'==''">Android</Platform>
         <TargetedPlatforms>32786</TargetedPlatforms>
         <AppType>Application</AppType>
         <MainSource>rtsplayer.dpr</MainSource>
-        <ProjectName Condition="'$(ProjectName)'==''">rtsplayer</ProjectName>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
         <Base>true</Base>
@@ -107,6 +106,8 @@
         <AUP_CAMERA>true</AUP_CAMERA>
         <AUP_ACCESS_NETWORK_STATE>true</AUP_ACCESS_NETWORK_STATE>
         <AUP_INTERNET>true</AUP_INTERNET>
+        <AUP_RECORD_AUDIO>true</AUP_RECORD_AUDIO>
+        <AUP_MODIFY_AUDIO_SETTINGS>true</AUP_MODIFY_AUDIO_SETTINGS>
         <AUP_READ_EXTERNAL_STORAGE>true</AUP_READ_EXTERNAL_STORAGE>
         <AUP_WRITE_EXTERNAL_STORAGE>true</AUP_WRITE_EXTERNAL_STORAGE>
         <AUP_READ_PHONE_STATE>true</AUP_READ_PHONE_STATE>
@@ -292,6 +293,7 @@
         <DCCReference Include="src\Dvrip\VMS.Dvrip.Protocol.pas"/>
         <DCCReference Include="src\Dvrip\VMS.Dvrip.Media.pas"/>
         <DCCReference Include="src\Dvrip\VMS.Dvrip.Session.pas"/>
+        <DCCReference Include="src\Dvrip\VMS.Dvrip.Talk.pas"/>
         <DCCReference Include="src\App\VMS.App.Clock.pas"/>
         <DCCReference Include="src\App\VMS.App.Composition.pas"/>
         <DCCReference Include="src\App\VMS.App.Config.pas"/>
@@ -299,6 +301,7 @@
         <DCCReference Include="src\App\VMS.App.Decodificacao.pas"/>
         <DCCReference Include="src\Android\VMS.Android.UiAssets.pas"/>
         <DCCReference Include="src\Android\VMS.Android.Jpeg.pas"/>
+        <DCCReference Include="src\Android\VMS.Android.Microfone.pas"/>
         <DCCReference Include="src\Android\VMS.Android.JNIUtil.pas"/>
         <DCCReference Include="src\Android\VMS.Android.VideoDecoder.pas"/>
         <DCCReference Include="src\App\VMS.App.Encerrar.pas"/>

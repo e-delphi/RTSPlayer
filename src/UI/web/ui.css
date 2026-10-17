@@ -59,6 +59,9 @@
   --sobre-erro:#690005;        /* o que se escreve EM CIMA do erro */
   --ok:#7ee2a8;
   --alerta:#f2c14e;
+  /* Quem mexeu na camera: PTZ e fala. Lilas, longe do amarelo do movimento e
+     do azul da gravacao, que dividem a regua com ele. */
+  --interacao:#d4a4f5;
 
   /* Cantos. O M3 arredonda por tamanho de componente, e nao por gosto. */
   --r-xs:4px; --r-s:8px; --r-m:12px; --r-l:16px; --r-xl:28px;
@@ -74,6 +77,17 @@
    ficam com cada uma: a casca esconde a rolagem, o login centraliza, o player
    pinta o proprio preto. */
 * { -webkit-tap-highlight-color: transparent; }
+
+/* Nada e selecionavel. Isto e um app, e nao um documento: no Android, segurar
+   o dedo num botao selecionava o rotulo dele, abria a barra de copiar e
+   cancelava o gesto -- e segurar e justamente como se usa o Falar e as setas
+   da PTZ. O callout e o menu do toque longo (copiar imagem, abrir link).
+
+   Os campos de digitar sao a excecao obrigatoria: sem selecao neles o cursor
+   nao anda e, em alguns WebViews, nem da para digitar. */
+* { -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+input, textarea, select, [contenteditable="true"] {
+  -webkit-user-select:text; user-select:text; }
 
 html, body { height:100%; }
 

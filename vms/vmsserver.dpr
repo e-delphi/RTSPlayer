@@ -59,6 +59,8 @@ uses
   VMS.Dvrip.Protocol in '..\src\Dvrip\VMS.Dvrip.Protocol.pas',
   VMS.Dvrip.Media in '..\src\Dvrip\VMS.Dvrip.Media.pas',
   VMS.Dvrip.Session in '..\src\Dvrip\VMS.Dvrip.Session.pas',
+  VMS.Dvrip.Talk in '..\src\Dvrip\VMS.Dvrip.Talk.pas',
+  Vms.Server.Interactions in 'src\Api\Vms.Server.Interactions.pas',
   VMS.Rec.Crc32 in '..\src\Recording\VMS.Rec.Crc32.pas',
   VMS.Rec.Format in '..\src\Recording\VMS.Rec.Format.pas',
   VMS.Rec.Block in '..\src\Recording\VMS.Rec.Block.pas',

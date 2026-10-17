@@ -117,6 +117,8 @@ decide, nunca o método — `OPTIONS` existe nos dois protocolos.
 | `GET /api/recordings?camera=X` | a lista crua, arquivo por arquivo — diagnóstico |
 | `GET /api/index?file=…` | o índice de blocos, cru — diagnóstico |
 | `GET /api/thumb?camera=…&ms=…` | a miniatura JPEG daquele instante |
+| `POST /api/fala?camera=X&acao=enviar` | áudio para o alto-falante da câmera (PCM 16 bits, 8 kHz, mono no corpo); `acao=testar` e `acao=fechar` por GET |
+| `GET /api/interacoes?camera=X&fromMs=…&toMs=…` | os trechos em que alguém mexeu na câmera (PTZ ou fala), para a régua |
 
 **Miniaturas** — o app desenha uma tira de imagens na barra do tempo, e elas vêm
 daqui. A chave é o MINUTO: o servidor arredonda o `ms` pedido para o começo do
