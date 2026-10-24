@@ -14,12 +14,15 @@ cargo build --release -p vmsserver -p rtsplayer || exit /b 1
 if /i not "%~1"=="sem-android" (
     call "%~dp0android\build-apk.bat" || exit /b 1
 )
-if exist dist rmdir /s /q dist
+rem So refaz as pastas que este build gera: sem-android mantem o APK anterior.
+if exist dist\windows-servidor rmdir /s /q dist\windows-servidor
+if exist dist\windows-cliente rmdir /s /q dist\windows-cliente
 mkdir dist\windows-servidor dist\windows-cliente || exit /b 1
 copy /y target\release\vmsserver.exe dist\windows-servidor\ >nul || exit /b 1
 copy /y server\runtime\* dist\windows-servidor\ >nul || exit /b 1
 copy /y target\release\rtsplayer.exe dist\windows-cliente\ >nul || exit /b 1
 if /i not "%~1"=="sem-android" (
+    if exist dist\android rmdir /s /q dist\android
     mkdir dist\android
     copy /y android\app\build\outputs\apk\release\app-release.apk dist\android\RTSPlayer.apk >nul || exit /b 1
 )

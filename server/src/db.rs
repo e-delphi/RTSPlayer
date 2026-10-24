@@ -1,9 +1,11 @@
 //! O banco do vmsserver (SQLite, WAL): configuração, inventário das gravações,
 //! eventos, miniaturas, interações e log. O vídeo fica fora — é `.vms`.
 //!
-//! Duas conexões: uma para quem pergunta e espera (leituras, escritas que
-//! precisam do resultado), e uma thread dona da outra, para quem só quer gravar
-//! e seguir (`post`) — a sessão RTSP que loga não pode esperar disco.
+//! Conexões de dois tipos: algumas para quem pergunta e espera (leituras,
+//! escritas que precisam do resultado) — mais de uma, para uma consulta lenta
+//! (`/api/sql`, eventos de um mês) não parar o resto da API; o WAL deixa ler em
+//! paralelo — e uma thread dona da última, para quem só quer gravar e seguir
+//! (`post`): a sessão RTSP que loga não pode esperar disco.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -103,9 +105,13 @@ enum Job {
     Flush(Sender<()>),
 }
 
+/// Quantas conexões atendem quem espera.
+pub const CONEXOES: usize = 4;
+
 pub struct Db {
     path: PathBuf,
-    conn: Mutex<Connection>,
+    conns: Vec<Mutex<Connection>>,
+    proxima: AtomicUsize,
     tx: Mutex<Option<Sender<Job>>>,
     writer: Mutex<Option<JoinHandle<()>>>,
     pending: Arc<AtomicUsize>,
@@ -125,7 +131,7 @@ impl Db {
                 let _ = std::fs::create_dir_all(d);
             }
         }
-        let conn = open_conn(path)?;
+        let conns = (0..CONEXOES).map(|_| open_conn(path).map(Mutex::new)).collect::<DbResult<Vec<_>>>()?;
         let wconn = open_conn(path)?;
         let (tx, rx) = channel::<Job>();
         let pending = Arc::new(AtomicUsize::new(0));
@@ -159,7 +165,8 @@ impl Db {
             .map_err(|e| DbError(e.to_string()))?;
         Ok(Arc::new(Db {
             path: path.to_path_buf(),
-            conn: Mutex::new(conn),
+            conns,
+            proxima: AtomicUsize::new(0),
             tx: Mutex::new(Some(tx)),
             writer: Mutex::new(Some(writer)),
             pending,
@@ -178,7 +185,16 @@ impl Db {
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+        // Uma livre, se houver; senão a fila de uma delas, em rodízio.
+        for c in &self.conns {
+            match c.try_lock() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+        let i = self.proxima.fetch_add(1, Ordering::Relaxed) % self.conns.len();
+        self.conns[i].lock().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn exec(&self, sql: &str, params: Params) -> DbResult<usize> {
@@ -337,6 +353,21 @@ pub fn describe(db: &Db) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consulta_lenta_nao_para_as_outras() {
+        let db = Db::memory("pool");
+        ensure_schema(&db, 1).unwrap();
+        // Todas menos uma presas numa "consulta lenta": a outra ainda atende.
+        let presas: Vec<_> = (1..CONEXOES).map(|_| db.conn()).collect();
+        let (tx, rx) = channel();
+        std::thread::scope(|s| {
+            s.spawn(|| tx.send(db.query_i64("SELECT COUNT(*) FROM setting", p![], -1)).unwrap());
+            let n = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("a consulta esperou a lenta");
+            assert!(n > 0);
+        });
+        drop(presas);
+    }
 
     #[test]
     fn cria_o_esquema_e_reabre_em_dia() {
