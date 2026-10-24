@@ -507,8 +507,8 @@ mod tests {
     }
 
     /// Com o onnxruntime, o modelo e o FFmpeg de verdade (fora da suíte padrão):
-    ///   set VMS_TEST_BIN=...\delphimsin   (onnxruntime.dll, yolo26s.onnx, FFmpeg)
-    ///   set VMS_TEST_IMG=...us.jpg
+    ///   set VMS_TEST_BIN=...\server\runtime   (onnxruntime.dll, yolo26s.onnx, FFmpeg)
+    ///   set VMS_TEST_IMG=...\bus.jpg
     ///   cargo test -p vmsserver -- --ignored modelo_de_verdade
     #[test]
     #[ignore]

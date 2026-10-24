@@ -15,3 +15,5 @@
 /dist/
 # backups do RAD Studio
 __history/
+# configuracao do servidor (tem as senhas das cameras); vai no pacote, nao no git
+/server/runtime/vmsserver.json

@@ -4,8 +4,6 @@
 #            ONVIF, HTTP, sessão de câmera, ao vivo em memória, a interface web
 #   server/  vmsserver: grava, publica em RTSP e serve a API + a interface
 #   client/  RTSPlayer: janela Win32 + WebView2 com a mesma interface
-#
-# O porte do Delphi está em delphi/, que fica só como referência.
 [workspace]
 resolver = "2"
 members = ["shared", "server", "client", "android/rust"]

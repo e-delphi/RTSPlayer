@@ -1,7 +1,7 @@
 # RTSPlayer + vmsserver (Rust)
 
-Porte para Rust do RTSPlayer e do vmsserver. O código Delphi antigo está em
-`delphi/`, só como referência.
+Porte para Rust do RTSPlayer e do vmsserver. O código Delphi antigo ficou no
+histórico do git (até o commit `dfd4b7e`, na pasta `delphi/`).
 
 ```
 shared/   vms-core — a biblioteca comum aos dois
