@@ -1,0 +1,20 @@
+[package]
+name = "vmsserver"
+description = "Grava as câmeras em .vms, publica em RTSP e serve a API e a interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vms-core = { path = "../shared" }
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+base64.workspace = true
+libloading.workspace = true
+hmac = "0.12"
+getrandom = "0.2"
+jpeg-encoder = "0.6"
+# onnxruntime carregado em tempo de execucao (a DLL ao lado do exe), API >= 1.17.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-17"] }

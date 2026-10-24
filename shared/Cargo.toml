@@ -1,0 +1,17 @@
+[package]
+name = "vms-core"
+description = "O que o RTSPlayer e o vmsserver compartilham: formato .vms, protocolos de câmera, HTTP, sessão e a interface web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "vms_core"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+base64.workspace = true

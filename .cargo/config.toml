@@ -1,0 +1,5 @@
+# O runtime do C dentro do exe: o cliente e o servidor rodam num Windows sem o
+# Visual C++ Redistributable. (As DLLs do FFmpeg e do ONNX Runtime ainda usam
+# o dinâmico; o pacote do servidor leva as dela.)
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

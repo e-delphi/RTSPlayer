@@ -1,0 +1,45 @@
+[package]
+name = "rtsplayer"
+description = "RTSPlayer: câmeras ao vivo e gravações, numa janela Win32 + WebView2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "rtsplayer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rtsplayer"
+path = "src/main.rs"
+
+[dependencies]
+vms-core = { path = "../shared" }
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+# Só a janela (Win32 + WebView2) e o WinHTTP: o resto do crate (o roteador do
+# app, o cadastro, o ao vivo) também compila para Android.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+# O `#[implement]` do webview2-com expande para `windows_core::...`.
+windows-core = "0.61"
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_Networking_WinHttp",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+# Embute o ícone (MAINICON) no exe: janela e taskbar o carregam por nome.
+embed-resource = "3"

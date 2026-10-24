@@ -1,0 +1,20 @@
+VMS - servidor (Windows 64 bits)
+
+Rodar: vmsserver.exe. Tudo fica nesta pasta: o banco (vmsserver.db), as
+gravacoes (recordings\) e o cache. Copie a pasta inteira para mudar de maquina.
+
+Uma porta so (8554): a interface web em http://<maquina>:8554 e o ao vivo em
+rtsp://<maquina>:8554/live/<camera>.
+
+Primeiro acesso: abra http://localhost:8554 NESTA maquina e defina o usuario e
+a senha. Depois cadastre as cameras pela interface.
+
+Migrando do servidor Delphi: coloque o vmsserver.json antigo nesta pasta antes
+de rodar pela primeira vez; as cameras e os parametros sao importados.
+
+Deteccao de objetos: em Parametros, analytics.modelPath = yolo26s.onnx (o
+modelo ja esta nesta pasta). Vazio, so a deteccao de movimento roda.
+
+As DLLs: FFmpeg (avcodec, avutil, swscale, swresample, libx264, zlib) para as
+miniaturas e a analise; onnxruntime para a deteccao; MSVCP140/VCRUNTIME140 sao
+o runtime do Visual C++ que essas DLLs usam.

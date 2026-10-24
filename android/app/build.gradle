@@ -1,0 +1,59 @@
+// O APK do RTSPlayer: uma Activity com WebView e a biblioteca Rust
+// (`android/rust`, compilada por `build-apk.bat` para src/main/jniLibs).
+plugins {
+    id 'com.android.application'
+}
+
+// A chave de release: `android/keystore.properties` (fora do git) aponta o
+// .jks e as senhas. Sem o arquivo, o release sai sem assinatura e não instala.
+def assinatura = new Properties()
+def arquivoAssinatura = rootProject.file('keystore.properties')
+if (arquivoAssinatura.exists()) {
+    arquivoAssinatura.withInputStream { assinatura.load(it) }
+}
+
+android {
+    namespace 'app.rtsplayer'
+    compileSdk 34
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'app.rtsplayer'
+        // Android 9 (Pie) em diante.
+        minSdk 28
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0'
+        // armv7 para os aparelhos de 32 bits (e os de 64 que ainda rodam 32);
+        // arm64 para os que só rodam 64 bits (Pixel 7 em diante e outros).
+        // Um APK só: o Android instala a biblioteca certa do aparelho.
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a'
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (assinatura['storeFile']) {
+                storeFile rootProject.file(assinatura['storeFile'])
+                storePassword assinatura['storePassword']
+                keyAlias assinatura['keyAlias']
+                keyPassword assinatura['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (assinatura['storeFile']) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

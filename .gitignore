@@ -1,16 +1,17 @@
-gravador.json
-*.local
-*.identcache
-*.deployproj
+/target/
+**/*.rs.bk
+# runtime de desenvolvimento (DLLs do FFmpeg, banco, gravações)
+/server/exe/
+/client/exe/
+# Android: saida do Gradle e a biblioteca Rust compilada pelo build-apk.bat
+/android/.gradle/
+/android/app/build/
+/android/build/
+/android/local.properties
+/android/app/src/main/jniLibs/
+/android/keystore.properties
+/android/*.jks
+# pacotes gerados pelo build-dist.bat
+/dist/
+# backups do RAD Studio
 __history/
-__recovery/
-/dcu/
-/bin/*
-!/bin/Win64/
-/bin/Win64/*
-!/bin/Win64/Release/
-/bin/Win64/Release/*
-!/bin/Win64/Release/*.dll
-/vms/dcu/
-/vms/bin/
-*.pyc

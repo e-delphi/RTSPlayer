@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Câmeras e servidores pela rede; a fala grava o microfone. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <application
+        android:label="RTSPlayer"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Tema"
+        android:hardwareAccelerated="true"
+        android:resizeableActivity="true"
+        android:usesCleartextTraffic="true">
+        <!-- adjustResize: o teclado encolhe a área útil em vez de cobrir o
+             campo que se está digitando. A troca de orientação não recria a
+             Activity: o ao vivo não cai ao girar o celular. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|keyboard|keyboardHidden|screenSize|screenLayout|uiMode"
+            android:windowSoftInputMode="adjustResize"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

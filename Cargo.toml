@@ -1,0 +1,41 @@
+# Workspace do RTSPlayer em Rust.
+#
+#   shared/  biblioteca comum (vms-core): formato .vms, RTSP/RTP/SDP, DVRIP,
+#            ONVIF, HTTP, sessão de câmera, ao vivo em memória, a interface web
+#   server/  vmsserver: grava, publica em RTSP e serve a API + a interface
+#   client/  RTSPlayer: janela Win32 + WebView2 com a mesma interface
+#
+# O porte do Delphi está em delphi/, que fica só como referência.
+[workspace]
+resolver = "2"
+members = ["shared", "server", "client", "android/rust"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+libloading = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Hash e SQLite otimizados mesmo em debug: o PBKDF2 da senha (50 mil rodadas)
+# levava segundos por teste sem isto.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

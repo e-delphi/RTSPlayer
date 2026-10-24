@@ -1,0 +1,250 @@
+# RTSPlayer
+
+Player de câmeras IP para **Android** e **Windows**, escrito em Delphi/FireMonkey.
+
+O protocolo é implementado direto no socket — RTSP e DVRIP falados na mão, sem
+libVLC, sem wrapper, sem componente de terceiro. Só a decodificação de vídeo e
+áudio é delegada à plataforma: MediaCodec no Android, FFmpeg no Windows.
+
+[![Delphi](https://img.shields.io/badge/Delphi-12%20Athens-red)](https://www.embarcadero.com/products/delphi)
+[![Framework](https://img.shields.io/badge/framework-FireMonkey-blue)](https://docwiki.embarcadero.com/RADStudio/en/FireMonkey)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-green)](LICENSE)
+
+## Telas
+
+### Assistir
+
+A tela inicial separa o que vem de um servidor do que está cadastrado no próprio
+aparelho. A de vídeo é a mesma para ao vivo e para gravação.
+
+| Início | Ao vivo |
+|:--:|:--:|
+| ![Tela inicial: as câmeras do servidor, cada uma com contagem de arquivos, espaço ocupado e atalho para o histórico; abaixo, as câmeras cadastradas neste aparelho](docs/1-inicio.png) | ![Vídeo ao vivo da câmera frente, com o relógio no cabeçalho e o codec e a resolução no rodapé](docs/2-ao-vivo.png) |
+
+### Rever
+
+| Histórico | Linha do tempo | Eventos |
+|:--:|:--:|:--:|
+| ![Histórico por dia: cada dia com o total gravado, a porcentagem do dia coberta e uma barra de cobertura](docs/3-historico.png) | ![Reprodução de gravação com a régua do dia embaixo do vídeo, mostrando as faixas gravadas em azul, os buracos em preto e as marcas de evento](docs/4-time-line.png) | ![Grade de eventos com miniatura, hora e rótulo: movimento em amarelo, objeto reconhecido pela rede em azul](docs/5-eventos.png) |
+
+### Calibrar a detecção
+
+A grade que o detector enxerga fica desenhada sobre o próprio vídeo, e a curva
+mostra o trecho analisado. Mexer na sensibilidade reclassifica o trecho na hora,
+sem voltar ao servidor; só o botão de aplicar grava o parâmetro lá.
+
+| Detecção de movimento | Parâmetros do servidor |
+|:--:|:--:|
+| ![Calibração da detecção: a grade sobre o vídeo, o selo com o veredito e o score, a curva do trecho analisado com a linha do limiar e o controle de sensibilidade](docs/9-calibracao-movimento.png) | ![Parâmetros do servidor editáveis pelo app, com campo de filtro e a troca de senha no topo](docs/8-servidor-parametros.png) |
+
+### Cadastrar
+
+| Servidores | Servidor | Nova câmera |
+|:--:|:--:|:--:|
+| ![Lista de servidores cadastrados, com o endereço de cada um](docs/6-servidores.png) | ![Cadastro do servidor: nome, as rotas até ele com a marca de tailscale, e as credenciais de acesso](docs/7-servidor-cadastro.png) | ![Cadastro de câmera: nome, URL RTSP ou DVRIP, usuário, senha e o interruptor de habilitada](docs/10-camera-cadastro.png) |
+
+## Recursos
+
+- **RTSP** com autenticação Basic e Digest, `DESCRIBE`/`SETUP`/`PLAY`, keep-alive
+  por `GET_PARAMETER` ou `OPTIONS`
+- **Transporte TCP (interleaved) ou UDP**, com ordem de preferência configurável
+  e fallback automático por timeout (`auto`, `tcp,udp`, `udp,tcp`, `tcp`, `udp`)
+- **DVRIP / Sofia** (DVRs e câmeras Xiongmai/XM, porta 34567) — login, `OPMonitor`
+  e demux do fluxo de mídia
+- **Reconexão automática** com backoff exponencial, supervisionada por câmera,
+  com limite opcional de tentativas
+- **Fallback de decoder no Android**: quando o decoder de hardware falha (comum em
+  1080p+ com drivers problemáticos), a sessão migra para o decoder de software
+- **Teste de conexão** na tela de cadastro: faz só o handshake e informa o
+  resultado, sem abrir o stream
+- **Gravação `.vms`** (formato próprio: blocos indexados com CRC32) — a engine
+  suporta, o app roda com a gravação desligada
+- **Playback de gravação** quando a câmera está atrás de um vmsserver: o app puxa
+  a mídia pela API do servidor e toca no mesmo decodificador do ao vivo, com
+  ritmo próprio (nenhum dos dois renderers apresenta por PTS)
+- **Log em tela**, útil para diagnosticar câmera que não abre
+
+## Codecs
+
+| Vídeo | Áudio |
+|---|---|
+| H.264 | AAC |
+| H.265 / HEVC | PCM |
+| MJPEG | G.711 (µ-law e A-law) |
+| | G.726 (16/24/32/40 kbps) |
+
+## Plataformas
+
+| Plataforma | Decodificação | Observação |
+|---|---|---|
+| Android / Android64 | MediaCodec via JNI | fallback automático para decoder de software |
+| Win64 | FFmpeg | DLLs incluídas em `bin/Win64/Release` |
+
+## Estrutura
+
+```
+src/
+├── Net/          sockets TCP e UDP atrás de uma interface
+├── Rtsp/         cliente RTSP: mensagens, URL, autenticação, transporte
+├── Sdp/          parser de SDP
+├── Rtp/          pacote RTP e demux por canal interleaved ou payload type
+├── Depacketizer/ RTP → frames (H264, H265, MJPEG, AAC, PCM, G711, G726)
+├── Api/          cliente das rotas de gravação do vmsserver
+├── Playback/     engine que toca gravação: busca, fila e ritmo
+├── Dvrip/        protocolo Sofia/DVRIP: handshake, comandos e mídia
+├── Domain/       sessão, supervisor, política de reconexão, tipos e portas
+├── Recording/    escrita e leitura do formato .vms
+├── Media/        fachada do renderer (escolhe o backend por plataforma)
+├── Android/      backend MediaCodec (vídeo, áudio, JNI)
+├── Win/          backend FFmpeg
+├── App/          composition root, configuração, logger, clock
+└── UI/           shell FMX + frames de lista, player e edição
+```
+
+A separação é intencional: `Domain` e os protocolos não conhecem FMX nem
+plataforma. A UI conversa com a sessão através de `IMediaSink`, e
+`VMS.Media.Renderer` decide em tempo de compilação qual backend entra.
+
+## Compilando
+
+Requer **Delphi 12 Athens** (FireMonkey). Não há dependência externa além das
+DLLs do FFmpeg, que já estão no repositório.
+
+1. Abra `rtsplayer.dproj` no RAD Studio
+2. Escolha a plataforma (`Win64`, `Android` ou `Android64`)
+3. Compile e execute
+
+No Windows, os DLLs precisam estar ao lado do executável — é o caso ao rodar a
+partir de `bin/Win64/Release`. No Android eles não são usados: a decodificação
+vai por MediaCodec.
+
+## Configuração
+
+As câmeras são cadastradas pela própria interface (protocolo, host, porta,
+caminho, usuário, senha, transporte e atrasos de sincronismo A/V). A lista é
+gravada em `cameras.json`, na pasta Documentos do dispositivo:
+
+```json
+[
+  {
+    "name": "Portaria",
+    "url": "rtsp://192.0.2.10:554/onvif1",
+    "user": "admin",
+    "password": "",
+    "transport": "tcp,udp",
+    "maxRetries": 0,
+    "audioDelayMs": 200,
+    "videoDelayMs": 200
+  }
+]
+```
+
+- `transport` aceita `auto`, `tcp`, `udp`, `tcp,udp` ou `udp,tcp` — a ordem é a
+  de preferência, e a troca acontece por timeout
+- `maxRetries` igual a `0` reconecta indefinidamente
+- `audioDelayMs` / `videoDelayMs` ajustam o jitter buffer de cada trilha
+- para DVRIP, use `dvrip://host:34567` como URL
+
+### Vários caminhos até a mesma câmera
+
+A mesma câmera costuma ter mais de um endereço: o IP dela na LAN, o servidor que
+a republica em casa, e o mesmo servidor pela tailnet. Em vez de três cadastros
+iguais, **uma câmera com uma lista de caminhos**, em ordem de prioridade:
+
+```json
+{
+  "name": "Frente",
+  "endpoints": [
+    { "name": "Local",  "url": "rtsp://192.168.100.9:8554/live/frente" },
+    { "name": "Online", "url": "rtsp://100.102.246.119:8554/live/frente",
+      "tailscale": true },
+    { "name": "Direto", "url": "rtsp://192.168.100.2:555",
+      "user": "admin", "password": "…", "transport": "tcp,udp" }
+  ],
+  "maxRetries": 0, "audioDelayMs": 200, "videoDelayMs": 200
+}
+```
+
+Antes de **cada** tentativa de conexão o app testa os caminhos na ordem (um TCP
+connect com 700 ms) e usa o primeiro que responder. Isso vale também nas
+reconexões, que é o que faz sair de casa trocar de caminho sozinho. Nenhum
+respondendo, ele tenta o marcado como `tailscale` (o túnel pode estar caído, e é
+a sessão dele que sabe pedir para subir) ou o primeiro da lista.
+
+No caminho `tailscale`, se a rota não existe o app abre o Tailscale e espera até
+30 s a rota aparecer, mostrando **"Aguardando a VPN"** — que é diferente de
+"Conectando", porque a ação que falta está no outro app. Quem liga a VPN é o
+usuário: o Android não deixa um app subir o `VpnService` de outro. Com o túnel
+já de pé e a câmera muda, ele nem abre o Tailscale — o problema ali é a câmera.
+
+Pela interface, isso fica no topo da tela de cadastro: **"+ caminho"** cria mais
+um, as abas numeradas escolhem qual está sendo editado (os campos de baixo —
+protocolo, host, porta, credenciais, transporte, Tailscale — são **do caminho
+selecionado**), e o **x** apaga o caminho atual. O nome da câmera é um só; o
+campo logo abaixo das abas é o nome daquele caminho ("Local", "Online"...).
+
+Cadastro no formato antigo (uma `url` por câmera) continua valendo: vira uma
+câmera de um caminho só. Os campos `url`/`user`/`password`/`transport` fora da
+lista são o espelho do primeiro caminho.
+
+### Levar o cadastro para outro aparelho
+
+- **Exportar uma câmera**: toque em *Editar* na lista e use a seta ao lado da
+  lixeira do card. Sai **aquela câmera com todos os caminhos dela**, em texto,
+  pela **bandeja de compartilhar do Android** — WhatsApp, e-mail, arquivo, o que
+  você escolher. No Windows, vai para a área de transferência.
+- **Importar**: o ícone de seta entrando, na barra da lista, abre uma caixa onde
+  se cola o texto. O botão **Colar** puxa da área de transferência num toque.
+  Câmera de mesmo nome é atualizada; as demais entram no fim da lista — o que só
+  existe no aparelho de destino não é apagado. Aceita tanto uma câmera quanto
+  uma lista inteira.
+
+O texto **leva as senhas em claro** (é o mesmo conteúdo do arquivo), e o app
+avisa isso antes de exportar. Mande só para você mesmo e apague a mensagem
+depois de importar.
+
+> ⚠️ As senhas ficam em texto puro nesse arquivo, como acontece na maioria dos
+> clientes RTSP (o protocolo precisa da senha em claro para calcular o Digest).
+> Ele vive na área privada do app, mas não é um cofre — trate o dispositivo como
+> parte da superfície de ataque das suas câmeras.
+
+## Formato .vms
+
+Container próprio, pensado para gravação contínua com perda mínima em caso de
+queda de energia. O mapa desenhado, byte a byte e com as ligações entre os dois
+arquivos, está em [docs/anatomia-vms.html](docs/anatomia-vms.html) — abra no
+navegador.
+
+- **Header** `VMS1` com metadados das trilhas (codec, resolução, extradata)
+- **Blocos** `BLK` com índice de samples + payload e um CRC32 ao final —
+  cada bloco é fechado a cada N samples, N ms ou N bytes, o que vier primeiro
+- **Âncora A/V** `BANC` no fim do índice de cada bloco: o instante de parede em
+  que cada trilha começou ali, que é o que relaciona dois PTS em bases diferentes
+- **Índice** `VIDX` com tempo, posição e "tem keyframe" de cada bloco, escrito
+  quando a gravação fecha: achar um instante vira uma busca binária em vez de
+  uma varredura do arquivo
+- **Índice do arquivo em gravação** no `.vms.idx` ao lado, escrito em lotes a
+  cada punhado de blocos enquanto a gravação corre — é o que dá índice ao
+  arquivo de hoje, que é justamente o que se quer assistir. Fechando direito, o
+  `VIDX` entra no fim do `.vms` e o sidecar é apagado; fechando torto, ele fica e
+  continua sendo o índice daquele arquivo
+- **Footer** `VEOF` com total de blocos, duração, offset do último bloco e
+  ponteiro para o índice
+
+A gravação **roda de arquivo** a cada `rotateMinutes` (60 por padrão), sempre
+esperando um keyframe para o arquivo novo começar por um ponto de entrada do
+decodificador. É o que mantém a pasta de cada câmera legível, dá granularidade
+para a retenção apagar e limita o tamanho de cada índice.
+
+Um arquivo truncado continua legível até o último bloco completo: o leitor para
+quando faltam bytes, em vez de falhar o arquivo inteiro. Ele também tem um modo
+"live", que aguarda o escritor em vez de terminar no fim do arquivo. O CRC de cada
+bloco é conferido na leitura: bloco corrompido é pulado com aviso, em vez de
+envenenar o decodificador.
+
+O formato está em desenvolvimento e **não carrega compatibilidade**: existe um
+layout só. Mudou o layout, as gravações antigas se apagam.
+
+## Licença
+
+[AGPL-3.0](LICENSE).

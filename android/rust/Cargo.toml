@@ -1,0 +1,18 @@
+[package]
+name = "rtsplayer-android"
+description = "RTSPlayer para Android: a mesma lógica do app Windows, servida ao WebView por 127.0.0.1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rtsplayer_android"
+# cdylib = o .so que o APK carrega; rlib = os testes rodam no Windows também.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vms-core = { path = "../../shared" }
+rtsplayer = { path = "../../client" }
+jni = "0.21"
+# Encaminhar ao vmsserver (http e https): no Android não há WinHTTP.
+ureq = "2"

@@ -1,0 +1,257 @@
+/* ============================================================ Material Design 3
+
+   O que TODA pagina da interface compartilha: os tokens de cor, a base do
+   documento e os poucos componentes que aparecem em mais de uma tela.
+
+   Existe porque a paleta estava copiada em tres arquivos e ja tinha divergido:
+   o mesmo #8ed0f0 se chamava --p na casca e --az no login, o mesmo #e6e6e6 era
+   --sobre-sup aqui e --txt la, e as telas de eventos e do player nem token
+   tinham -- escreviam o hex na mao. Trocar uma cor pedia cinco buscas e
+   acertava quatro.
+
+   O que NAO entra aqui: layout de tela e componente de uma pagina so. A linha
+   do tempo da sintonia, o cartao de evento, o formulario do login -- cada um
+   fica onde e usado. Isto e a base comum, e nao um deposito.
+
+   Cuidado ao acrescentar: `.pin` de proposito NAO esta aqui. A casca chama
+   assim o ponto de estado de 10px de um servidor, e a tela de eventos chama
+   assim o pontinho de 6px que diz o tipo do evento. Mesmo nome, coisas
+   diferentes; subir um dos dois quebraria o outro em silencio.
+
+   Servido em /ui/ui.css pelos DOIS servidores, da mesma pasta que o
+   vmsreader.js e o player.js.
+
+   ---------------------------------------------------------------- os tokens
+
+   Tokens, e nao cores soltas. Cada valor abaixo tem um PAPEL -- superficie,
+   contorno, primaria -- e a regra e sempre usar o papel. Foi assim que deu para
+   trocar a aparencia inteira sem procurar #2f2f2f espalhado pelos arquivos.
+
+   Escala tonal no escuro: a elevacao do M3 nao e sombra, e TOM. Um cartao
+   "acima" da superficie e um cinza mais claro, e nao um cinza igual com uma
+   sombra embaixo. Por isso a fileira sup .. sup4.
+
+   A primaria vive na familia do azul que o app sempre teve (#2d9cdb), nos tons
+   que o esquema escuro pede: clara para o traco (tom 80) e escura para o que
+   fica ATRAS dele (tom 30). Azul escuro com texto branco, que era o botao de
+   antes, e o padrao claro usado no escuro -- fica pesado e some no fundo. */
+:root {
+  color-scheme: dark;
+
+  --p:#8ed0f0;                 /* primaria */
+  --sobre-p:#00344a;           /* o que se escreve EM CIMA da primaria */
+  --p-cont:#00506b;            /* container primario */
+  --sobre-p-cont:#c2e9ff;
+  --sec-cont:#334b53;          /* container secundario: acao de apoio */
+  --sobre-sec-cont:#cfe7ef;
+
+  --sup:#121212;               /* a superficie do app */
+  --sup1:#1a1a1a;
+  --sup2:#1f1f1f;
+  --sup3:#282828;
+  --sup4:#333333;
+  --sobre-sup:#e6e6e6;
+  --sobre-sup-var:#c2c7c9;     /* texto secundario */
+  --contorno:#8b9194;
+  --contorno-var:#3f4447;      /* divisorias e bordas */
+
+  --erro:#ffb4ab;
+  --sobre-erro:#690005;        /* o que se escreve EM CIMA do erro */
+  --ok:#7ee2a8;
+  --alerta:#f2c14e;
+  /* Quem mexeu na camera: PTZ e fala. Lilas, longe do amarelo do movimento e
+     do azul da gravacao, que dividem a regua com ele. */
+  --interacao:#d4a4f5;
+
+  /* Cantos. O M3 arredonda por tamanho de componente, e nao por gosto. */
+  --r-xs:4px; --r-s:8px; --r-m:12px; --r-l:16px; --r-xl:28px;
+
+  /* Nomes antigos, para o que ainda os cita. */
+  --bg:var(--sup); --bor:var(--contorno-var); --txt:var(--sobre-sup);
+  --dim:var(--sobre-sup-var); --az:var(--p); --sobre-az:var(--sobre-p);
+}
+
+/* ------------------------------------------------------------------- a base
+
+   So o que vale para qualquer pagina. Rolagem, direcao do flex e fundo proprio
+   ficam com cada uma: a casca esconde a rolagem, o login centraliza, o player
+   pinta o proprio preto. */
+* { -webkit-tap-highlight-color: transparent; }
+
+/* Nada e selecionavel. Isto e um app, e nao um documento: no Android, segurar
+   o dedo num botao selecionava o rotulo dele, abria a barra de copiar e
+   cancelava o gesto -- e segurar e justamente como se usa o Falar e as setas
+   da PTZ. O callout e o menu do toque longo (copiar imagem, abrir link).
+
+   Os campos de digitar sao a excecao obrigatoria: sem selecao neles o cursor
+   nao anda e, em alguns WebViews, nem da para digitar. */
+* { -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+input, textarea, select, [contenteditable="true"] {
+  -webkit-user-select:text; user-select:text; }
+
+html, body { height:100%; }
+
+body { margin:0; background:var(--sup); color:var(--sobre-sup);
+       /* Roboto e a fonte do Material, e ela ja esta no Android. No Windows cai
+          no Segoe UI, que e a fonte do sistema de la -- pedir Roboto de fora
+          quebraria o app sem rede, que e onde ele mais roda. */
+       font:400 14px/20px Roboto, system-ui, "Segoe UI", sans-serif; }
+
+/* ------------------------------------------------------------------ botoes
+
+   Tres pesos, como o M3 pede: cheio para a acao principal da tela, tonal para
+   as de apoio, contornado para o resto. Todos em pilula e com 40px de altura,
+   que e a medida do Material. */
+button.b, select.b {
+  background:none; color:var(--p); border:1px solid var(--contorno-var);
+  border-radius:20px; padding:9px 16px; min-height:40px; box-sizing:border-box;
+  font:500 14px/20px Roboto, system-ui, sans-serif; cursor:pointer;
+  white-space:nowrap; position:relative; overflow:hidden; }
+/* O toque no Material nao muda a cor do componente: poe um veu da cor do
+   CONTEUDO por cima dele, com opacidade fixa. Uma regra so serve a todos, e
+   cada um continua com a cor de fundo que tem. */
+button.b::after, select.b::after {
+  content:""; position:absolute; inset:0; background:currentColor; opacity:0;
+  pointer-events:none; transition:opacity .1s linear; }
+button.b:hover::after, select.b:hover::after { opacity:.08; }
+button.b:active::after, select.b:active::after { opacity:.12; }
+/* .on = a acao principal. Fundo claro e texto escuro: e assim que o botao cheio
+   se comporta num tema escuro. */
+button.b.on { background:var(--p); border-color:transparent;
+              color:var(--sobre-p); }
+button.b.tonal { background:var(--sec-cont); border-color:transparent;
+                 color:var(--sobre-sec-cont); }
+button.b.risco { color:var(--erro); }
+button.b[disabled] { opacity:.38; cursor:default; }
+
+/* O seletor nativo nao acompanha a altura nem a cor dos botoes ao lado -- vinha
+   mais baixo e com a seta do sistema. Sem a aparencia nativa ele vira mais um
+   botao da fileira, com a seta desenhada aqui. */
+select.b {
+  appearance:none; -webkit-appearance:none; padding-right:32px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 19px) 55%, calc(100% - 14px) 55%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat; }
+select.b:focus { outline:none; border-color:var(--p); }
+select.b option { background:var(--sup3); color:var(--sobre-sup); }
+
+/* ------------------------------------------------------------ botao de icone
+
+   40px de alvo, 24px de desenho, veu redondo. */
+.icone { position:relative; overflow:hidden;
+         flex:0 0 auto; width:40px; height:40px; padding:8px;
+         box-sizing:border-box; border:0; border-radius:50%;
+         background:none; color:var(--sobre-sup); cursor:pointer;
+         display:inline-flex; align-items:center; justify-content:center; }
+.icone svg { width:24px; height:24px; display:block; }
+.icone[disabled] { opacity:.38; cursor:default; }
+.icone::after { content:""; position:absolute; inset:0; border-radius:50%;
+                background:currentColor; opacity:0; pointer-events:none;
+                transition:opacity .1s linear; }
+.icone:hover::after { opacity:.08; }
+.icone:active::after { opacity:.12; }
+
+/* Icone de tracado, que e o estilo corrente do Material. A regra e uma so para
+   todos: fill e stroke sao herdados, entao vale tambem dentro do <use> --
+   seletor de fora nao alcanca o conteudo clonado, mas heranca alcanca. */
+svg.ico { width:24px; height:24px; display:block; flex:0 0 auto;
+          fill:none; stroke:currentColor; stroke-width:1.8;
+          stroke-linecap:round; stroke-linejoin:round; }
+
+/* A onda. E o gesto que faz uma interface parecer Material antes mesmo de se ler
+   qualquer coisa nela: o toque tem origem, e ela se ve. */
+.onda { position:absolute; border-radius:50%; background:currentColor;
+        opacity:.20; transform:scale(0); pointer-events:none;
+        animation:ondear .45s ease-out forwards; }
+@keyframes ondear { to { transform:scale(1); opacity:0; } }
+
+/* ------------------------------------------------------------------- estado
+
+   Texto de recado. As tres telas que dizem "deu certo" ou "deu errado" diziam
+   com vermelhos diferentes; aqui e o token. */
+.err  { color:var(--erro); }
+.ok   { color:var(--ok); }
+.warn { color:var(--alerta); }
+
+/* ===================================================== formularios
+
+   Duas telas cadastram coisas: as cameras do aparelho e as do servidor.
+   O campo cheio do M3 (fundo proprio, canto arredondado so em cima,
+   traco que acende no foco, rotulo que sobe quando ha texto) vive aqui
+   para as duas usarem o mesmo, e nao duas copias que divergem. */
+.ajuda { color:var(--sobre-sup-var);
+         font:400 12px/16px Roboto, system-ui, sans-serif;
+         padding:4px 16px 0; margin:-8px 0 12px; }
+/* O -8px acima existe para encostar a ajuda no campo, que tem 20px embaixo.
+   Depois de uma linha de botoes, que nao tem margem embaixo nenhuma, ele
+   virava sobreposicao: medido, o texto entrava 8px dentro do botao Procurar. */
+.acoes + .ajuda { margin-top:8px; }
+.divisor { height:1px; background:var(--contorno-var); margin:8px 0; }
+
+/* ------------------------------------------------------ campos de texto
+
+   Campo cheio do M3: fundo proprio, canto arredondado so em cima, e um
+   traco embaixo que acende na cor primaria com o foco. O rotulo comeca
+   dentro e SOBE quando ha texto -- e por isso que o input vem antes do
+   rotulo na marcacao, para o :placeholder-shown alcancar o irmao.
+
+   `label.campo`, e nao `.campo`: a regra generica de input logo abaixo tem a
+   MESMA especificidade e vem depois, entao ganhava dela -- o campo nascia com
+   o padding do input simples, sem o espaco de cima, e o rotulo flutuado caia
+   por cima do proprio valor. */
+.campo { display:block; position:relative; margin-bottom:20px; }
+label.campo input {
+  display:block; width:100%; box-sizing:border-box; margin:0;
+  background:var(--sup3); color:var(--sobre-sup);
+  border:0; border-bottom:1px solid var(--contorno);
+  border-radius:var(--r-xs) var(--r-xs) 0 0;
+  padding:24px 16px 8px; font:400 16px/24px Roboto, system-ui, sans-serif; }
+label.campo input:focus { outline:none; border-bottom:2px solid var(--p);
+                     padding-bottom:7px; }
+label.campo > span { position:absolute; left:16px; top:16px; pointer-events:none;
+                color:var(--sobre-sup-var);
+                font:400 16px/24px Roboto, system-ui, sans-serif;
+                transition:transform .12s ease, color .12s ease;
+                transform-origin:left top; }
+/* Vazio E sem foco: o rotulo desce e ocupa o lugar do texto. */
+label.campo input + span { transform:translateY(-10px) scale(.75); }
+label.campo input:placeholder-shown:not(:focus) + span {
+  transform:translateY(8px) scale(1); }
+label.campo input:focus + span { color:var(--p); }
+
+/* Fora dos .campo (filtro, linhas de parametro) o input continua simples. */
+input[type=text], input:not([type]), input[type=password] {
+  display:block; width:100%; box-sizing:border-box; margin-top:4px;
+  background:var(--sup3); color:var(--sobre-sup);
+  border:1px solid var(--contorno-var); border-radius:var(--r-xs);
+  padding:10px 12px; font:400 14px/20px Roboto, system-ui, sans-serif; }
+input[type=text]:focus, input:not([type]):focus, input[type=password]:focus {
+  outline:none; border-color:var(--p); }
+label { display:block; margin-bottom:12px; color:var(--sobre-sup-var);
+        font:400 12px/16px Roboto, system-ui, sans-serif; }
+
+/* ------------------------------------------------------------- chave
+
+   O quadradinho virou a chave do Material: alvo maior, estado legivel de
+   longe, e o polegar cresce quando liga. */
+label.chk { display:flex; align-items:center; gap:16px;
+            font:400 16px/24px Roboto, system-ui, sans-serif;
+            color:var(--sobre-sup); margin:8px 0 16px; cursor:pointer; }
+label.chk input[type=checkbox] {
+  appearance:none; -webkit-appearance:none; margin:0; flex:0 0 auto;
+  width:52px; height:32px; border-radius:16px; background:var(--sup4);
+  border:2px solid var(--contorno); position:relative; cursor:pointer;
+  transition:background .12s, border-color .12s; }
+label.chk input[type=checkbox]::after {
+  content:""; position:absolute; left:6px; top:50%; width:16px; height:16px;
+  border-radius:50%; background:var(--contorno); transform:translateY(-50%);
+  transition:left .12s ease, width .12s, height .12s, background .12s; }
+label.chk input[type=checkbox]:checked {
+  background:var(--p); border-color:var(--p); }
+label.chk input[type=checkbox]:checked::after {
+  left:26px; width:24px; height:24px; background:var(--sobre-p); }
+
+.acoes { display:flex; gap:8px; margin-top:24px; flex-wrap:wrap; }
